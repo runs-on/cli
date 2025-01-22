@@ -2,6 +2,8 @@
 
 RunsOn CLI (`roc`) is a command line tool to manage and troubleshoot your [RunsOn](https://runs-on.com) installation.
 
+Note: the CLI only works with RunsOn >= v2.6.3.
+
 ## Installation
 
 You can download the binaries for your platform (Linux, macOS) from the [Releases](https://github.com/runs-on/cli/releases/latest) page.
