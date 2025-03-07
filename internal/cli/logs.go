@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -380,9 +381,13 @@ func getLogGroupArn(arn string) string {
 }
 
 func extractJobID(input string) string {
-	if strings.HasPrefix(input, "https://") {
-		// Extract job ID from URL like https://github.com/runs-on/runs-on/actions/runs/12312372848/job/34368864490
-		parts := strings.Split(input, "/")
+	url, err := url.Parse(input)
+	if err == nil && url.Scheme == "https" {
+		// Extract job ID from URLs like:
+		//
+		// - https://github.com/runs-on/runs-on/actions/runs/12312372848/job/34368864490
+		// - https://github.com/runs-on/runs-on/actions/runs/12312372848/job/34368864490?pr=123
+		parts := strings.Split(url.Path, "/")
 		if len(parts) > 1 {
 			return parts[len(parts)-1]
 		}
