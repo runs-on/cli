@@ -11,14 +11,14 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/0.0.1/roc-0.0.1-darwin-arm64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.0/roc-v0.1.0-darwin-arm64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
 Example (Linux AMD64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/0.0.1/roc-0.0.1-linux-amd64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.0/roc-v0.1.0-linux-amd64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
