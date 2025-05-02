@@ -70,7 +70,7 @@ func NewConnectCmd() *cobra.Command {
 				break
 			}
 
-			// Check if instance is running
+			// Check if instance is running and get platform type
 			describeInput := &ssm.DescribeInstanceInformationInput{
 				Filters: []types.InstanceInformationStringFilter{
 					{
@@ -104,12 +104,19 @@ func NewConnectCmd() *cobra.Command {
 				return fmt.Errorf("AWS Session Manager plugin not installed. Please install from https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html")
 			}
 
+			// Determine shell command based on platform type
+			shellCmd := "cd /home/runner && bash"
+			if describeOutput.InstanceInformationList[0].PlatformType == "Windows" {
+				// will still work even if directory does not exist (defaults to C:\Windows\system32)
+				shellCmd = "cd C:\\actions-runner; powershell"
+			}
+
 			return syscall.Exec(awsPath, []string{
 				"aws", "ssm", "start-session",
 				"--target", instanceID,
 				"--region", region,
 				"--document-name", "AWS-StartInteractiveCommand",
-				"--parameters", "command='cd /home/runner && bash'",
+				"--parameters", fmt.Sprintf("command='%s'", shellCmd),
 			}, os.Environ())
 		},
 	}
