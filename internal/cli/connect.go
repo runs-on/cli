@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 	"time"
 
@@ -111,13 +112,68 @@ func NewConnectCmd() *cobra.Command {
 				shellCmd = "cd C:\\actions-runner; powershell"
 			}
 
-			return syscall.Exec(awsPath, []string{
-				"aws", "ssm", "start-session",
+			saveCmd := exec.Command("stty", "-g")
+			saveCmd.Stdin = os.Stdin
+			savedState, err := saveCmd.Output()
+			if err != nil {
+				return fmt.Errorf("failed to save terminal state: %w", err)
+			}
+			
+			restoreTerminal := func() {
+				restoreCmd := exec.Command("stty", string(savedState))
+				restoreCmd.Stdin = os.Stdin
+				restoreCmd.Run()
+				exec.Command("stty", "sane").Run()
+				exec.Command("stty", "echo").Run()
+			}
+			
+			defer restoreTerminal()
+
+			cmd := exec.Command(awsPath, 
+				"ssm", "start-session",
 				"--target", instanceID,
 				"--region", region,
 				"--document-name", "AWS-StartInteractiveCommand",
 				"--parameters", fmt.Sprintf("command='%s'", shellCmd),
-			}, os.Environ())
+			)
+
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("failed to start session: %w", err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				done <- cmd.Wait()
+			}()
+
+			select {
+			case <-sigChan:
+				fmt.Fprintln(os.Stderr, "\nReceived interrupt, terminating connection...")
+				if err := cmd.Process.Kill(); err != nil {
+					return fmt.Errorf("failed to kill process: %w", err)
+				}
+				return nil
+			case err := <-done:
+				if err != nil {
+					if exitErr, ok := err.(*exec.ExitError); ok {
+						status := exitErr.ExitCode()
+						if status == 130 || status == 255 {
+							fmt.Fprintln(os.Stderr, "\nInstance connection closed.")
+							return nil
+						}
+					}
+					return fmt.Errorf("session ended with error: %w", err)
+				}
+				fmt.Fprintln(os.Stderr, "\nSession completed successfully.")
+				return nil
+			}
 		},
 	}
 
