@@ -253,23 +253,15 @@ func (d *StackDoctor) checkCongratsResponse(ctx context.Context) error {
 	}
 }
 
-func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, error) {
-	fmt.Print("Fetching AppRunner logs...")
-
-	serviceArn, ok := d.outputs["RunsOnServiceArn"]
-	if !ok {
-		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
-		return 0, d.failCheck("Logs fetched", "Service ARN not found", err)
-	}
-
+func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, serviceArn, logGroupType string, since time.Duration) (int, error) {
 	// Convert AppRunner ARN to CloudWatch log group ARN
-	logGroupArn := getLogGroupArn(serviceArn)
+	logGroupArn := getLogGroupArn(serviceArn, logGroupType)
 
 	// Create logs directory in workspace
 	logsDir := filepath.Join(d.workDir, "logs")
 	err := os.MkdirAll(logsDir, 0755)
 	if err != nil {
-		return 0, d.failCheck("Logs fetched", "Failed to create logs directory", err)
+		return 0, err
 	}
 
 	startTime := time.Now().Add(-since)
@@ -280,9 +272,9 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 	}
 
 	var totalLines int
-	logFile, err := os.Create(filepath.Join(logsDir, "application.log"))
+	logFile, err := os.Create(filepath.Join(logsDir, fmt.Sprintf("%s.log", logGroupType)))
 	if err != nil {
-		return 0, d.failCheck("Logs fetched", "Failed to create log file", err)
+		return 0, err
 	}
 	defer logFile.Close()
 
@@ -290,7 +282,7 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 	for paginator.HasMorePages() {
 		output, err := paginator.NextPage(ctx)
 		if err != nil {
-			return 0, d.failCheck("Logs fetched", "Failed to fetch logs", err)
+			return 0, err
 		}
 
 		for _, event := range output.Events {
@@ -301,8 +293,35 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 		}
 	}
 
-	d.addCheck("Logs fetched", "✅", fmt.Sprintf("Fetched %d lines since %s", totalLines, since), nil)
-	d.printCheckResult("", "✅", fmt.Sprintf("%d lines since %s", totalLines, since))
+	return totalLines, nil
+}
+
+func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, error) {
+	serviceArn, ok := d.outputs["RunsOnServiceArn"]
+	if !ok {
+		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
+		return 0, d.failCheck("Logs fetched", "Service ARN not found", err)
+	}
+
+	// Fetch application logs
+	fmt.Printf("Fetching AppRunner application logs (since %s)...", since)
+	appLines, err := d.fetchLogsFromGroup(ctx, serviceArn, "application", since)
+	if err != nil {
+		return 0, d.failCheck("Application logs fetched", "Failed to fetch application logs", err)
+	}
+	d.addCheck("Application logs fetched", "✅", fmt.Sprintf("%d lines", appLines), nil)
+	d.printCheckResult("", "✅", fmt.Sprintf("%d lines", appLines))
+
+	// Fetch service logs (always from last 14 days)
+	fmt.Print("Fetching AppRunner service logs (since 14 days)...")
+	serviceLines, err := d.fetchLogsFromGroup(ctx, serviceArn, "service", 14*24*time.Hour)
+	if err != nil {
+		return 0, d.failCheck("Service logs fetched", "Failed to fetch service logs", err)
+	}
+	d.addCheck("Service logs fetched", "✅", fmt.Sprintf("%d lines", serviceLines), nil)
+	d.printCheckResult("", "✅", fmt.Sprintf("%d lines", serviceLines))
+
+	totalLines := appLines + serviceLines
 	return totalLines, nil
 }
 
@@ -321,7 +340,6 @@ func (d *StackDoctor) saveResults() error {
 
 	return nil
 }
-
 func (d *StackDoctor) createZipFile() (string, error) {
 	timestamp := time.Now().Format("2006-01-02-15-04-05")
 	zipFileName := fmt.Sprintf("roc-doctor-%s.zip", timestamp)
@@ -342,11 +360,21 @@ func (d *StackDoctor) createZipFile() (string, error) {
 		return "", fmt.Errorf("failed to add checks.json to zip: %w", err)
 	}
 
-	// Add logs directory from workspace
+	// Add log files directly to zip
 	logsDir := filepath.Join(d.workDir, "logs")
-	err = addDirectoryToZip(zipWriter, logsDir)
+	entries, err := os.ReadDir(logsDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to add logs directory to zip: %w", err)
+		return "", fmt.Errorf("failed to read logs directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			logPath := filepath.Join(logsDir, entry.Name())
+			err = addFileToZipWithPath(zipWriter, logPath, filepath.Join("logs", entry.Name()))
+			if err != nil {
+				return "", fmt.Errorf("failed to add log file %s to zip: %w", entry.Name(), err)
+			}
+		}
 	}
 
 	return zipFileName, nil
