@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
@@ -62,7 +63,12 @@ func NewRootCmd() *cobra.Command {
 		},
 	}
 
-	cmd.PersistentFlags().String("stack", "runs-on", "CloudFormation stack name")
+	defaultStack := os.Getenv("RUNS_ON_STACK_NAME")
+	if defaultStack == "" {
+		defaultStack = "runs-on"
+	}
+
+	cmd.PersistentFlags().String("stack", defaultStack, "CloudFormation stack name")
 
 	cmd.AddCommand(
 		NewLogsCmd(),
