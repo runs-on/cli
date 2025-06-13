@@ -105,7 +105,7 @@ func NewConnectCmd() *cobra.Command {
 			}
 
 			// Determine shell command based on platform type
-			shellCmd := "cd /home/runner && bash"
+			shellCmd := "cd /home/runner && sudo -s bash"
 			if describeOutput.InstanceInformationList[0].PlatformType == "Windows" {
 				// will still work even if directory does not exist (defaults to C:\Windows\system32)
 				shellCmd = "cd C:\\actions-runner; powershell"
