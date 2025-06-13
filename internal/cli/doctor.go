@@ -41,6 +41,7 @@ type StackDoctor struct {
 	httpClient *http.Client
 	result     *DoctorResult
 	outputs    map[string]string // Cache stack outputs
+	workDir    string            // Temporary workspace directory
 }
 
 func NewStackDoctor(config *RunsOnConfig) *StackDoctor {
@@ -112,11 +113,6 @@ func (d *StackDoctor) loadStackOutputs(ctx context.Context) error {
 func (d *StackDoctor) checkStackHealth(ctx context.Context) error {
 	fmt.Print("Checking CloudFormation stack health...")
 
-	err := d.loadStackOutputs(ctx)
-	if err != nil {
-		return d.failCheck("CloudFormation stack health", "Failed to describe stack", err)
-	}
-
 	// Get stack status from the same API call
 	out, err := d.cfn.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
 		StackName: &d.stackName,
@@ -141,10 +137,6 @@ func (d *StackDoctor) checkStackHealth(ctx context.Context) error {
 
 func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 	fmt.Print("Checking AppRunner service...")
-
-	if err := d.loadStackOutputs(ctx); err != nil {
-		return d.failCheck("AppRunner service running", "Failed to get stack outputs", err)
-	}
 
 	serviceArn, ok := d.outputs["RunsOnServiceArn"]
 	if !ok {
@@ -189,11 +181,6 @@ func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 }
 
 func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) error {
-	if err := d.loadStackOutputs(ctx); err != nil {
-		fmt.Print("Checking AppRunner service endpoint...")
-		return d.failCheck("AppRunner service endpoint accessible", "Failed to get stack outputs", err)
-	}
-
 	entryPoint, ok := d.outputs["RunsOnEntryPoint"]
 	if !ok {
 		fmt.Print("Checking AppRunner service endpoint...")
@@ -232,10 +219,6 @@ func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) error {
 func (d *StackDoctor) checkCongratsResponse(ctx context.Context) error {
 	fmt.Print("Checking for 'Congrats' response...")
 
-	if err := d.loadStackOutputs(ctx); err != nil {
-		return d.failCheck("AppRunner service returns 'Congrats'", "Failed to get stack outputs", err)
-	}
-
 	entryPoint, ok := d.outputs["RunsOnEntryPoint"]
 	if !ok {
 		err := fmt.Errorf("RunsOnEntryPoint not found in stack outputs")
@@ -273,10 +256,6 @@ func (d *StackDoctor) checkCongratsResponse(ctx context.Context) error {
 func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, error) {
 	fmt.Print("Fetching AppRunner logs...")
 
-	if err := d.loadStackOutputs(ctx); err != nil {
-		return 0, d.failCheck("Logs fetched", "Failed to get stack outputs", err)
-	}
-
 	serviceArn, ok := d.outputs["RunsOnServiceArn"]
 	if !ok {
 		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
@@ -286,8 +265,9 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 	// Convert AppRunner ARN to CloudWatch log group ARN
 	logGroupArn := getLogGroupArn(serviceArn)
 
-	// Create logs directory
-	err := os.MkdirAll("logs", 0755)
+	// Create logs directory in workspace
+	logsDir := filepath.Join(d.workDir, "logs")
+	err := os.MkdirAll(logsDir, 0755)
 	if err != nil {
 		return 0, d.failCheck("Logs fetched", "Failed to create logs directory", err)
 	}
@@ -300,7 +280,7 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 	}
 
 	var totalLines int
-	logFile, err := os.Create("logs/application.log")
+	logFile, err := os.Create(filepath.Join(logsDir, "application.log"))
 	if err != nil {
 		return 0, d.failCheck("Logs fetched", "Failed to create log file", err)
 	}
@@ -327,13 +307,14 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 }
 
 func (d *StackDoctor) saveResults() error {
-	// Save checks.json
+	// Save checks.json in workspace
 	checksData, err := json.MarshalIndent(d.result, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal results: %w", err)
 	}
 
-	err = os.WriteFile("checks.json", checksData, 0644)
+	checksPath := filepath.Join(d.workDir, "checks.json")
+	err = os.WriteFile(checksPath, checksData, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write checks.json: %w", err)
 	}
@@ -354,14 +335,16 @@ func (d *StackDoctor) createZipFile() (string, error) {
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 
-	// Add checks.json
-	err = addFileToZip(zipWriter, "checks.json")
+	// Add checks.json from workspace
+	checksPath := filepath.Join(d.workDir, "checks.json")
+	err = addFileToZipWithPath(zipWriter, checksPath, "checks.json")
 	if err != nil {
 		return "", fmt.Errorf("failed to add checks.json to zip: %w", err)
 	}
 
-	// Add logs directory
-	err = addDirectoryToZip(zipWriter, "logs")
+	// Add logs directory from workspace
+	logsDir := filepath.Join(d.workDir, "logs")
+	err = addDirectoryToZip(zipWriter, logsDir)
 	if err != nil {
 		return "", fmt.Errorf("failed to add logs directory to zip: %w", err)
 	}
@@ -369,8 +352,8 @@ func (d *StackDoctor) createZipFile() (string, error) {
 	return zipFileName, nil
 }
 
-func addFileToZip(zipWriter *zip.Writer, filename string) error {
-	file, err := os.Open(filename)
+func addFileToZipWithPath(zipWriter *zip.Writer, filePath, zipPath string) error {
+	file, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
@@ -385,7 +368,7 @@ func addFileToZip(zipWriter *zip.Writer, filename string) error {
 	if err != nil {
 		return err
 	}
-	header.Name = filename
+	header.Name = zipPath
 
 	writer, err := zipWriter.CreateHeader(header)
 	if err != nil {
@@ -429,12 +412,24 @@ func addDirectoryToZip(zipWriter *zip.Writer, dirname string) error {
 }
 
 func (d *StackDoctor) cleanup() {
-	os.Remove("checks.json")
-	os.RemoveAll("logs")
+	if d.workDir != "" {
+		os.RemoveAll(d.workDir)
+	}
 }
 
 func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
+	// Create temporary workspace directory
+	var err error
+	d.workDir, err = os.MkdirTemp("", "roc-doctor-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary workspace: %w", err)
+	}
 	defer d.cleanup()
+
+	// Load stack outputs once at the beginning
+	if err := d.loadStackOutputs(ctx); err != nil {
+		return fmt.Errorf("failed to load stack outputs: %w", err)
+	}
 
 	// Run all checks
 	d.checkStackHealth(ctx)
@@ -444,7 +439,7 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 	d.fetchLogs(ctx, since)
 
 	// Save results
-	err := d.saveResults()
+	err = d.saveResults()
 	if err != nil {
 		return fmt.Errorf("failed to save results: %w", err)
 	}
