@@ -68,11 +68,12 @@ func NewRootCmd() *cobra.Command {
 		defaultStack = "runs-on"
 	}
 
-	cmd.PersistentFlags().String("stack", defaultStack, "CloudFormation stack name")
+	cmd.PersistentFlags().String("stack", defaultStack, "CloudFormation stack name (can also be set via RUNS_ON_STACK_NAME env var)")
 
 	cmd.AddCommand(
 		NewLogsCmd(),
 		NewConnectCmd(),
+		NewStackCmd(),
 	)
 
 	return cmd

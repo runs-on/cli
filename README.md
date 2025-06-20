@@ -46,7 +46,7 @@ Global Flags:
 Example:
 
 ```bash
-roc connect https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899
+AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899
 ```
 
 ## `roc logs`
@@ -70,7 +70,51 @@ Global Flags:
 Example:
 
 ```bash
-roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --watch
+AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --watch
+```
+
+## `roc stack doctor`
+
+Diagnose RunsOn stack health and export troubleshooting information.
+
+This command performs comprehensive health checks on your RunsOn CloudFormation stack:
+- Verifies CloudFormation stack status
+- Checks AppRunner service health and version
+- Tests endpoint accessibility  
+- Validates service configuration
+- Fetches application logs
+
+Results are exported as a timestamped ZIP file containing checks.json and logs.
+
+```
+Usage:
+  roc stack doctor [flags]
+
+Flags:
+  -h, --help           help for doctor
+      --since string   Fetch logs since duration (e.g. 30m, 2h, 24h) (default "24h")
+
+Global Flags:
+      --stack string   CloudFormation stack name (default "runs-on")
+```
+
+Example:
+
+```bash
+AWS_PROFILE=runs-on-admin roc stack doctor --since 2h
+```
+
+Output:
+
+```
+Checking CloudFormation stack health (https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/stackinfo?stackId=runs-on-test)... ✅ (status: UPDATE_COMPLETE)
+Checking AppRunner service (https://console.aws.amazon.com/apprunner/home?region=us-east-1#/services/RunsOnService-4rHCauYu4m23)... ✅ (version: v2.8.4)
+Checking AppRunner service endpoint (https://wxrwksit5a.us-east-1.awsapprunner.com)... ✅
+Checking for 'Congrats' response... ✅
+Fetching AppRunner application logs (since 24h0m0s)... ✅ (5419 lines)
+Fetching AppRunner service logs (since 14 days)... ✅ (13 lines)
+
+Full results exported to: /Users/crohr/dev/runs-on/cli/roc-doctor-2025-06-20-12-40-29.zip
 ```
 
 ## Contributing
@@ -78,7 +122,6 @@ roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/3466195
 Contributions are welcome! Ideas of future improvements:
 
 * Make the CloudFormation stack create an IAM role for the CLI to use, so that the CLI automatically assumes it when launched with an admin role?
-* `roc stack doctor` - check RunsOn stack and make sure everything is healthy (AppRunner endpoint health check, GitHub App webhook deliveries, etc.).
 * `roc stack pause|resume` - set RunsOn in maintenance mode (queue incoming jobs, but don't start them), to perform an upgrade.
 * `roc stack upgrade` - upgrade RunsOn stack to the latest version.
 * `roc stack logs` - fetch RunsOn server logs.

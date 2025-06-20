@@ -27,3 +27,5 @@ go.work.sum
 # binary
 /roc
 /dist
+# doctor files
+/roc-*

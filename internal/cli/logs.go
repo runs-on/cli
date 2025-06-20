@@ -318,7 +318,7 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval ti
 
 	collector.wg.Add(1)
 	go func() {
-		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn)
+		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
 		if err := f.streamLogs(ctx, watch, watchInterval, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
 			input.LogGroupIdentifier = &logGroupArn
 			filterPatterns := []string{}
@@ -376,8 +376,8 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval ti
 	}
 }
 
-func getLogGroupArn(arn string) string {
-	return fmt.Sprintf("%s/application", strings.Replace(strings.Replace(arn, "apprunner", "logs", 1), ":service", ":log-group:/aws/apprunner", 1))
+func getLogGroupArn(arn string, name string) string {
+	return fmt.Sprintf("%s/%s", strings.Replace(strings.Replace(arn, "apprunner", "logs", 1), ":service", ":log-group:/aws/apprunner", 1), name)
 }
 
 func extractJobID(input string) string {
