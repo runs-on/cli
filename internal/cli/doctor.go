@@ -84,7 +84,7 @@ func (d *StackDoctor) printCheckResult(message, status, details string) {
 
 func (d *StackDoctor) failCheck(name, message string, err error) error {
 	d.addCheck(name, "❌", message, err)
-	d.printCheckResult("", "❌", "")
+	d.printCheckResult("", "❌", message)
 	return err
 }
 
@@ -111,7 +111,9 @@ func (d *StackDoctor) loadStackOutputs(ctx context.Context) error {
 }
 
 func (d *StackDoctor) checkStackHealth(ctx context.Context) error {
-	fmt.Print("Checking CloudFormation stack health...")
+	region := d.cfg.Region
+	cfnURL := fmt.Sprintf("https://console.aws.amazon.com/cloudformation/home?region=%s#/stacks/stackinfo?stackId=%s", region, d.stackName)
+	fmt.Printf("Checking CloudFormation stack health (%s)...", cfnURL)
 
 	// Get stack status from the same API call
 	out, err := d.cfn.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
@@ -136,13 +138,24 @@ func (d *StackDoctor) checkStackHealth(ctx context.Context) error {
 }
 
 func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
-	fmt.Print("Checking AppRunner service...")
-
 	serviceArn, ok := d.outputs["RunsOnServiceArn"]
 	if !ok {
+		fmt.Print("Checking AppRunner service...")
 		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
 		return d.failCheck("AppRunner service running", "Service ARN not found", err)
 	}
+
+	// Extract service name from ARN for console URL
+	// ARN format: arn:aws:apprunner:region:account:service/service-name/service-id
+	parts := strings.Split(serviceArn, "/")
+	var serviceName string
+	if len(parts) >= 2 {
+		serviceName = parts[1]
+	}
+
+	region := d.cfg.Region
+	appRunnerURL := fmt.Sprintf("https://console.aws.amazon.com/apprunner/home?region=%s#/services/%s", region, serviceName)
+	fmt.Printf("Checking AppRunner service (%s)...", appRunnerURL)
 
 	expectedTag := d.outputs["RunsOnAppTag"]
 
@@ -199,7 +212,7 @@ func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) error {
 	resp, err := d.httpClient.Get(entryPoint)
 	if err != nil {
 		d.addCheck("AppRunner service endpoint accessible", "❌", fmt.Sprintf("Failed to connect to %s", entryPoint), err)
-		d.printCheckResult("", "❌", "")
+		d.printCheckResult("", "❌", "failed to connect")
 		return err
 	}
 	defer resp.Body.Close()
@@ -257,12 +270,7 @@ func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, serviceArn, logGro
 	// Convert AppRunner ARN to CloudWatch log group ARN
 	logGroupArn := getLogGroupArn(serviceArn, logGroupType)
 
-	// Create logs directory in workspace
 	logsDir := filepath.Join(d.workDir, "logs")
-	err := os.MkdirAll(logsDir, 0755)
-	if err != nil {
-		return 0, err
-	}
 
 	startTime := time.Now().Add(-since)
 
@@ -297,10 +305,18 @@ func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, serviceArn, logGro
 }
 
 func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, error) {
+	// Always create logs directory structure, even if we can't fetch logs
+	logsDir := filepath.Join(d.workDir, "logs")
+	err := os.MkdirAll(logsDir, 0755)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create logs directory: %w", err)
+	}
+
 	serviceArn, ok := d.outputs["RunsOnServiceArn"]
 	if !ok {
-		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
-		return 0, d.failCheck("Logs fetched", "Service ARN not found", err)
+		// Skip logs fetching for failed stacks - this is expected
+		d.addCheck("Logs fetched", "⏭️", "Skipped - service not available", nil)
+		return 0, nil
 	}
 
 	// Fetch application logs
@@ -367,6 +383,7 @@ func (d *StackDoctor) createZipFile() (string, error) {
 		return "", fmt.Errorf("failed to read logs directory: %w", err)
 	}
 
+	// Add log files if any exist
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			logPath := filepath.Join(logsDir, entry.Name())
