@@ -55,8 +55,6 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 	var debug bool
 	var wait bool
 	var delay time.Duration
-	var clean bool
-	var skipChecks bool
 
 	cmd := &cobra.Command{
 		Use:           "interrupt JOB_ID|JOB_URL",
@@ -122,63 +120,54 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			}
 			logger.Printf("✓ AWS connectivity verified (Account: %s)\n", *identity.Account)
 
-			if !skipChecks {
-				// Pre-flight checks for required services and permissions
-				logger.Printf("Performing pre-flight checks...\n")
+			// Pre-flight checks for required services and permissions
+			logger.Printf("Performing pre-flight checks...\n")
 
-				// Check FIS service access
-				fisClient := fis.NewFromConfig(config.AWSConfig)
-				logger.Printf("Testing FIS service access...\n")
-				_, err = fisClient.ListExperimentTemplates(ctx, &fis.ListExperimentTemplatesInput{})
-				if err != nil {
-					if strings.Contains(err.Error(), "ResolveEndpointV2") {
-						return fmt.Errorf("AWS FIS service endpoint resolution failed in region %s.\n\nThis could indicate:\n1. FIS service is not available in this region\n2. Network/VPC restrictions preventing FIS access\n3. Service endpoint configuration issues\n\nTry using --skip-checks to bypass pre-flight validation, or contact AWS support.\n\nError: %v", region, err)
-					}
-					if strings.Contains(err.Error(), "AccessDenied") {
-						return fmt.Errorf("insufficient permissions for AWS FIS in region %s.\n\nRequired permissions:\n- fis:ListExperimentTemplates\n- fis:CreateExperimentTemplate\n- fis:StartExperiment\n- fis:GetExperiment\n- fis:DeleteExperimentTemplate\n- ec2:DescribeInstances\n- iam:CreateRole\n- iam:PutRolePolicy\n- sts:GetCallerIdentity\n\nError: %v", region, err)
-					}
-					logger.Printf("FIS pre-flight check warning: %v\n", err)
-				} else {
-					logger.Printf("✓ FIS service access verified\n")
+			// Check FIS service access
+			fisClient := fis.NewFromConfig(config.AWSConfig)
+			logger.Printf("Testing FIS service access...\n")
+			_, err = fisClient.ListExperimentTemplates(ctx, &fis.ListExperimentTemplatesInput{})
+			if err != nil {
+				if strings.Contains(err.Error(), "ResolveEndpointV2") {
+					return fmt.Errorf("AWS FIS service endpoint resolution failed in region %s.\n\nThis could indicate:\n1. FIS service is not available in this region\n2. Network/VPC restrictions preventing FIS access\n3. Service endpoint configuration issues\n\nContact AWS support or try a different region.\n\nError: %v", region, err)
 				}
+				if strings.Contains(err.Error(), "AccessDenied") {
+					return fmt.Errorf("insufficient permissions for AWS FIS in region %s.\n\nRequired permissions:\n- fis:ListExperimentTemplates\n- fis:CreateExperimentTemplate\n- fis:StartExperiment\n- fis:GetExperiment\n- fis:DeleteExperimentTemplate\n- ec2:DescribeInstances\n- iam:CreateRole\n- iam:PutRolePolicy\n- sts:GetCallerIdentity\n\nError: %v", region, err)
+				}
+				logger.Printf("FIS pre-flight check warning: %v\n", err)
 			} else {
-				logger.Printf("Skipping pre-flight checks as requested\n")
+				logger.Printf("✓ FIS service access verified\n")
 			}
 
-			if !skipChecks {
-				// Check EC2 instance details
-				ec2Client := ec2.NewFromConfig(config.AWSConfig)
-				logger.Printf("Verifying instance %s details...\n", instanceID)
+			// Check EC2 instance details
+			ec2Client := ec2.NewFromConfig(config.AWSConfig)
+			logger.Printf("Verifying instance %s details...\n", instanceID)
 
-				instanceResp, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-					InstanceIds: []string{instanceID},
-				})
-				if err != nil {
-					return fmt.Errorf("failed to describe instance %s: %w\n\nTry using --skip-checks to bypass instance validation", instanceID, err)
-				}
-
-				if len(instanceResp.Reservations) == 0 || len(instanceResp.Reservations[0].Instances) == 0 {
-					return fmt.Errorf("instance %s not found", instanceID)
-				}
-
-				instance := instanceResp.Reservations[0].Instances[0]
-				logger.Printf("Instance lifecycle: %v, state: %v\n", instance.InstanceLifecycle, instance.State.Name)
-
-				if instance.InstanceLifecycle != "spot" {
-					return fmt.Errorf("instance %s is not a spot instance (lifecycle: %v). Spot interruptions can only be triggered on spot instances", instanceID, instance.InstanceLifecycle)
-				}
-
-				if instance.State.Name != "running" {
-					return fmt.Errorf("instance %s is not running (state: %v). Instance must be running to trigger spot interruption", instanceID, instance.State.Name)
-				}
-
-				logger.Printf("✓ Instance %s is a running spot instance\n", instanceID)
-			} else {
-				logger.Printf("Skipping instance validation (assuming %s is a running spot instance)\n", instanceID)
+			instanceResp, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+				InstanceIds: []string{instanceID},
+			})
+			if err != nil {
+				return fmt.Errorf("failed to describe instance %s: %w", instanceID, err)
 			}
+
+			if len(instanceResp.Reservations) == 0 || len(instanceResp.Reservations[0].Instances) == 0 {
+				return fmt.Errorf("instance %s not found", instanceID)
+			}
+
+			instance := instanceResp.Reservations[0].Instances[0]
+			logger.Printf("Instance lifecycle: %v, state: %v\n", instance.InstanceLifecycle, instance.State.Name)
+
+			if instance.InstanceLifecycle != "spot" {
+				return fmt.Errorf("instance %s is not a spot instance (lifecycle: %v). Spot interruptions can only be triggered on spot instances", instanceID, instance.InstanceLifecycle)
+			}
+
+			if instance.State.Name != "running" {
+				return fmt.Errorf("instance %s is not running (state: %v). Instance must be running to trigger spot interruption", instanceID, instance.State.Name)
+			}
+
+			logger.Printf("✓ Instance %s is a running spot instance\n", instanceID)
 
 			// Create AWS clients
-			fisClient := fis.NewFromConfig(config.AWSConfig)
 			iamClient := iam.NewFromConfig(config.AWSConfig)
 
 			// Trigger spot interruption
@@ -192,7 +181,7 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			fmt.Printf("Started FIS experiment: %s\n", *experiment.Id)
 
 			// Monitor experiment
-			if err := monitorExperiment(ctx, fisClient, experiment, delay, clean, logger); err != nil {
+			if err := monitorExperiment(ctx, fisClient, experiment, delay, true, logger); err != nil {
 				return fmt.Errorf("error monitoring experiment: %w", err)
 			}
 
@@ -204,8 +193,6 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 	cmd.Flags().BoolVar(&debug, "debug", false, "Enable debug output")
 	cmd.Flags().BoolVarP(&wait, "wait", "w", false, "Wait for instance ID if not found")
 	cmd.Flags().DurationVar(&delay, "delay", 5*time.Second, "Delay before interruption (e.g., 2m, 30s)")
-	cmd.Flags().BoolVar(&clean, "clean", true, "Clean up FIS experiment after completion")
-	cmd.Flags().BoolVar(&skipChecks, "skip-checks", false, "Skip pre-flight checks (use with caution)")
 
 	return cmd
 }
