@@ -44,6 +44,7 @@ func NewRootCmd(stack *Stack) *cobra.Command {
 	cmd.AddCommand(
 		NewLogsCmd(stack),
 		NewConnectCmd(stack),
+		NewInterruptCmd(stack),
 		NewStackCmd(stack),
 	)
 
