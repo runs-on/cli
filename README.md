@@ -73,6 +73,51 @@ Example:
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --watch
 ```
 
+## `roc interrupt`
+
+Trigger a spot interruption on the instance running a specific job, simulating a spot instance interruption for testing purposes.
+
+This command uses AWS Fault Injection Simulator (FIS) to send a spot interruption notification to the running instance.
+
+```
+Usage:
+  roc interrupt JOB_ID|JOB_URL [flags]
+
+Flags:
+      --debug            Enable debug output
+      --delay duration   Delay before interruption (e.g., 2m, 30s) (default 5s)
+  -h, --help             help for interrupt
+  -w, --wait             Wait for instance ID if not found
+
+Global Flags:
+      --stack string   CloudFormation stack name (default "runs-on")
+```
+
+**Requirements:**
+- The target instance must be a running spot instance
+- AWS FIS service must be available in your region
+
+**How it works:**
+1. Validates the instance is a running spot instance
+2. Creates an IAM role for FIS if it doesn't exist
+3. Creates and starts a FIS experiment to send the interruption
+4. Monitors the experiment progress
+5. Automatically cleans up the experiment template when complete
+
+Example:
+
+```bash
+AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899
+```
+
+```bash
+# Wait for instance if job hasn't started yet
+AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --wait
+
+# Custom delay before interruption (default is 5 seconds)
+AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --delay 30s
+```
+
 ## `roc stack doctor`
 
 Diagnose RunsOn stack health and export troubleshooting information.
@@ -126,6 +171,7 @@ Contributions are welcome! Ideas of future improvements:
 * `roc stack upgrade` - upgrade RunsOn stack to the latest version.
 * `roc stack logs` - fetch RunsOn server logs.
 * `roc cache [list|clear]` - list or clear cached data for a specific repository.
+* `roc ssh JOB_ID|JOB_URL` - SSH directly to an instance (alternative to SSM for cases where SSM isn't available).
 
 ## License
 
