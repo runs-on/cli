@@ -27,6 +27,14 @@ type StackOutputs struct {
 	BucketConfig           string
 }
 
+type LogOptions struct {
+	Watch         bool
+	WatchInterval time.Duration
+	StartTime     int64
+	Format        string
+	NoColor       bool
+}
+
 type LogFetcher struct {
 	cfg         aws.Config
 	cwl         *cloudwatchlogs.Client
@@ -38,6 +46,7 @@ type LogFetcher struct {
 	jobID       string
 	workflowJob *github.WorkflowJob
 	logger      *log.Logger
+	collector   *logCollector
 }
 
 func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
@@ -152,17 +161,44 @@ type logEvent struct {
 	stream    string
 	timestamp int64
 	eventId   string
+	noColor   bool
 }
 
-func (e *logEvent) print() {
-	localTime := time.UnixMilli(e.timestamp).Local().Format("15:04:05.000")
+type applicationLogEvent struct {
+	Message    string    `json:"message"`
+	AppVersion string    `json:"app_version"`
+	RunID      int64     `json:"run_id"`
+	Label      []string  `json:"labels"`
+	Timestamp  time.Time `json:"time"`
+}
+
+func (e *logEvent) print(format string) {
+	message := e.message
+	localTime := time.UnixMilli(e.timestamp).Local().Format("2006-01-02T15:04:05.000Z07:00")
+
+	if format == "short" && e.prefix == "application" {
+		applicationLogEvent := &applicationLogEvent{}
+		err := json.Unmarshal([]byte(message), applicationLogEvent)
+		if err == nil {
+			message = applicationLogEvent.Message
+			localTime = applicationLogEvent.Timestamp.Local().Format("2006-01-02T15:04:05.000Z07:00")
+		}
+	}
+
+	if e.noColor {
+		fmt.Printf("%s [%s] %s\n", localTime, e.stream, message)
+		return
+	}
+
+	// Default "long" format
+
 	color := "\033[34m" // blue for instance
 	stream := e.stream
 	if e.prefix == "application" {
 		color = "\033[33m" // yellow for application
 		stream = e.prefix
 	}
-	fmt.Printf("\033[90m%s\033[0m %s[%s]\033[0m %s\n", localTime, color, stream, e.message)
+	fmt.Printf("\033[90m%s\033[0m %s[%s]\033[0m %s\n", localTime, color, stream, message)
 }
 
 type logCollector struct {
@@ -203,14 +239,8 @@ func (c *logCollector) add(event logEvent) {
 	}
 }
 
-type contextKey string
-
-const (
-	collectorKey contextKey = "collector"
-)
-
-func (f *LogFetcher) streamLogs(ctx context.Context, watch bool, watchInterval time.Duration, prefix string, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) error {
-	collector := ctx.Value(collectorKey).(*logCollector)
+func (f *LogFetcher) streamLogs(ctx context.Context, prefix string, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, opts *LogOptions) error {
+	collector := f.collector
 
 	input := &cloudwatchlogs.FilterLogEventsInput{}
 
@@ -247,6 +277,7 @@ func (f *LogFetcher) streamLogs(ctx context.Context, watch bool, watchInterval t
 						stream:    *event.LogStreamName,
 						timestamp: *event.Timestamp,
 						eventId:   *event.EventId,
+						noColor:   opts.NoColor,
 					})
 
 					if event.Timestamp != nil && *event.Timestamp > lastTimestamp {
@@ -271,16 +302,16 @@ func (f *LogFetcher) streamLogs(ctx context.Context, watch bool, watchInterval t
 			pastEventsCollected = true
 			collector.wg.Done()
 		}
-		if !watch {
+		if !opts.Watch {
 			break
 		}
-		time.Sleep(watchInterval)
+		time.Sleep(opts.WatchInterval)
 	}
 
 	return nil
 }
 
-func (f *LogFetcher) streamInstanceLogs(ctx context.Context, watch bool, watchInterval time.Duration) error {
+func (f *LogFetcher) streamInstanceLogs(ctx context.Context, opts *LogOptions) error {
 	updateInput := func(input *cloudwatchlogs.FilterLogEventsInput) error {
 		input.LogGroupIdentifier = &f.outputs.EC2InstanceLogGroupArn
 		input.FilterPattern = aws.String("")
@@ -302,16 +333,16 @@ func (f *LogFetcher) streamInstanceLogs(ctx context.Context, watch bool, watchIn
 		return nil
 	}
 
-	return f.streamLogs(ctx, watch, watchInterval, "instance", updateInput)
+	return f.streamLogs(ctx, "instance", updateInput, opts)
 }
 
-func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval time.Duration, startTime int64) error {
-	collector := newLogCollector()
-	ctx = context.WithValue(ctx, collectorKey, collector)
+func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
+	f.collector = newLogCollector()
+	collector := f.collector
 
 	collector.wg.Add(1)
 	go func() {
-		if err := f.streamInstanceLogs(ctx, watch, watchInterval); err != nil {
+		if err := f.streamInstanceLogs(ctx, opts); err != nil {
 			f.logger.Printf("Error streaming instance logs: %v", err)
 		}
 	}()
@@ -319,7 +350,7 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval ti
 	collector.wg.Add(1)
 	go func() {
 		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
-		if err := f.streamLogs(ctx, watch, watchInterval, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
+		if err := f.streamLogs(ctx, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
 			input.LogGroupIdentifier = &logGroupArn
 			filterPatterns := []string{}
 			if f.workflowJob != nil {
@@ -338,7 +369,7 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval ti
 			input.FilterPattern = aws.String(fmt.Sprintf("{ %s }", strings.Join(filterPatterns, " || ")))
 			f.logger.Printf("Filter pattern: %s", *input.FilterPattern)
 			return nil
-		}); err != nil {
+		}, opts); err != nil {
 			f.logger.Printf("Error streaming application logs: %v", err)
 		}
 	}()
@@ -351,25 +382,28 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, watch bool, watchInterval ti
 	sort.Slice(collector.events, func(i, j int) bool {
 		return collector.events[i].timestamp < collector.events[j].timestamp
 	})
+	format := opts.Format
+	if format == "" {
+		format = "long"
+	}
 	for _, event := range collector.events {
-		event.print()
+		event.print(format)
 	}
 	collector.pastEventsCollected = true
 	collector.mu.Unlock()
 
-	if !watch {
+	if !opts.Watch {
 		return nil
 	}
 
-	// Watch for new events
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case event := <-collector.eventCh:
-			event.print()
+			event.print(format)
 		case <-time.After(10 * time.Second):
-			if !watch {
+			if !opts.Watch {
 				return nil
 			}
 		}
@@ -395,11 +429,13 @@ func extractJobID(input string) string {
 	return input
 }
 
-func NewLogsCmd() *cobra.Command {
+func NewLogsCmd(stack *Stack) *cobra.Command {
 	var (
 		watchDuration string
 		since         string
 		debug         bool
+		noColor       bool
+		format        string
 	)
 
 	cmd := &cobra.Command{
@@ -407,7 +443,7 @@ func NewLogsCmd() *cobra.Command {
 		Short: "Fetch RunsOn and instance logs for a specific job ID",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			config, err := getStackOutputs(cmd)
+			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
 				return err
 			}
@@ -443,7 +479,13 @@ func NewLogsCmd() *cobra.Command {
 				watchInterval = duration
 			}
 
-			return fetcher.FetchLogs(ctx, watch, watchInterval, startTime.UnixMilli())
+			return fetcher.FetchLogs(ctx, &LogOptions{
+				Watch:         watch,
+				WatchInterval: watchInterval,
+				StartTime:     startTime.UnixMilli(),
+				Format:        format,
+				NoColor:       noColor,
+			})
 		},
 	}
 
@@ -451,5 +493,7 @@ func NewLogsCmd() *cobra.Command {
 	cmd.Flags().Lookup("watch").NoOptDefVal = "5s"
 	cmd.Flags().StringVarP(&since, "since", "s", "2h", "Show logs since duration (e.g. 30m, 2h)")
 	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
+	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output")
 	return cmd
 }

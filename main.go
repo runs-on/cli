@@ -25,10 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Store AWS config in context
-	ctx = context.WithValue(ctx, "aws_config", cfg)
-
-	if err := cli.NewRootCmd().ExecuteContext(ctx); err != nil {
+	if err := cli.NewRootCmd(cli.NewStack(cfg)).ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
