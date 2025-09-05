@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func NewConnectCmd() *cobra.Command {
+func NewConnectCmd(stack *Stack) *cobra.Command {
 	var debug bool
 	var watch bool
 
@@ -27,7 +27,7 @@ func NewConnectCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			config, err := getStackOutputs(cmd)
+			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
 				return err
 			}

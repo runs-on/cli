@@ -506,7 +506,7 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 	return nil
 }
 
-func NewDoctorCmd() *cobra.Command {
+func NewDoctorCmd(stack *Stack) *cobra.Command {
 	var since string
 
 	cmd := &cobra.Command{
@@ -523,10 +523,10 @@ This command performs comprehensive health checks on your RunsOn CloudFormation 
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.
 
-The stack name can be overridden using the RUNS_ON_STACK_NAME environment variable.`,
+The stack name can be overridden using the RUNS_ON_STACK_NAME or RUNS_ON_STACK environment variable.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			config, err := getStackOutputs(cmd)
+			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
 				return err
 			}
