@@ -175,6 +175,47 @@ Fetching AppRunner service logs (since 14 days)... ✅ (13 lines)
 Full results exported to: /Users/crohr/dev/runs-on/cli/roc-doctor-2025-06-20-12-40-29.zip
 ```
 
+## `roc stack logs`
+
+Stream all RunsOn application logs from CloudWatch log streams.
+
+This command streams all application logs from the RunsOn service, not filtered by specific jobs. Use this to monitor overall service activity and troubleshoot system-wide issues.
+
+```
+Usage:
+  roc stack logs [flags]
+
+Flags:
+  -d, --debug                 Enable debug output
+  -f, --format string         Output format: long (default) or short (default "long")
+  -h, --help                  help for logs
+      --no-color              Disable color output
+  -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
+  -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
+
+Global Flags:
+      --stack string   CloudFormation stack name (default "runs-on")
+```
+
+Examples:
+
+```bash
+# Stream last 2 hours of application logs (default)
+AWS_PROFILE=runs-on-admin roc stack logs
+
+# Stream last 24 hours of logs
+AWS_PROFILE=runs-on-admin roc stack logs --since 24h
+
+# Stream logs with watch mode (refreshes every 5 seconds)
+AWS_PROFILE=runs-on-admin roc stack logs --watch
+
+# Stream logs with custom watch interval
+AWS_PROFILE=runs-on-admin roc stack logs --watch 10s
+
+# Stream logs in short format without color
+AWS_PROFILE=runs-on-admin roc stack logs --format short --no-color
+```
+
 ## Contributing
 
 Contributions are welcome! Ideas of future improvements:
@@ -182,7 +223,6 @@ Contributions are welcome! Ideas of future improvements:
 * Make the CloudFormation stack create an IAM role for the CLI to use, so that the CLI automatically assumes it when launched with an admin role?
 * `roc stack pause|resume` - set RunsOn in maintenance mode (queue incoming jobs, but don't start them), to perform an upgrade.
 * `roc stack upgrade` - upgrade RunsOn stack to the latest version.
-* `roc stack logs` - fetch RunsOn server logs.
 * `roc cache [list|clear]` - list or clear cached data for a specific repository.
 * `roc ssh JOB_ID|JOB_URL` - SSH directly to an instance (alternative to SSM for cases where SSM isn't available).
 

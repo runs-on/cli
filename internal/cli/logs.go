@@ -497,6 +497,63 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 	}
 }
 
+func (f *LogFetcher) FetchAllApplicationLogs(ctx context.Context, opts *LogOptions) error {
+	f.collector = newLogCollector()
+	collector := f.collector
+
+	collector.wg.Add(1)
+	go func() {
+		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
+		if err := f.streamLogs(ctx, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
+			input.LogGroupIdentifier = &logGroupArn
+			// No filtering pattern for all logs
+			input.FilterPattern = aws.String("")
+			// Set start time from options
+			if input.StartTime == nil {
+				input.StartTime = aws.Int64(opts.StartTime)
+			}
+			return nil
+		}, opts); err != nil {
+			f.logger.Printf("Error streaming application logs: %v", err)
+		}
+	}()
+
+	// Wait for initial events to be collected
+	collector.wg.Wait()
+
+	collector.mu.Lock()
+	f.logger.Printf("Draining remaining events")
+	sort.Slice(collector.events, func(i, j int) bool {
+		return collector.events[i].timestamp < collector.events[j].timestamp
+	})
+	format := opts.Format
+	if format == "" {
+		format = "long"
+	}
+	for _, event := range collector.events {
+		event.print(format)
+	}
+	collector.pastEventsCollected = true
+	collector.mu.Unlock()
+
+	if !opts.Watch {
+		return nil
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case event := <-collector.eventCh:
+			event.print(format)
+		case <-time.After(10 * time.Second):
+			if !opts.Watch {
+				return nil
+			}
+		}
+	}
+}
+
 func getLogGroupArn(arn string, name string) string {
 	return fmt.Sprintf("%s/%s", strings.Replace(strings.Replace(arn, "apprunner", "logs", 1), ":service", ":log-group:/aws/apprunner", 1), name)
 }
@@ -590,6 +647,77 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
 	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output")
 	cmd.Flags().StringSliceVar(&includeFlags, "include", []string{}, "Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)")
+
+	return cmd
+}
+
+func NewStackLogsCmd(stack *Stack) *cobra.Command {
+	var (
+		watchDuration string
+		since         string
+		debug         bool
+		noColor       bool
+		format        string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "logs",
+		Short: "Stream all RunsOn application logs from CloudWatch",
+		Long: `Stream all RunsOn application logs from the CloudWatch log group.
+		
+This command streams all application logs from the RunsOn service, not filtered
+by specific jobs. Use this to monitor overall service activity and troubleshoot
+system-wide issues.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			config, err := stack.getStackOutputs(cmd)
+			if err != nil {
+				return err
+			}
+
+			ctx := cmd.Context()
+
+			startTime := time.Now().Add(-2 * time.Hour)
+			if since != "" {
+				duration, err := time.ParseDuration(since)
+				if err != nil {
+					return fmt.Errorf("invalid --since value: %w", err)
+				}
+				startTime = time.Now().Add(-duration)
+			}
+
+			fetcher := NewLogFetcher(config)
+			if debug {
+				fetcher.logger.SetOutput(os.Stderr)
+			}
+
+			watchInterval := 5 * time.Second
+			watch := watchDuration != ""
+			if watch && watchDuration != "true" {
+				duration, err := time.ParseDuration(watchDuration)
+				if err != nil {
+					return fmt.Errorf("invalid --watch value: %w", err)
+				}
+				watchInterval = duration
+			}
+
+			logOptions := &LogOptions{
+				Watch:         watch,
+				WatchInterval: watchInterval,
+				StartTime:     startTime.UnixMilli(),
+				Format:        format,
+				NoColor:       noColor,
+			}
+
+			return fetcher.FetchAllApplicationLogs(ctx, logOptions)
+		},
+	}
+
+	cmd.Flags().StringVarP(&watchDuration, "watch", "w", "", "Watch for new logs with optional interval (e.g. --watch 2s)")
+	cmd.Flags().Lookup("watch").NoOptDefVal = "5s"
+	cmd.Flags().StringVarP(&since, "since", "s", "2h", "Show logs since duration (e.g. 30m, 2h)")
+	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
+	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output")
 
 	return cmd
 }
