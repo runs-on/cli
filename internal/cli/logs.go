@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/go-github/v66/github"
 	"github.com/spf13/cobra"
@@ -40,6 +42,7 @@ type LogFetcher struct {
 	cwl          *cloudwatchlogs.Client
 	s3           *s3.Client
 	cfn          *cloudformation.Client
+	ec2          *ec2.Client
 	stackName    string
 	outputs      *StackOutputs
 	instanceID   string
@@ -48,7 +51,7 @@ type LogFetcher struct {
 	workflowJob  *github.WorkflowJob
 	logger       *log.Logger
 	collector    *logCollector
-	useRunFilter bool
+	includeTypes []string
 }
 
 func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
@@ -58,6 +61,7 @@ func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
 		cwl:       cloudwatchlogs.NewFromConfig(config.AWSConfig),
 		s3:        s3.NewFromConfig(config.AWSConfig),
 		cfn:       cloudformation.NewFromConfig(config.AWSConfig),
+		ec2:       ec2.NewFromConfig(config.AWSConfig),
 		stackName: config.StackName,
 		outputs: &StackOutputs{
 			AppRunnerServiceArn:    config.AppRunnerServiceArn,
@@ -68,10 +72,10 @@ func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
 	}
 }
 
-func (f *LogFetcher) Init(ctx context.Context, jobID string, useRunFilter bool) error {
+func (f *LogFetcher) Init(ctx context.Context, jobID string, includeTypes []string) error {
 	f.jobID = jobID
-	f.useRunFilter = useRunFilter
-	f.logger.Printf("Fetching logs for job ID: %s (use run filter: %v)", jobID, useRunFilter)
+	f.includeTypes = includeTypes
+	f.logger.Printf("Fetching logs for job ID: %s (include types: %v)", jobID, includeTypes)
 
 	if err := f.refreshWorkflowJobDetails(ctx); err != nil {
 		return err
@@ -81,7 +85,7 @@ func (f *LogFetcher) Init(ctx context.Context, jobID string, useRunFilter bool) 
 	}
 
 	// If using run filter, extract run ID from workflow job
-	if f.useRunFilter && f.workflowJob != nil {
+	if f.hasIncludeType("run") && f.workflowJob != nil {
 		f.runID = fmt.Sprintf("%d", *f.workflowJob.RunID)
 		f.logger.Printf("Using run ID for filtering: %s", f.runID)
 	}
@@ -113,6 +117,15 @@ func (f *LogFetcher) Init(ctx context.Context, jobID string, useRunFilter bool) 
 	}()
 
 	return nil
+}
+
+func (f *LogFetcher) hasIncludeType(includeType string) bool {
+	for _, t := range f.includeTypes {
+		if t == includeType {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *LogFetcher) refreshInstanceID(ctx context.Context) error {
@@ -205,6 +218,9 @@ func (e *logEvent) print(format string) {
 	stream := e.stream
 	if e.prefix == "application" {
 		color = "\033[33m" // yellow for application
+		stream = e.prefix
+	} else if e.prefix == "console" {
+		color = "\033[35m" // magenta for console
 		stream = e.prefix
 	}
 	fmt.Printf("\033[90m%s\033[0m %s[%s]\033[0m %s\n", localTime, color, stream, message)
@@ -345,6 +361,53 @@ func (f *LogFetcher) streamInstanceLogs(ctx context.Context, opts *LogOptions) e
 	return f.streamLogs(ctx, "instance", updateInput, opts)
 }
 
+func (f *LogFetcher) streamConsoleLogs(ctx context.Context, opts *LogOptions) error {
+	if f.instanceID == "" {
+		return fmt.Errorf("instance ID for job %s not available yet", f.jobID)
+	}
+
+	// Fetch console output from EC2 instance
+	input := &ec2.GetConsoleOutputInput{
+		InstanceId: aws.String(f.instanceID),
+	}
+
+	result, err := f.ec2.GetConsoleOutput(ctx, input)
+	if err != nil {
+		return fmt.Errorf("error fetching console logs: %w", err)
+	}
+
+	if result.Output != nil {
+		// Decode base64 encoded console output
+		decodedOutput, err := base64.StdEncoding.DecodeString(*result.Output)
+		if err != nil {
+			f.logger.Printf("Error decoding base64 console output: %v", err)
+			// If base64 decoding fails, use the raw output
+			decodedOutput = []byte(*result.Output)
+		}
+
+		timestamp := result.Timestamp.UnixMilli()
+		// Split console output into lines and add them as log events
+		lines := strings.Split(string(decodedOutput), "\n")
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			eventId := fmt.Sprintf("console-%s-%d", f.instanceID, i)
+
+			f.collector.add(logEvent{
+				message:   line,
+				prefix:    "console",
+				stream:    "console",
+				timestamp: timestamp,
+				eventId:   eventId,
+				noColor:   opts.NoColor,
+			})
+		}
+	}
+
+	return nil
+}
+
 func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 	f.collector = newLogCollector()
 	collector := f.collector
@@ -356,6 +419,17 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 		}
 	}()
 
+	// Add console logs if requested
+	if f.hasIncludeType("console") {
+		collector.wg.Add(1)
+		go func() {
+			defer collector.wg.Done()
+			if err := f.streamConsoleLogs(ctx, opts); err != nil {
+				f.logger.Printf("Error streaming console logs: %v", err)
+			}
+		}()
+	}
+
 	collector.wg.Add(1)
 	go func() {
 		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
@@ -363,7 +437,7 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 			input.LogGroupIdentifier = &logGroupArn
 			filterPatterns := []string{}
 			if f.workflowJob != nil {
-				if f.useRunFilter {
+				if f.hasIncludeType("run") {
 					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.run_id = \"%s\" )", f.runID))
 				} else {
 					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.job_id = \"%d\" )", *f.workflowJob.ID))
@@ -449,12 +523,12 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 		debug         bool
 		noColor       bool
 		format        string
-		runFlag       bool
+		includeFlags  []string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "logs JOB_ID|JOB_URL|RUN_ID",
-		Short: "Fetch RunsOn and instance logs for a specific job ID or run ID (with --run flag)",
+		Short: "Fetch RunsOn and instance logs for a specific job ID. Use --include to specify log types (run, console)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			config, err := stack.getStackOutputs(cmd)
@@ -496,8 +570,13 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				NoColor:       noColor,
 			}
 
+			// If no include flags specified, default to job logs only
+			if len(includeFlags) == 0 {
+				includeFlags = []string{}
+			}
+
 			jobID := extractJobID(args[0])
-			if err := fetcher.Init(ctx, jobID, runFlag); err != nil {
+			if err := fetcher.Init(ctx, jobID, includeFlags); err != nil {
 				return err
 			}
 			return fetcher.FetchLogs(ctx, logOptions)
@@ -510,6 +589,7 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
 	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
 	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output")
-	cmd.Flags().BoolVar(&runFlag, "run", false, "Include all logs from the entire run in addition to the single job logs")
+	cmd.Flags().StringSliceVar(&includeFlags, "include", []string{}, "Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)")
+
 	return cmd
 }
