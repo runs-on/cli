@@ -64,6 +64,7 @@ RUNS_ON_STACK_NAME environment variable (defaults to "runs-on").`,
 
 	cmd.AddCommand(
 		NewDoctorCmd(stack),
+		NewStackLogsCmd(stack),
 	)
 
 	return cmd
