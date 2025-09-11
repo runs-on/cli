@@ -1,4 +1,4 @@
-name: Release CLI
+name: Release
 
 on:
   release:
@@ -12,15 +12,17 @@ jobs:
   release:
     name: Release Go Binary
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-      - uses: wangyoucao577/go-release-action@8dbc9990292b456ae78e728c7cf7b857b821faac
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          goos: ${{ matrix.goos }}
-          goarch: ${{ matrix.goarch }}
-          binary_name: roc
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

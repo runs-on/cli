@@ -11,14 +11,14 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/v0.1.3/roc-v0.1.3-darwin-arm64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.4/roc-v0.1.4-darwin-arm64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
 Example (Linux AMD64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/v0.1.3/roc-v0.1.3-linux-amd64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.4/roc-v0.1.4-linux-amd64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
@@ -220,11 +220,10 @@ AWS_PROFILE=runs-on-admin roc stack logs --format short --no-color
 
 Contributions are welcome! Ideas of future improvements:
 
-* Make the CloudFormation stack create an IAM role for the CLI to use, so that the CLI automatically assumes it when launched with an admin role?
 * `roc stack pause|resume` - set RunsOn in maintenance mode (queue incoming jobs, but don't start them), to perform an upgrade.
 * `roc stack upgrade` - upgrade RunsOn stack to the latest version.
 * `roc cache [list|clear]` - list or clear cached data for a specific repository.
-* `roc ssh JOB_ID|JOB_URL` - SSH directly to an instance (alternative to SSM for cases where SSM isn't available).
+* `roc validate path/to/runs-on.yml` - validate the RunsOn repository configuration file.
 
 ## License
 
