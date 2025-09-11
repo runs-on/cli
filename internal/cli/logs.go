@@ -36,17 +36,19 @@ type LogOptions struct {
 }
 
 type LogFetcher struct {
-	cfg         aws.Config
-	cwl         *cloudwatchlogs.Client
-	s3          *s3.Client
-	cfn         *cloudformation.Client
-	stackName   string
-	outputs     *StackOutputs
-	instanceID  string
-	jobID       string
-	workflowJob *github.WorkflowJob
-	logger      *log.Logger
-	collector   *logCollector
+	cfg          aws.Config
+	cwl          *cloudwatchlogs.Client
+	s3           *s3.Client
+	cfn          *cloudformation.Client
+	stackName    string
+	outputs      *StackOutputs
+	instanceID   string
+	jobID        string
+	runID        string
+	workflowJob  *github.WorkflowJob
+	logger       *log.Logger
+	collector    *logCollector
+	useRunFilter bool
 }
 
 func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
@@ -66,15 +68,22 @@ func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
 	}
 }
 
-func (f *LogFetcher) Init(ctx context.Context, jobID string) error {
+func (f *LogFetcher) Init(ctx context.Context, jobID string, useRunFilter bool) error {
 	f.jobID = jobID
-	f.logger.Printf("Fetching logs for job ID: %s", jobID)
+	f.useRunFilter = useRunFilter
+	f.logger.Printf("Fetching logs for job ID: %s (use run filter: %v)", jobID, useRunFilter)
 
 	if err := f.refreshWorkflowJobDetails(ctx); err != nil {
 		return err
 	}
 	if err := f.refreshInstanceID(ctx); err != nil {
 		return err
+	}
+
+	// If using run filter, extract run ID from workflow job
+	if f.useRunFilter && f.workflowJob != nil {
+		f.runID = fmt.Sprintf("%d", *f.workflowJob.RunID)
+		f.logger.Printf("Using run ID for filtering: %s", f.runID)
 	}
 
 	// Start goroutine to refresh instance ID every 5s
@@ -354,7 +363,11 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 			input.LogGroupIdentifier = &logGroupArn
 			filterPatterns := []string{}
 			if f.workflowJob != nil {
-				filterPatterns = append(filterPatterns, fmt.Sprintf("( $.job_id = \"%d\" )", *f.workflowJob.ID))
+				if f.useRunFilter {
+					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.run_id = \"%s\" )", f.runID))
+				} else {
+					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.job_id = \"%d\" )", *f.workflowJob.ID))
+				}
 				// only set start time if it's not already set
 				if input.StartTime == nil {
 					input.StartTime = aws.Int64(f.workflowJob.CreatedAt.UnixMilli() - 10000)
@@ -362,9 +375,9 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 			} else {
 				return fmt.Errorf("workflow job queued event not found yet for job %s", f.jobID)
 			}
-			// also grep for messages mentioning the instance ID
+			// also grep for messages mentioning the instance ID (only for job filtering)
 			if f.instanceID != "" {
-				filterPatterns = append(filterPatterns, fmt.Sprintf(`( $.message = "%s" )`, f.instanceID))
+				filterPatterns = append(filterPatterns, fmt.Sprintf(`( $.message = "*%s*" )`, f.instanceID))
 			}
 			input.FilterPattern = aws.String(fmt.Sprintf("{ %s }", strings.Join(filterPatterns, " || ")))
 			f.logger.Printf("Filter pattern: %s", *input.FilterPattern)
@@ -436,11 +449,12 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 		debug         bool
 		noColor       bool
 		format        string
+		runFlag       bool
 	)
 
 	cmd := &cobra.Command{
-		Use:   "logs JOB_ID|JOB_URL",
-		Short: "Fetch RunsOn and instance logs for a specific job ID",
+		Use:   "logs JOB_ID|JOB_URL|RUN_ID",
+		Short: "Fetch RunsOn and instance logs for a specific job ID or run ID (with --run flag)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			config, err := stack.getStackOutputs(cmd)
@@ -448,7 +462,6 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				return err
 			}
 
-			jobID := extractJobID(args[0])
 			ctx := cmd.Context()
 
 			startTime := time.Now().Add(-2 * time.Hour)
@@ -465,10 +478,6 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				fetcher.logger.SetOutput(os.Stderr)
 			}
 
-			if err := fetcher.Init(ctx, jobID); err != nil {
-				return err
-			}
-
 			watchInterval := 5 * time.Second
 			watch := watchDuration != ""
 			if watch && watchDuration != "true" {
@@ -479,13 +488,19 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				watchInterval = duration
 			}
 
-			return fetcher.FetchLogs(ctx, &LogOptions{
+			logOptions := &LogOptions{
 				Watch:         watch,
 				WatchInterval: watchInterval,
 				StartTime:     startTime.UnixMilli(),
 				Format:        format,
 				NoColor:       noColor,
-			})
+			}
+
+			jobID := extractJobID(args[0])
+			if err := fetcher.Init(ctx, jobID, runFlag); err != nil {
+				return err
+			}
+			return fetcher.FetchLogs(ctx, logOptions)
 		},
 	}
 
@@ -495,5 +510,6 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
 	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
 	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output")
+	cmd.Flags().BoolVar(&runFlag, "run", false, "Include all logs from the entire run in addition to the single job logs")
 	return cmd
 }
