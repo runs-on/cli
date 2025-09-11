@@ -51,7 +51,7 @@ AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions
 
 ## `roc logs`
 
-Fetch RunsOn server and instance logs for a specific job ID or URL.
+Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional log types.
 
 ```
 Usage:
@@ -59,7 +59,10 @@ Usage:
 
 Flags:
   -d, --debug                 Enable debug output
+  -f, --format string         Output format: long (default) or short (default "long")  
   -h, --help                  help for logs
+      --include strings       Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)
+      --no-color              Disable color output
   -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
@@ -67,10 +70,20 @@ Global Flags:
       --stack string   CloudFormation stack name (default "runs-on")
 ```
 
-Example:
+Examples:
 
 ```bash
+# Fetch logs for a specific job (default behavior)
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --watch
+
+# Fetch all application logs for a run (all jobs in the run)  
+AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --include=run --watch
+
+# Fetch EC2 instance console logs
+AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=console
+
+# Fetch both run logs and console logs
+AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=run,console --watch
 ```
 
 ## `roc interrupt`
