@@ -28,6 +28,7 @@ Example (macOS ARM64):
 
 ```
 curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.6/roc_0.1.6_darwin_arm64
+chmod a+x ./roc
 ./roc --help
 ```
 
@@ -35,6 +36,7 @@ Example (Linux AMD64):
 
 ```
 curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.6/roc_0.1.6_linux_amd64
+chmod a+x ./roc
 ./roc --help
 ```
 
