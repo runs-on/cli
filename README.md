@@ -4,6 +4,22 @@ RunsOn CLI (`roc`) is a command line tool to manage and troubleshoot your [RunsO
 
 Note: the CLI only works with RunsOn >= v2.6.3.
 
+## Table of Contents
+
+### Core Commands
+- [`roc connect`](#roc-connect) - Connect to GitHub Actions runner instances via SSM
+- [`roc logs`](#roc-logs) - Fetch RunsOn server and instance logs for specific jobs
+- [`roc interrupt`](#roc-interrupt) - Trigger spot interruptions for testing
+
+### Stack Management
+- [`roc stack doctor`](#roc-stack-doctor) - Diagnose RunsOn stack health and export troubleshooting info
+- [`roc stack logs`](#roc-stack-logs) - Stream all RunsOn application logs from CloudWatch
+
+### Other
+- [Installation](#installation) - Download and install the CLI
+- [Contributing](#contributing) - Ideas for future improvements
+- [License](#license) - Project license information
+
 ## Installation
 
 You can download the binaries for your platform (Linux, macOS) from the [Releases](https://github.com/runs-on/cli/releases/latest) page.
@@ -11,18 +27,18 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/v0.1.4/roc-v0.1.4-darwin-arm64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.5/roc-v0.1.5-darwin-arm64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
 Example (Linux AMD64):
 
 ```
-curl "https://github.com/runs-on/cli/releases/download/v0.1.4/roc-v0.1.4-linux-amd64.tar.gz" -Lo- | tar -xvz
+curl "https://github.com/runs-on/cli/releases/download/v0.1.5/roc-v0.1.5-linux-amd64.tar.gz" -Lo- | tar -xvz
 ./roc --help
 ```
 
-## Features
+## Core Commands
 
 ### `roc connect`
 
@@ -49,7 +65,7 @@ Example:
 AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899
 ```
 
-## `roc logs`
+### `roc logs`
 
 Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional log types.
 
@@ -86,7 +102,7 @@ AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=console
 AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=run,console --watch
 ```
 
-## `roc interrupt`
+### `roc interrupt`
 
 Trigger a spot interruption on the instance running a specific job, simulating a spot instance interruption for testing purposes.
 
@@ -131,7 +147,9 @@ AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --wait
 AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --delay 30s
 ```
 
-## `roc stack doctor`
+## Stack Management
+
+### `roc stack doctor`
 
 Diagnose RunsOn stack health and export troubleshooting information.
 
@@ -175,7 +193,7 @@ Fetching AppRunner service logs (since 14 days)... ✅ (13 lines)
 Full results exported to: /Users/crohr/dev/runs-on/cli/roc-doctor-2025-06-20-12-40-29.zip
 ```
 
-## `roc stack logs`
+### `roc stack logs`
 
 Stream all RunsOn application logs from CloudWatch log streams.
 
