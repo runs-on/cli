@@ -1,10 +1,14 @@
 runners:
-  - name: test-runner
+  test-runner:
     ram: 8
     family: t3.*
+    image: ubuntu24-full-x64
+
 pools:
-  - name: test-pool
-    schedule: "* * * * *"
-    runners:
-      - test-runner
+  test-pool:
+    runner: test-runner
+    schedule:
+      - name: default
+        hot: 1
+        stopped: 2
 
