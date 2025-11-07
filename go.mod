@@ -15,7 +15,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.64.2
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.2
 	github.com/google/go-github/v66 v66.0.0
-	github.com/runs-on/config v0.0.0-20251107084808-6c12227f3f6a
+	github.com/runs-on/config v0.0.0-20251107100507-3b71b72c1946
 	github.com/spf13/cobra v1.10.1
 )
 
