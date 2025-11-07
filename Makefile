@@ -1,5 +1,5 @@
 PREVIOUS_TAG ?= $(shell git tag -l | tail -n 1)
-TAG=v0.1.7
+TAG=v0.1.8
 FILES_TO_COMMIT=Makefile README.md
 
 .PHONY: build install bump tag release update-config
