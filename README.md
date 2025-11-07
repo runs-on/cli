@@ -10,6 +10,7 @@ Note: the CLI only works with RunsOn >= v2.6.3.
 - [`roc connect`](#roc-connect) - Connect to GitHub Actions runner instances via SSM
 - [`roc logs`](#roc-logs) - Fetch RunsOn server and instance logs for specific jobs
 - [`roc interrupt`](#roc-interrupt) - Trigger spot interruptions for testing
+- [`roc lint`](#roc-lint) - Validate and lint runs-on configuration files
 
 ### Stack Management
 - [`roc stack doctor`](#roc-stack-doctor) - Diagnose RunsOn stack health and export troubleshooting info
@@ -147,6 +148,72 @@ AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --wait
 
 # Custom delay before interruption (default is 5 seconds)
 AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --delay 30s
+```
+
+### `roc lint`
+
+Validate and lint runs-on.yml configuration files. This command validates your configuration files against the RunsOn schema, checking for syntax errors, invalid values, missing required fields, and schema violations.
+
+When no file path is provided, the command recursively searches for all `runs-on.yml` files in the current directory and subdirectories.
+
+```
+Usage:
+  roc lint [flags] [file]
+
+Flags:
+      --format string   Output format: text, json, or sarif (default "text")
+      --stdin          Read configuration from stdin
+  -h, --help           help for lint
+
+Global Flags:
+      --stack string   CloudFormation stack name (default "runs-on")
+```
+
+**What it validates:**
+- YAML syntax errors
+- Schema validation for all top-level fields (`_extends`, `runners`, `images`, `pools`, `admins`)
+- Required fields and valid value types
+- Pool configuration (name pattern, schedule values, runner references)
+- Runner specifications (CPU, RAM, family, spot values, etc.)
+- Image specifications (AMI IDs, platform, architecture, etc.)
+- Custom fields are allowed (e.g., `x-defaults` for YAML anchors)
+
+**Output formats:**
+- `text` (default): Human-readable output with file status and diagnostics
+- `json`: Structured JSON output for CI/CD integration
+- `sarif`: SARIF format for GitHub Code Scanning and other tools
+
+Examples:
+
+```bash
+# Lint a specific configuration file
+roc lint .github/runs-on.yml
+
+# Lint all runs-on.yml files recursively (no arguments)
+roc lint
+
+# Lint from stdin
+cat runs-on.yml | roc lint --stdin
+
+# Lint with JSON output for CI/CD pipelines
+roc lint config/runs-on.yml --format json
+
+# Lint with SARIF output for GitHub Code Scanning
+roc lint .github/runs-on.yml --format sarif
+```
+
+**Integration with CI/CD:**
+
+The command exits with a non-zero status code when validation errors are found:
+
+```bash
+# Exit code 0 for valid config, 1 for invalid
+if roc lint runs-on.yml --format json > validation-report.json; then
+  echo "Configuration is valid!"
+else
+  echo "Configuration validation failed. See validation-report.json for details."
+  exit 1
+fi
 ```
 
 ## Stack Management
