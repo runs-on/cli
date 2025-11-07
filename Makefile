@@ -25,25 +25,25 @@ bump-readme:
 	fi
 	@git fetch --tags 2>/dev/null || true
 	@VERSION=$$(echo $(TAG) | sed 's/^v//'); \
-	ALL_TAGS=$$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V); \
-	PREVIOUS_TAG=$$(echo "$$ALL_TAGS" | grep -v "^$(TAG)$$" | tail -n 1); \
-	if [ -z "$$PREVIOUS_TAG" ]; then \
-		PREVIOUS_TAG=$$(echo "$$ALL_TAGS" | tail -n 2 | head -n 1); \
-	fi; \
-	echo "Current tag: $(TAG)"; \
-	echo "Previous tag: $$PREVIOUS_TAG"; \
-	echo "Version: $$VERSION"; \
-	if [ -n "$$PREVIOUS_TAG" ] && [ "$$PREVIOUS_TAG" != "$(TAG)" ]; then \
-		PREVIOUS_VERSION=$$(echo $$PREVIOUS_TAG | sed 's/^v//'); \
-		echo "Updating README.md: $$PREVIOUS_TAG -> $(TAG), roc_$$PREVIOUS_VERSION -> roc_$$VERSION"; \
-		sed -i.bak "s|$$PREVIOUS_TAG|$(TAG)|g" README.md; \
-		sed -i.bak "s|roc_$$PREVIOUS_VERSION|roc_$$VERSION|g" README.md; \
-		rm -f README.md.bak; \
-	else \
-		echo "No previous tag found or tags are the same, updating placeholder versions"; \
+	README_TAG=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1); \
+	README_VERSION=$$(echo $$README_TAG | sed 's/^v//'); \
+	if [ -z "$$README_TAG" ]; then \
+		echo "No version tag found in README.md, updating placeholder versions"; \
 		sed -i.bak "s|v0\.0\.0|$(TAG)|g" README.md; \
 		sed -i.bak "s|roc_0\.0\.0|roc_$$VERSION|g" README.md; \
 		rm -f README.md.bak; \
+	else \
+		echo "Current tag: $(TAG)"; \
+		echo "README tag: $$README_TAG"; \
+		echo "Version: $$VERSION"; \
+		if [ "$$README_TAG" != "$(TAG)" ]; then \
+			echo "Updating README.md: $$README_TAG -> $(TAG), roc_$$README_VERSION -> roc_$$VERSION"; \
+			sed -i.bak "s|$$README_TAG|$(TAG)|g" README.md; \
+			sed -i.bak "s|roc_$$README_VERSION|roc_$$VERSION|g" README.md; \
+			rm -f README.md.bak; \
+		else \
+			echo "README.md already contains $(TAG)"; \
+		fi; \
 	fi; \
 	if git diff --exit-code README.md > /dev/null 2>&1; then \
 		echo "README.md already up to date"; \
