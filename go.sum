@@ -90,8 +90,8 @@ github.com/protocolbuffers/txtpbfmt v0.0.0-20251016062345-16587c79cd91 h1:s1LvMa
 github.com/protocolbuffers/txtpbfmt v0.0.0-20251016062345-16587c79cd91/go.mod h1:JSbkp0BviKovYYt9XunS95M3mLPibE9bGg+Y95DsEEY=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
 github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
-github.com/runs-on/config v0.0.0-20251107105722-95213002996f h1:hLkYbDuv0Y0r3r2R3EOSiUe2AJkJ5yPkXjMpsfMV2Vk=
-github.com/runs-on/config v0.0.0-20251107105722-95213002996f/go.mod h1:GpI5uxiwwwBhomaTjTZDqjPX/S1t7EEONJyTC+R5AiU=
+github.com/runs-on/config v0.0.0-20251107113615-ba280a53ce25 h1:pWsHi5QYqJSJfNU0sCWgtnMFaV26+iLo/ig3i8GESEY=
+github.com/runs-on/config v0.0.0-20251107113615-ba280a53ce25/go.mod h1:GpI5uxiwwwBhomaTjTZDqjPX/S1t7EEONJyTC+R5AiU=
 github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/spf13/cobra v1.10.1 h1:lJeBwCfmrnXthfAupyUTzJ/J4Nc1RsHC/mSRU2dll/s=
 github.com/spf13/cobra v1.10.1/go.mod h1:7SmJGaTHFVBY0jW4NXGluQoLvhqFQM+6XSKD+P4XaB0=
