@@ -56,6 +56,25 @@ The validator supports YAML anchors and will automatically expand them during va
 	cmd.Flags().StringVarP(&format, "format", "f", "text", "Output format: text, json, or sarif")
 	cmd.Flags().BoolVar(&stdin, "stdin", false, "Read from stdin instead of file")
 
+	// Enable file path completion for the file argument
+	cmd.ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		// Check if --stdin flag is set
+		if cmd.Flags().Changed("stdin") {
+			stdinFlag, _ := cmd.Flags().GetBool("stdin")
+			if stdinFlag {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+		}
+
+		// If we already have a file argument, don't complete more
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		// Use default file completion (allows files and directories)
+		return nil, cobra.ShellCompDirectiveDefault
+	}
+
 	return cmd
 }
 
