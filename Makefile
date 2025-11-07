@@ -12,7 +12,10 @@ install: build
 	sudo install -m 755 dist/roc /usr/local/bin/roc
 
 bump:
-	gsed -i "s/$(PREVIOUS_TAG)/$(TAG)/g" README.md
+	@PREVIOUS_VERSION=$$(echo $(PREVIOUS_TAG) | sed 's/^v//'); \
+	NEW_VERSION=$$(echo $(TAG) | sed 's/^v//'); \
+	gsed -i "s/$(PREVIOUS_TAG)/$(TAG)/g" README.md; \
+	gsed -i "s/roc_$$PREVIOUS_VERSION/roc_$$NEW_VERSION/g" README.md
 	if git diff --exit-code $(FILES_TO_COMMIT); then \
 		echo "No changes to commit"; \
 	else \
