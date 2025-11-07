@@ -1,7 +1,7 @@
 PREVIOUS_TAG ?= $(shell git tag -l | tail -n 1)
 TAG=v0.1.6
 
-.PHONY: build install
+.PHONY: build install bump tag release update-config
 
 build:
 	mkdir -p dist
@@ -19,3 +19,9 @@ tag: bump
 
 release: tag
 	gh release create $(TAG) --generate-notes
+
+update-config:
+	@echo "Updating github.com/runs-on/config to latest version..."
+	@mise exec -- go get github.com/runs-on/config@main
+	@mise exec -- go mod tidy
+	@echo "Config module updated successfully"
