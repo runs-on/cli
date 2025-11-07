@@ -29,7 +29,7 @@ tag: bump
 	git push origin $(TAG)
 
 release: tag
-	gh release create $(TAG) --generate-notes
+	gh release create $(TAG) --generate-notes --draft
 
 update-config:
 	@echo "Updating github.com/runs-on/config to latest version..."

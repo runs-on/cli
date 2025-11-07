@@ -26,3 +26,8 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release
+        if: github.event.release.draft == true
+        run: gh release edit ${{ github.event.release.tag_name }} --draft=false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
