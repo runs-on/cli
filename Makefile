@@ -1,5 +1,5 @@
 PREVIOUS_TAG ?= $(shell git tag -l | tail -n 1)
-TAG=v0.1.10
+TAG=v0.1.11
 
 .PHONY: build install tag update-config test bump-readme
 
