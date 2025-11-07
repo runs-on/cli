@@ -13,5 +13,9 @@ runs:
   steps:
     - name: Install RunsOn CLI
       shell: bash
-      run: ${{ github.action_path }}/install.sh ${{ inputs.version }}
+      run: |
+        ACTION_PATH="${{ github.action_path }}"
+        # Convert Windows paths to Unix-style for bash compatibility
+        ACTION_PATH="${ACTION_PATH//\\//}"
+        "${ACTION_PATH}/install.sh" ${{ inputs.version }}
 
