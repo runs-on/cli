@@ -15,11 +15,11 @@ bump:
 	gsed -i "s/$(PREVIOUS_TAG)/$(TAG)/g" README.md
 	if git diff --exit-code $(FILES_TO_COMMIT); then \
 		echo "No changes to commit"; \
-		exit 0; \
-	fi
-	git commit -m "Bump version to $(TAG)" $(FILES_TO_COMMIT) && \
+	else \
+		git commit -m "Bump version to $(TAG)" $(FILES_TO_COMMIT) && \
 		git push origin main && \
-		git diff --exit-code
+		git diff --exit-code; \
+	fi
 
 tag: bump
 	git tag -a $(TAG) -m "Release $(TAG)"
