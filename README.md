@@ -30,7 +30,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.11/roc_0.1.11_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.12/roc_0.1.12_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -38,7 +38,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.11/roc_0.1.11_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.12/roc_0.1.12_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
