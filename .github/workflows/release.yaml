@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -26,8 +27,32 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish release
-        if: github.event.release.draft == true
-        run: gh release edit ${{ github.event.release.tag_name }} --draft=false
+      - name: Publish release and mark as latest
+        run: |
+          gh release edit ${{ github.ref_name }} --latest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update README with version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION=$(echo $TAG | sed 's/^v//')
+          PREVIOUS_TAG=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 2 | head -n 1)
+          
+          if [ -n "$PREVIOUS_TAG" ]; then
+            sed -i "s|$PREVIOUS_TAG|$TAG|g" README.md
+            sed -i "s|roc_$(echo $PREVIOUS_TAG | sed 's/^v//')|roc_$VERSION|g" README.md
+          else
+            # First release, update any placeholder versions
+            sed -i "s|v0\.0\.0|$TAG|g" README.md
+            sed -i "s|roc_0\.0\.0|roc_$VERSION|g" README.md
+          fi
+          
+          if git diff --exit-code README.md; then
+            echo "README.md already up to date"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "Update README for $TAG" || exit 0
+            git push origin HEAD:main || exit 0
+          fi
