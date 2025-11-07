@@ -131,7 +131,7 @@ func lintAllFiles(ctx context.Context, format string) error {
 			continue
 		}
 
-		isValid := len(diags) == 0
+		isValid := len(diags) == 0 || !hasErrors(diags)
 		allResults = append(allResults, fileResult{
 			Path:        file,
 			Valid:       isValid,
@@ -160,11 +160,9 @@ type fileResult struct {
 func outputLintAllText(results []fileResult) error {
 	allValid := true
 	for _, result := range results {
-		if result.Valid {
-			fmt.Printf("✅ %s\n", result.Path)
-		} else {
-			fmt.Printf("❌ %s (%d error(s))\n", result.Path, len(result.Diagnostics))
+		if !result.Valid {
 			allValid = false
+			break
 		}
 	}
 
@@ -173,7 +171,77 @@ func outputLintAllText(results []fileResult) error {
 		for _, result := range results {
 			if !result.Valid {
 				fmt.Printf("\n%s:\n", result.Path)
-				for i, diag := range result.Diagnostics {
+				var errors []validate.Diagnostic
+				var warnings []validate.Diagnostic
+				for _, diag := range result.Diagnostics {
+					if diag.Severity == validate.SeverityError {
+						errors = append(errors, diag)
+					} else if diag.Severity == validate.SeverityWarning {
+						warnings = append(warnings, diag)
+					}
+				}
+				for i, diag := range errors {
+					fmt.Printf("  %d. ", i+1)
+					if diag.Line > 0 {
+						fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
+					}
+					fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
+				}
+				if len(warnings) > 0 {
+					fmt.Printf("\n  Warnings:\n")
+					for i, diag := range warnings {
+						fmt.Printf("    %d. ", i+1)
+						if diag.Line > 0 {
+							fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
+						}
+						fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
+					}
+				}
+			} else {
+				// File is valid but might have warnings
+				var warnings []validate.Diagnostic
+				for _, diag := range result.Diagnostics {
+					if diag.Severity == validate.SeverityWarning {
+						warnings = append(warnings, diag)
+					}
+				}
+				if len(warnings) > 0 {
+					fmt.Printf("⚠️  %s (%d warning(s))\n", result.Path, len(warnings))
+				} else {
+					fmt.Printf("✅ %s\n", result.Path)
+				}
+			}
+		}
+		os.Exit(1)
+		return nil
+	}
+
+	// All files are valid, but check for warnings
+	hasWarnings := false
+	for _, result := range results {
+		for _, diag := range result.Diagnostics {
+			if diag.Severity == validate.SeverityWarning {
+				hasWarnings = true
+				break
+			}
+		}
+		if hasWarnings {
+			break
+		}
+	}
+
+	if hasWarnings {
+		fmt.Println("\nWarnings:")
+		for _, result := range results {
+			var warnings []validate.Diagnostic
+			for _, diag := range result.Diagnostics {
+				if diag.Severity == validate.SeverityWarning {
+					warnings = append(warnings, diag)
+				}
+			}
+			if len(warnings) > 0 {
+				fmt.Printf("\n%s:\n", result.Path)
+				for i, diag := range warnings {
 					fmt.Printf("  %d. ", i+1)
 					if diag.Line > 0 {
 						fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
@@ -182,10 +250,19 @@ func outputLintAllText(results []fileResult) error {
 				}
 			}
 		}
-		os.Exit(1)
 	}
 
 	return nil
+}
+
+// hasErrors checks if any diagnostics are errors (not warnings)
+func hasErrors(diags []validate.Diagnostic) bool {
+	for _, diag := range diags {
+		if diag.Severity == validate.SeverityError {
+			return true
+		}
+	}
+	return false
 }
 
 func outputLintAllJSON(results []fileResult) error {
@@ -376,22 +453,59 @@ func outputLintResults(diags []validate.Diagnostic, sourceName string, format st
 }
 
 func outputLintText(diags []validate.Diagnostic, sourceName string) error {
-	if len(diags) == 0 {
+	// Separate errors and warnings
+	var errors []validate.Diagnostic
+	var warnings []validate.Diagnostic
+	for _, diag := range diags {
+		if diag.Severity == validate.SeverityError {
+			errors = append(errors, diag)
+		} else if diag.Severity == validate.SeverityWarning {
+			warnings = append(warnings, diag)
+		}
+	}
+
+	if len(errors) == 0 && len(warnings) == 0 {
 		fmt.Printf("✅ Configuration file '%s' is valid!\n", sourceName)
 		return nil
 	}
 
-	fmt.Printf("❌ Configuration file '%s' has %d error(s):\n\n", sourceName, len(diags))
-	for i, diag := range diags {
+	if len(errors) > 0 {
+		fmt.Printf("❌ Configuration file '%s' has %d error(s)", sourceName, len(errors))
+		if len(warnings) > 0 {
+			fmt.Printf(" and %d warning(s)", len(warnings))
+		}
+		fmt.Printf(":\n\n")
+		for i, diag := range errors {
+			fmt.Printf("%d. ", i+1)
+			if diag.Line > 0 {
+				fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
+			}
+			fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
+		}
+		if len(warnings) > 0 {
+			fmt.Printf("\nWarnings:\n")
+			for i, diag := range warnings {
+				fmt.Printf("  %d. ", i+1)
+				if diag.Line > 0 {
+					fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
+				}
+				fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
+			}
+		}
+		fmt.Printf("\nPlease fix the errors above and run the validation again.\n")
+		os.Exit(1)
+		return nil
+	}
+
+	// Only warnings, no errors
+	fmt.Printf("⚠️  Configuration file '%s' is valid but has %d warning(s):\n\n", sourceName, len(warnings))
+	for i, diag := range warnings {
 		fmt.Printf("%d. ", i+1)
 		if diag.Line > 0 {
 			fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
 		}
 		fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
 	}
-
-	fmt.Printf("\nPlease fix the errors above and run the validation again.\n")
-	os.Exit(1)
 	return nil
 }
 

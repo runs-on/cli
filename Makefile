@@ -22,6 +22,6 @@ release: tag
 
 update-config:
 	@echo "Updating github.com/runs-on/config to latest version..."
-	@mise exec -- go get github.com/runs-on/config@main
+	@mise exec -- go get -u github.com/runs-on/config@main
 	@mise exec -- go mod tidy
 	@echo "Config module updated successfully"
