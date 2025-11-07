@@ -25,10 +25,10 @@ bump-readme:
 	fi
 	@git fetch --tags 2>/dev/null || true
 	@VERSION=$$(echo $(TAG) | sed 's/^v//'); \
-	README_TAG=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1); \
+	README_TAG=$$(grep -oE 'releases/download/v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1 | sed 's|releases/download/||'); \
 	README_VERSION=$$(echo $$README_TAG | sed 's/^v//'); \
 	if [ -z "$$README_TAG" ]; then \
-		echo "No version tag found in README.md, updating placeholder versions"; \
+		echo "No version tag found in download URLs, updating placeholder versions"; \
 		sed -i.bak "s|v0\.0\.0|$(TAG)|g" README.md; \
 		sed -i.bak "s|roc_0\.0\.0|roc_$$VERSION|g" README.md; \
 		rm -f README.md.bak; \
@@ -38,7 +38,7 @@ bump-readme:
 		echo "Version: $$VERSION"; \
 		if [ "$$README_TAG" != "$(TAG)" ]; then \
 			echo "Updating README.md: $$README_TAG -> $(TAG), roc_$$README_VERSION -> roc_$$VERSION"; \
-			sed -i.bak "s|$$README_TAG|$(TAG)|g" README.md; \
+			sed -i.bak "s|releases/download/$$README_TAG|releases/download/$(TAG)|g" README.md; \
 			sed -i.bak "s|roc_$$README_VERSION|roc_$$VERSION|g" README.md; \
 			rm -f README.md.bak; \
 		else \
