@@ -1,0 +1,17 @@
+name: 'Setup RunsOn CLI'
+description: 'Downloads and installs the RunsOn CLI (roc) on GitHub runners'
+author: 'RunsOn'
+
+inputs:
+  version:
+    description: 'Version of RunsOn CLI to install (e.g., v0.1.7). Defaults to latest.'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install RunsOn CLI
+      shell: bash
+      run: ${{ github.action_path }}/install.sh ${{ inputs.version }}
+
