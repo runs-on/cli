@@ -15,9 +15,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.64.2
 	github.com/aws/aws-sdk-go-v2/service/sts v1.38.2
 	github.com/google/go-github/v66 v66.0.0
-	github.com/runs-on/config v0.0.0-20251107080844-0d79f16c0de9
+	github.com/runs-on/config v0.0.0-20251107082643-40209bdaf8f3
 	github.com/spf13/cobra v1.10.1
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -49,4 +48,5 @@ require (
 	golang.org/x/net v0.46.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
