@@ -23,6 +23,8 @@ Note: the CLI only works with RunsOn >= v2.6.3.
 
 ## Installation
 
+### Download Binary
+
 You can download the binaries for your platform (Linux, macOS) from the [Releases](https://github.com/runs-on/cli/releases/latest) page.
 
 Example (macOS ARM64):
@@ -39,6 +41,38 @@ Example (Linux AMD64):
 curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.11/roc_0.1.11_linux_amd64
 chmod a+x ./roc
 ./roc --help
+```
+
+### GitHub Action
+
+You can use the RunsOn CLI in your GitHub Actions workflows by including it as a step:
+
+```yaml
+- uses: runs-on/cli@main
+  with:
+    version: 'latest'  # Optional: defaults to 'latest'
+```
+
+Example workflow:
+
+```yaml
+name: Lint RunsOn Config
+
+on:
+  pull_request:
+    paths:
+      - '.github/runs-on.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: runs-on/cli@main
+      
+      - name: Lint runs-on.yml
+        run: roc lint .github/runs-on.yml
 ```
 
 ## Core Commands

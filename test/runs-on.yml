@@ -1,0 +1,10 @@
+runners:
+  - name: test-runner
+    ram: 8
+    family: t3.*
+pools:
+  - name: test-pool
+    schedule: "* * * * *"
+    runners:
+      - test-runner
+

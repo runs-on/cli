@@ -47,4 +47,13 @@ jobs:
           else
             roc version
           fi
+      
+      - name: Lint test runs-on.yml
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            roc.exe lint test/runs-on.yml
+          else
+            roc lint test/runs-on.yml
+          fi
 
