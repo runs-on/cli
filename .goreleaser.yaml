@@ -18,6 +18,7 @@ builds:
     binary: roc
     ldflags:
       - -s -w
+      - -X roc/internal/version.Version={{ .Version }}
 
 archives:
   - format: binary

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"roc/internal/version"
+
 	"github.com/runs-on/config/pkg/validate"
 	"github.com/spf13/cobra"
 )
@@ -275,13 +277,13 @@ func outputLintAllJSON(results []fileResult) error {
 	}
 
 	type jsonFileResult struct {
-		Path        string          `json:"path"`
-		Valid       bool            `json:"valid"`
+		Path        string           `json:"path"`
+		Valid       bool             `json:"valid"`
 		Diagnostics []jsonDiagnostic `json:"diagnostics"`
 	}
 
 	type jsonOutput struct {
-		Valid bool            `json:"valid"`
+		Valid bool             `json:"valid"`
 		Files []jsonFileResult `json:"files"`
 	}
 
@@ -330,7 +332,7 @@ func outputLintAllJSON(results []fileResult) error {
 
 func outputLintAllSARIF(results []fileResult) error {
 	type sarifLocation struct {
-		URI   string `json:"uri"`
+		URI    string `json:"uri"`
 		Region struct {
 			StartLine   int `json:"startLine,omitempty"`
 			StartColumn int `json:"startColumn,omitempty"`
@@ -359,7 +361,7 @@ func outputLintAllSARIF(results []fileResult) error {
 	}
 
 	type sarifOutput struct {
-		Version string    `json:"version"`
+		Version string     `json:"version"`
 		Runs    []sarifRun `json:"runs"`
 	}
 
@@ -410,7 +412,7 @@ func outputLintAllSARIF(results []fileResult) error {
 						Version string `json:"version"`
 					}{
 						Name:    "roc",
-						Version: "0.1.0",
+						Version: version.Version,
 					},
 				},
 				Results: allResults,
@@ -553,7 +555,7 @@ func outputLintJSON(diags []validate.Diagnostic) error {
 
 func outputLintSARIF(diags []validate.Diagnostic) error {
 	type sarifLocation struct {
-		URI   string `json:"uri"`
+		URI    string `json:"uri"`
 		Region struct {
 			StartLine   int `json:"startLine,omitempty"`
 			StartColumn int `json:"startColumn,omitempty"`
@@ -582,7 +584,7 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 	}
 
 	type sarifOutput struct {
-		Version string    `json:"version"`
+		Version string     `json:"version"`
 		Runs    []sarifRun `json:"runs"`
 	}
 
@@ -631,7 +633,7 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 						Version string `json:"version"`
 					}{
 						Name:    "roc",
-						Version: "0.1.0",
+						Version: version.Version,
 					},
 				},
 				Results: results,
@@ -651,4 +653,3 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 
 	return nil
 }
-
