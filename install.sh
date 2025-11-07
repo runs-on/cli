@@ -124,8 +124,8 @@ echo "Binary: $INSTALL_PATH"
 
 # Verify installation
 if [ "$OS" = "windows" ]; then
-  "$INSTALL_PATH" --version || echo "Warning: Could not verify installation"
+  "$INSTALL_PATH" version || echo "Warning: Could not verify installation"
 else
-  "$INSTALL_PATH" --version || echo "Warning: Could not verify installation"
+  "$INSTALL_PATH" version || echo "Warning: Could not verify installation"
 fi
 

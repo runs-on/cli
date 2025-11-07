@@ -29,9 +29,9 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            roc.exe --version
+            roc.exe version
           else
-            roc --version
+            roc version
           fi
       
       - name: Test with specific version
@@ -43,8 +43,8 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            roc.exe --version
+            roc.exe version
           else
-            roc --version
+            roc version
           fi
 
