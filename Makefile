@@ -1,5 +1,6 @@
 PREVIOUS_TAG ?= $(shell git tag -l | tail -n 1)
-TAG=v0.1.6
+TAG=v0.1.7
+FILES_TO_COMMIT=Makefile README.md
 
 .PHONY: build install bump tag release update-config
 
@@ -12,6 +13,13 @@ install: build
 
 bump:
 	gsed -i "s/$(PREVIOUS_TAG)/$(TAG)/g" README.md
+	if git diff --exit-code $(FILES_TO_COMMIT); then \
+		echo "No changes to commit"; \
+		exit 0; \
+	fi
+	git commit -m "Bump version to $(TAG)" $(FILES_TO_COMMIT) && \
+		git push origin main && \
+		git diff --exit-code
 
 tag: bump
 	git tag -a $(TAG) -m "Release $(TAG)"
