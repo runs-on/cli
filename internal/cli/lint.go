@@ -133,7 +133,7 @@ func lintAllFiles(ctx context.Context, format string) error {
 			continue
 		}
 
-		isValid := len(diags) == 0 || !hasErrors(diags)
+		isValid := isValidDiagnostics(diags)
 		allResults = append(allResults, fileResult{
 			Path:        file,
 			Valid:       isValid,
@@ -265,6 +265,11 @@ func hasErrors(diags []validate.Diagnostic) bool {
 		}
 	}
 	return false
+}
+
+// isValidDiagnostics checks if diagnostics are valid (no errors; warnings are OK)
+func isValidDiagnostics(diags []validate.Diagnostic) bool {
+	return len(diags) == 0 || !hasErrors(diags)
 }
 
 func outputLintAllJSON(results []fileResult) error {
@@ -526,7 +531,7 @@ func outputLintJSON(diags []validate.Diagnostic) error {
 	}
 
 	output := jsonOutput{
-		Valid:       len(diags) == 0,
+		Valid:       isValidDiagnostics(diags),
 		Diagnostics: make([]jsonDiagnostic, len(diags)),
 	}
 
@@ -546,7 +551,7 @@ func outputLintJSON(diags []validate.Diagnostic) error {
 		return fmt.Errorf("failed to encode JSON: %w", err)
 	}
 
-	if len(diags) > 0 {
+	if !output.Valid {
 		os.Exit(1)
 	}
 
@@ -647,7 +652,7 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 		return fmt.Errorf("failed to encode SARIF: %w", err)
 	}
 
-	if len(diags) > 0 {
+	if !isValidDiagnostics(diags) {
 		os.Exit(1)
 	}
 
