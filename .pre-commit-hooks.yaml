@@ -1,0 +1,8 @@
+- id: roc-lint
+  name: Lint runs-on.yml files
+  entry: roc lint
+  language: system
+  files: ^.*runs-on\.yml$
+  pass_filenames: true
+  description: Validate runs-on.yml configuration files using roc lint
+

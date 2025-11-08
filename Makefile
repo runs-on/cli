@@ -27,10 +27,12 @@ bump-readme:
 	@VERSION=$$(echo $(TAG) | sed 's/^v//'); \
 	README_TAG=$$(grep -oE 'releases/download/v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1 | sed 's|releases/download/||'); \
 	README_VERSION=$$(echo $$README_TAG | sed 's/^v//'); \
+	README_REV=$$(grep -oE 'rev: v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1 | sed 's|rev: ||'); \
 	if [ -z "$$README_TAG" ]; then \
 		echo "No version tag found in download URLs, updating placeholder versions"; \
 		sed -i.bak "s|v0\.0\.0|$(TAG)|g" README.md; \
 		sed -i.bak "s|roc_0\.0\.0|roc_$$VERSION|g" README.md; \
+		sed -i.bak "s|rev: v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|rev: $(TAG)|g" README.md; \
 		rm -f README.md.bak; \
 	else \
 		echo "Current tag: $(TAG)"; \
@@ -40,9 +42,15 @@ bump-readme:
 			echo "Updating README.md: $$README_TAG -> $(TAG), roc_$$README_VERSION -> roc_$$VERSION"; \
 			sed -i.bak "s|releases/download/$$README_TAG|releases/download/$(TAG)|g" README.md; \
 			sed -i.bak "s|roc_$$README_VERSION|roc_$$VERSION|g" README.md; \
+			sed -i.bak "s|rev: $$README_TAG|rev: $(TAG)|g" README.md; \
 			rm -f README.md.bak; \
 		else \
 			echo "README.md already contains $(TAG)"; \
+		fi; \
+		if [ -n "$$README_REV" ] && [ "$$README_REV" != "$(TAG)" ]; then \
+			echo "Updating pre-commit rev: $$README_REV -> $(TAG)"; \
+			sed -i.bak "s|rev: $$README_REV|rev: $(TAG)|g" README.md; \
+			rm -f README.md.bak; \
 		fi; \
 	fi; \
 	if git diff --exit-code README.md > /dev/null 2>&1; then \

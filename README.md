@@ -250,6 +250,32 @@ else
 fi
 ```
 
+**Pre-commit hook:**
+
+You can use `roc lint` as a pre-commit hook to automatically validate `runs-on.yml` files before committing. First, install [pre-commit](https://pre-commit.com/):
+
+```bash
+pip install pre-commit
+```
+
+Then add the hook to your `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/runs-on/cli
+    rev: v0.1.12  # Use the latest release tag
+    hooks:
+      - id: roc-lint
+```
+
+Finally, install the git hook scripts:
+
+```bash
+pre-commit install
+```
+
+Now `roc lint` will automatically run on staged `runs-on.yml` files before each commit. The commit will be blocked if validation errors are found.
+
 ## Stack Management
 
 ### `roc stack doctor`
