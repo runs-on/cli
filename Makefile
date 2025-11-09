@@ -16,7 +16,7 @@ tag:
 	git push origin main && git push origin $(TAG)
 
 test:
-	go test ./...
+	go test -count=1 ./...
 
 bump-readme:
 	@if [ -z "$(TAG)" ]; then \

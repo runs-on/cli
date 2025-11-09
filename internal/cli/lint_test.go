@@ -577,3 +577,35 @@ func TestOutputLintAllSARIF(t *testing.T) {
 		t.Errorf("Expected warning level, got %s", result.Runs[0].Results[0].Level)
 	}
 }
+
+func TestLintTestDataFile(t *testing.T) {
+	// Test that validates the test/runs-on.yml file
+	testFile := filepath.Join("..", "..", "test", "runs-on.yml")
+
+	// Check if file exists
+	if _, err := os.Stat(testFile); os.IsNotExist(err) {
+		t.Skipf("Test data file %s does not exist", testFile)
+		return
+	}
+
+	ctx := context.Background()
+	diags, err := validate.ValidateFile(ctx, testFile)
+	if err != nil {
+		t.Fatalf("Failed to validate test file: %v", err)
+	}
+
+	// Log diagnostics for debugging
+	for _, d := range diags {
+		if d.Severity == validate.SeverityError {
+			t.Errorf("Validation error in %s:%d:%d: %s", d.Path, d.Line, d.Column, d.Message)
+		} else {
+			t.Logf("Validation warning in %s:%d:%d: %s", d.Path, d.Line, d.Column, d.Message)
+		}
+	}
+
+	// Test should pass even with warnings, but fail on errors
+	hasErrors := hasErrors(diags)
+	if hasErrors {
+		t.Error("Test data file has validation errors")
+	}
+}
