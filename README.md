@@ -18,6 +18,7 @@ Note: the CLI only works with RunsOn >= v2.6.3.
 
 ### Other
 - [Installation](#installation) - Download and install the CLI
+- [Resource Discovery](#resource-discovery) - How the CLI discovers resources
 - [Contributing](#contributing) - Ideas for future improvements
 - [License](#license) - Project license information
 
@@ -75,6 +76,15 @@ jobs:
         run: roc lint .github/runs-on.yml
 ```
 
+## Resource Discovery
+
+The CLI discovers RunsOn resources using the AWS Resource Groups Tagging API (RGTA). Resources are identified by their tags:
+
+- `runs-on-stack-name`: The stack name (e.g., "runs-on")
+- `runs-on-resource`: The resource type (e.g., "apprunner-service", "config-bucket", "ec2-log-group")
+
+These tags are automatically applied when deploying RunsOn via the Terraform/OpenTofu module.
+
 ## Core Commands
 
 ### `roc connect`
@@ -93,7 +103,7 @@ Flags:
       --watch   Wait for instance ID if not found
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 Example:
@@ -120,7 +130,7 @@ Flags:
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 Examples:
@@ -156,7 +166,7 @@ Flags:
   -w, --wait             Wait for instance ID if not found
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 **Requirements:**
@@ -200,7 +210,7 @@ Flags:
   -h, --help           help for lint
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 **What it validates:**
@@ -282,10 +292,9 @@ Now `roc lint` will automatically run on staged `runs-on.yml` files before each 
 
 Diagnose RunsOn stack health and export troubleshooting information.
 
-This command performs comprehensive health checks on your RunsOn CloudFormation stack:
-- Verifies CloudFormation stack status
-- Checks AppRunner service health and version
-- Tests endpoint accessibility  
+This command performs comprehensive health checks on your RunsOn stack:
+- Checks AppRunner service health
+- Tests endpoint accessibility
 - Validates service configuration
 - Fetches application logs
 
@@ -300,7 +309,7 @@ Flags:
       --since string   Fetch logs since duration (e.g. 30m, 2h, 24h) (default "24h")
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 Example:
@@ -312,8 +321,7 @@ AWS_PROFILE=runs-on-admin roc stack doctor --since 2h
 Output:
 
 ```
-Checking CloudFormation stack health (https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/stackinfo?stackId=runs-on-test)... ✅ (status: UPDATE_COMPLETE)
-Checking AppRunner service (https://console.aws.amazon.com/apprunner/home?region=us-east-1#/services/RunsOnService-4rHCauYu4m23)... ✅ (version: v2.8.4)
+Checking AppRunner service (https://console.aws.amazon.com/apprunner/home?region=us-east-1#/services/RunsOnService-4rHCauYu4m23)... ✅ (status: RUNNING)
 Checking AppRunner service endpoint (https://wxrwksit5a.us-east-1.awsapprunner.com)... ✅
 Checking for 'Congrats' response... ✅
 Fetching AppRunner application logs (since 24h0m0s)... ✅ (5419 lines)
@@ -341,7 +349,7 @@ Flags:
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
-      --stack string   CloudFormation stack name (default "runs-on")
+      --stack string   Stack name (default "runs-on")
 ```
 
 Examples:

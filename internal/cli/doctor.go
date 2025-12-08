@@ -14,7 +14,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/apprunner"
-	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/spf13/cobra"
 )
@@ -34,23 +33,20 @@ type DoctorResult struct {
 
 type StackDoctor struct {
 	cfg        aws.Config
-	cfn        *cloudformation.Client
 	apprunner  *apprunner.Client
 	cwl        *cloudwatchlogs.Client
-	stackName  string
+	config     *RunsOnConfig // Discovered resources
 	httpClient *http.Client
 	result     *DoctorResult
-	outputs    map[string]string // Cache stack outputs
-	workDir    string            // Temporary workspace directory
+	workDir    string // Temporary workspace directory
 }
 
 func NewStackDoctor(config *RunsOnConfig) *StackDoctor {
 	return &StackDoctor{
 		cfg:       config.AWSConfig,
-		cfn:       cloudformation.NewFromConfig(config.AWSConfig),
 		apprunner: apprunner.NewFromConfig(config.AWSConfig),
 		cwl:       cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		stackName: config.StackName,
+		config:    config,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -88,60 +84,35 @@ func (d *StackDoctor) failCheck(name, message string, err error) error {
 	return err
 }
 
-func (d *StackDoctor) loadStackOutputs(ctx context.Context) error {
-	if d.outputs != nil {
-		return nil // Already loaded
+// getServiceURL gets the AppRunner service URL by calling DescribeService
+func (d *StackDoctor) getServiceURL(ctx context.Context) (string, error) {
+	serviceArn := d.config.AppRunnerServiceArn
+	if serviceArn == "" {
+		return "", fmt.Errorf("AppRunner service ARN not found")
 	}
 
-	out, err := d.cfn.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
-		StackName: &d.stackName,
+	out, err := d.apprunner.DescribeService(ctx, &apprunner.DescribeServiceInput{
+		ServiceArn: &serviceArn,
 	})
 	if err != nil {
-		return err
-	}
-	if len(out.Stacks) == 0 {
-		return fmt.Errorf("stack %s not found", d.stackName)
+		return "", err
 	}
 
-	d.outputs = make(map[string]string)
-	for _, output := range out.Stacks[0].Outputs {
-		d.outputs[*output.OutputKey] = *output.OutputValue
+	if out.Service != nil && out.Service.ServiceUrl != nil {
+		url := *out.Service.ServiceUrl
+		if !strings.HasPrefix(url, "https://") {
+			url = "https://" + url
+		}
+		return url, nil
 	}
-	return nil
-}
-
-func (d *StackDoctor) checkStackHealth(ctx context.Context) error {
-	region := d.cfg.Region
-	cfnURL := fmt.Sprintf("https://console.aws.amazon.com/cloudformation/home?region=%s#/stacks/stackinfo?stackId=%s", region, d.stackName)
-	fmt.Printf("Checking CloudFormation stack health (%s)...", cfnURL)
-
-	// Get stack status from the same API call
-	out, err := d.cfn.DescribeStacks(ctx, &cloudformation.DescribeStacksInput{
-		StackName: &d.stackName,
-	})
-	if err != nil {
-		return d.failCheck("CloudFormation stack health", "Failed to describe stack", err)
-	}
-
-	stack := out.Stacks[0]
-	status := string(stack.StackStatus)
-
-	if strings.Contains(status, "COMPLETE") && !strings.Contains(status, "ROLLBACK") {
-		d.addCheck("CloudFormation stack health", "✅", fmt.Sprintf("Status: %s", status), nil)
-		d.printCheckResult("", "✅", fmt.Sprintf("status: %s", status))
-		return nil
-	} else {
-		d.addCheck("CloudFormation stack health", "❌", fmt.Sprintf("Status: %s", status), nil)
-		d.printCheckResult("", "❌", fmt.Sprintf("status: %s", status))
-		return fmt.Errorf("stack is in unhealthy state: %s", status)
-	}
+	return "", fmt.Errorf("service URL not available")
 }
 
 func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
-	serviceArn, ok := d.outputs["RunsOnServiceArn"]
-	if !ok {
+	serviceArn := d.config.AppRunnerServiceArn
+	if serviceArn == "" {
 		fmt.Print("Checking AppRunner service...")
-		err := fmt.Errorf("RunsOnServiceArn not found in stack outputs")
+		err := fmt.Errorf("AppRunner service ARN not found in discovered resources")
 		return d.failCheck("AppRunner service running", "Service ARN not found", err)
 	}
 
@@ -157,8 +128,6 @@ func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 	appRunnerURL := fmt.Sprintf("https://console.aws.amazon.com/apprunner/home?region=%s#/services/%s", region, serviceName)
 	fmt.Printf("Checking AppRunner service (%s)...", appRunnerURL)
 
-	expectedTag := d.outputs["RunsOnAppTag"]
-
 	out, err := d.apprunner.DescribeService(ctx, &apprunner.DescribeServiceInput{
 		ServiceArn: &serviceArn,
 	})
@@ -170,21 +139,8 @@ func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 	status := string(service.Status)
 
 	if status == "RUNNING" {
-		// Extract image tag from the service configuration
-		imageUri := *service.SourceConfiguration.ImageRepository.ImageIdentifier
-		parts := strings.Split(imageUri, ":")
-		var actualTag string
-		if len(parts) > 1 {
-			actualTag = parts[len(parts)-1]
-		}
-
-		if actualTag == expectedTag {
-			d.addCheck("AppRunner service running", "✅", fmt.Sprintf("Version: %s", actualTag), nil)
-			d.printCheckResult("", "✅", fmt.Sprintf("version: %s", actualTag))
-		} else {
-			d.addCheck("AppRunner service running", "⚠️", fmt.Sprintf("Version mismatch - running: %s, expected: %s", actualTag, expectedTag), nil)
-			d.printCheckResult("", "⚠️", fmt.Sprintf("version mismatch - running: %s, expected: %s", actualTag, expectedTag))
-		}
+		d.addCheck("AppRunner service running", "✅", fmt.Sprintf("Status: %s", status), nil)
+		d.printCheckResult("", "✅", fmt.Sprintf("status: %s", status))
 		return nil
 	} else {
 		d.addCheck("AppRunner service running", "❌", fmt.Sprintf("Status: %s", status), nil)
@@ -194,16 +150,10 @@ func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 }
 
 func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) error {
-	entryPoint, ok := d.outputs["RunsOnEntryPoint"]
-	if !ok {
+	entryPoint, err := d.getServiceURL(ctx)
+	if err != nil {
 		fmt.Print("Checking AppRunner service endpoint...")
-		err := fmt.Errorf("RunsOnEntryPoint not found in stack outputs")
-		return d.failCheck("AppRunner service endpoint accessible", "Entry point not found", err)
-	}
-
-	// Ensure https:// prefix
-	if !strings.HasPrefix(entryPoint, "http://") && !strings.HasPrefix(entryPoint, "https://") {
-		entryPoint = "https://" + entryPoint
+		return d.failCheck("AppRunner service endpoint accessible", "Failed to get service URL", err)
 	}
 
 	fmt.Printf("Checking AppRunner service endpoint (%s)...", entryPoint)
@@ -232,15 +182,9 @@ func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) error {
 func (d *StackDoctor) checkCongratsResponse(ctx context.Context) error {
 	fmt.Print("Checking for 'Congrats' response...")
 
-	entryPoint, ok := d.outputs["RunsOnEntryPoint"]
-	if !ok {
-		err := fmt.Errorf("RunsOnEntryPoint not found in stack outputs")
-		return d.failCheck("AppRunner service returns 'Congrats'", "Entry point not found", err)
-	}
-
-	// Ensure https:// prefix
-	if !strings.HasPrefix(entryPoint, "http://") && !strings.HasPrefix(entryPoint, "https://") {
-		entryPoint = "https://" + entryPoint
+	entryPoint, err := d.getServiceURL(ctx)
+	if err != nil {
+		return d.failCheck("AppRunner service returns 'Congrats'", "Failed to get service URL", err)
 	}
 
 	resp, err := d.httpClient.Get(entryPoint)
@@ -312,8 +256,8 @@ func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, 
 		return 0, fmt.Errorf("failed to create logs directory: %w", err)
 	}
 
-	serviceArn, ok := d.outputs["RunsOnServiceArn"]
-	if !ok {
+	serviceArn := d.config.AppRunnerServiceArn
+	if serviceArn == "" {
 		// Skip logs fetching for failed stacks - this is expected
 		d.addCheck("Logs fetched", "⏭️", "Skipped - service not available", nil)
 		return 0, nil
@@ -471,13 +415,7 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 	}
 	defer d.cleanup()
 
-	// Load stack outputs once at the beginning
-	if err := d.loadStackOutputs(ctx); err != nil {
-		return fmt.Errorf("failed to load stack outputs: %w", err)
-	}
-
 	// Run all checks
-	d.checkStackHealth(ctx)
 	d.checkAppRunnerService(ctx)
 	d.checkEndpointAccessibility(ctx)
 	d.checkCongratsResponse(ctx)
@@ -514,10 +452,9 @@ func NewDoctorCmd(stack *Stack) *cobra.Command {
 		Short: "Diagnose RunsOn stack health and export troubleshooting information",
 		Long: `Diagnose RunsOn stack health and export troubleshooting information.
 
-This command performs comprehensive health checks on your RunsOn CloudFormation stack:
-- Verifies CloudFormation stack status
-- Checks AppRunner service health and version
-- Tests endpoint accessibility  
+This command performs comprehensive health checks on your RunsOn stack:
+- Checks AppRunner service health
+- Tests endpoint accessibility
 - Validates service configuration
 - Fetches application logs
 
