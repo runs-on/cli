@@ -78,12 +78,20 @@ jobs:
 
 ## Resource Discovery
 
-The CLI discovers RunsOn resources using the AWS Resource Groups Tagging API (RGTA). Resources are identified by their tags:
+The CLI discovers RunsOn resources using the AWS Resource Groups Tagging API (RGTA):
 
-- `runs-on-stack-name`: The stack name (e.g., "runs-on")
-- `runs-on-resource`: The resource type (e.g., "apprunner-service", "config-bucket", "ec2-log-group")
+1. **Primary**: `runs-on-stack-name` tag (all new CF/TF deployments)
+2. **Fallback**: Dynamic discovery via AppRunner service tags (older stacks)
 
-These tags are automatically applied when deploying RunsOn via the Terraform/OpenTofu module.
+Resources are identified by their `runs-on-resource` tag (Terraform) or ARN pattern matching (CloudFormation fallback):
+
+| Resource | Tag Value | CF Fallback |
+|----------|-----------|-------------|
+| AppRunner Service | `apprunner-service` | ARN pattern |
+| Config S3 Bucket | `config-bucket` | `runs-on/purpose=config` tag or name contains `-config` |
+| EC2 Log Group | `ec2-log-group` | Name contains `{stack}/ec2/instances` |
+
+Tags are automatically applied when deploying RunsOn via Terraform/OpenTofu or CloudFormation.
 
 ## Core Commands
 
