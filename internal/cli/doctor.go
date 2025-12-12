@@ -135,6 +135,10 @@ func (d *StackDoctor) checkAppRunnerService(ctx context.Context) error {
 		return d.failCheck("AppRunner service running", "Failed to describe service", err)
 	}
 
+	if out.Service == nil {
+		return d.failCheck("AppRunner service running", "Service not found in response", fmt.Errorf("DescribeService returned nil service"))
+	}
+
 	service := out.Service
 	status := string(service.Status)
 
