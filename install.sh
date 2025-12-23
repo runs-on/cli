@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+# set -x
 
 VERSION="${1:-latest}"
 
