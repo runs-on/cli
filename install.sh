@@ -51,9 +51,6 @@ esac
 if [ "$VERSION" = "latest" ]; then
   echo "Fetching latest version..."
   # Use a more portable method to extract tag_name from JSON
-  curl -sSL -H "Accept: application/vnd.github.v3+json" \
-    https://api.github.com/repos/runs-on/cli/releases/latest | \
-    grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | head -1
   VERSION=$(curl -sSL -H "Accept: application/vnd.github.v3+json" \
     https://api.github.com/repos/runs-on/cli/releases/latest | \
     grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | head -1)
