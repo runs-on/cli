@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -41,7 +40,6 @@ type LogFetcher struct {
 	cfg          aws.Config
 	cwl          *cloudwatchlogs.Client
 	s3           *s3.Client
-	cfn          *cloudformation.Client
 	ec2          *ec2.Client
 	stackName    string
 	outputs      *StackOutputs
@@ -60,7 +58,6 @@ func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
 		cfg:       config.AWSConfig,
 		cwl:       cloudwatchlogs.NewFromConfig(config.AWSConfig),
 		s3:        s3.NewFromConfig(config.AWSConfig),
-		cfn:       cloudformation.NewFromConfig(config.AWSConfig),
 		ec2:       ec2.NewFromConfig(config.AWSConfig),
 		stackName: config.StackName,
 		outputs: &StackOutputs{
@@ -664,7 +661,7 @@ func NewStackLogsCmd(stack *Stack) *cobra.Command {
 		Use:   "logs",
 		Short: "Stream all RunsOn application logs from CloudWatch",
 		Long: `Stream all RunsOn application logs from the CloudWatch log group.
-		
+
 This command streams all application logs from the RunsOn service, not filtered
 by specific jobs. Use this to monitor overall service activity and troubleshoot
 system-wide issues.`,

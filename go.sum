@@ -22,8 +22,6 @@ github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.6 h1:R0tNFJqfjHL3900cqhXuwQ+1K4G0
 github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.6/go.mod h1:y/7sDdu+aJvPtGXr4xYosdpq9a6T9Z0jkXfugmti0rI=
 github.com/aws/aws-sdk-go-v2/service/apprunner v1.38.3 h1:h6HKdn8kmz/bpDAM8eIX/Nu0oSoewQH4l1hiRukqYoE=
 github.com/aws/aws-sdk-go-v2/service/apprunner v1.38.3/go.mod h1:17A21aZwtJWcU346UqC5h5iynSNesczxeYQn5TX39lU=
-github.com/aws/aws-sdk-go-v2/service/cloudformation v1.66.0 h1:zDKnCvsZ21fO1oCx1Dj+QofcU2MABkM9gdb1278an+Y=
-github.com/aws/aws-sdk-go-v2/service/cloudformation v1.66.0/go.mod h1:wkKFqGoZf9Asi1eKuWbz7SEx0RtCq4+drWwHKzizP9o=
 github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.57.2 h1:TSNLZXt7ipIV+Q+GZAQ8dUxYUDsMX2/Atrn/YuPF3zI=
 github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.57.2/go.mod h1:mSt0uBAxUj2dnagbjc7p+Jh68SSwgDTNzMKUjchDiOY=
 github.com/aws/aws-sdk-go-v2/service/ec2 v1.251.0 h1:hGHSNZDTFnhLGUpRkQORM8uBY9R/FOkxCkuUUJBEOQ4=

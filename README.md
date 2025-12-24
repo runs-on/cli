@@ -83,7 +83,7 @@ The CLI discovers RunsOn resources using the AWS Resource Groups Tagging API (RG
 1. **Primary**: `runs-on-stack-name` tag (all new CF/TF deployments)
 2. **Fallback**: Dynamic discovery via AppRunner service tags (older stacks)
 
-Resources are identified by their `runs-on-resource` tag (Terraform) or ARN pattern matching (CloudFormation fallback):
+Resources are identified by their `runs-on-resource` tag (Terraform) or ARN pattern matching (fallback):
 
 | Resource | Tag Value | CF Fallback |
 |----------|-----------|-------------|

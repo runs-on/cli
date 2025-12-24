@@ -38,7 +38,7 @@ func NewRootCmd(stack *Stack) *cobra.Command {
 		}
 	}
 
-	cmd.PersistentFlags().String("stack", defaultStack, "CloudFormation stack name")
+	cmd.PersistentFlags().String("stack", defaultStack, "Stack name")
 	cmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "Disable color output")
 
 	cmd.AddCommand(

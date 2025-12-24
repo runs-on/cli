@@ -35,7 +35,7 @@ The CLI uses the Cobra framework with commands organized under `internal/cli/`:
 
 ### AWS Integration
 The CLI heavily integrates with AWS services:
-- CloudFormation - Stack management and output retrieval
+- Resource Groups Tagging API - Resource discovery
 - SSM - Instance connections
 - CloudWatch Logs - Log streaming
 - AppRunner - Service health checks
@@ -46,7 +46,7 @@ The CLI heavily integrates with AWS services:
 - AWS credentials via standard AWS SDK configuration (profiles, environment variables, IAM roles)
 
 ### Key Patterns
-1. Commands retrieve stack outputs from CloudFormation to get resource ARNs
+1. Commands discover resources via Resource Groups Tagging API to get resource ARNs
 2. Context propagation for AWS config through command execution
 3. Structured error handling with context-aware messages
 4. Real-time log streaming with optional watch mode
