@@ -15,6 +15,12 @@ builds:
     goarch:
       - amd64
       - arm64
+      - ppc64le
+    ignore:
+      - goos: darwin
+        goarch: ppc64le
+      - goos: windows
+        goarch: ppc64le
     binary: roc
     ldflags:
       - -s -w
