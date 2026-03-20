@@ -4,7 +4,7 @@ author: 'RunsOn'
 
 inputs:
   version:
-    description: 'Version of RunsOn CLI to install (e.g., v0.1.7). Defaults to latest.'
+    description: 'Version of RunsOn CLI to install (e.g., v2.12.1). Defaults to latest.'
     required: false
     default: 'latest'
 
@@ -13,9 +13,10 @@ runs:
   steps:
     - name: Install RunsOn CLI
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
       run: |
         ACTION_PATH="${{ github.action_path }}"
         # Convert Windows paths to Unix-style for bash compatibility
         ACTION_PATH="${ACTION_PATH//\\//}"
-        "${ACTION_PATH}/install.sh" ${{ inputs.version }}
-
+        "${ACTION_PATH}/install.sh" "${{ inputs.version }}"

@@ -14,10 +14,9 @@ func NewVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Display the version of roc",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Fprintf(os.Stdout, "%s\n", version.Version)
+			fmt.Fprintf(os.Stdout, "%s\n", version.String())
 		},
 	}
 
 	return cmd
 }
-

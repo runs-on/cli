@@ -1,61 +1,22 @@
-PREVIOUS_TAG ?= $(shell git tag -l | tail -n 1)
-TAG=v0.1.14
+VERSION ?= $(shell if [ -f ../VERSION ]; then tr -d '\n' < ../VERSION; elif [ -f VERSION ]; then tr -d '\n' < VERSION; elif git describe --tags --exact-match >/dev/null 2>&1; then git describe --tags --exact-match; else echo dev; fi)
+VERSION_NO_V = $(patsubst v%,%,$(VERSION))
+LDFLAGS = -s -w -X roc/internal/version.Version=$(VERSION)
 
-.PHONY: build install tag update-config test bump-readme
+.PHONY: build install test sync-metadata version
 
 build:
 	mkdir -p dist
-	go build -o dist/roc .
+	mise exec -- go build -ldflags="$(LDFLAGS)" -o dist/roc .
 
 install: build
 	sudo install -m 755 dist/roc /usr/local/bin/roc
 
-tag:
-	git commit -m "Bump version to $(TAG)" Makefile
-	git tag -a $(TAG) -m "Release $(TAG)"
-	git push origin main && git push origin $(TAG)
-
 test:
-	go test -count=1 ./...
+	mise exec -- go test -count=1 ./...
 
-bump-readme:
-	@if [ -z "$(TAG)" ]; then \
-		echo "Error: TAG is required. Usage: make bump-readme TAG=v0.1.10"; \
-		exit 1; \
-	fi
-	@git fetch --tags 2>/dev/null || true
-	@VERSION=$$(echo $(TAG) | sed 's/^v//'); \
-	README_TAG=$$(grep -oE 'releases/download/v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1 | sed 's|releases/download/||'); \
-	README_VERSION=$$(echo $$README_TAG | sed 's/^v//'); \
-	README_REV=$$(grep -oE 'rev: v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -n 1 | sed 's|rev: ||'); \
-	if [ -z "$$README_TAG" ]; then \
-		echo "No version tag found in download URLs, updating placeholder versions"; \
-		sed -i.bak "s|v0\.0\.0|$(TAG)|g" README.md; \
-		sed -i.bak "s|roc_0\.0\.0|roc_$$VERSION|g" README.md; \
-		sed -i.bak "s|rev: v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|rev: $(TAG)|g" README.md; \
-		rm -f README.md.bak; \
-	else \
-		echo "Current tag: $(TAG)"; \
-		echo "README tag: $$README_TAG"; \
-		echo "Version: $$VERSION"; \
-		if [ "$$README_TAG" != "$(TAG)" ]; then \
-			echo "Updating README.md: $$README_TAG -> $(TAG), roc_$$README_VERSION -> roc_$$VERSION"; \
-			sed -i.bak "s|releases/download/$$README_TAG|releases/download/$(TAG)|g" README.md; \
-			sed -i.bak "s|roc_$$README_VERSION|roc_$$VERSION|g" README.md; \
-			sed -i.bak "s|rev: $$README_TAG|rev: $(TAG)|g" README.md; \
-			rm -f README.md.bak; \
-		else \
-			echo "README.md already contains $(TAG)"; \
-		fi; \
-		if [ -n "$$README_REV" ] && [ "$$README_REV" != "$(TAG)" ]; then \
-			echo "Updating pre-commit rev: $$README_REV -> $(TAG)"; \
-			sed -i.bak "s|rev: $$README_REV|rev: $(TAG)|g" README.md; \
-			rm -f README.md.bak; \
-		fi; \
-	fi; \
-	if git diff --exit-code README.md > /dev/null 2>&1; then \
-		echo "README.md already up to date"; \
-	else \
-		echo "README.md updated successfully"; \
-		git diff README.md; \
-	fi
+sync-metadata:
+	@VERSION="$(VERSION)" VERSION_NO_V="$(VERSION_NO_V)" perl -0pi -e 's{releases/download/v[0-9A-Za-z.\\-]+}{releases/download/$$ENV{VERSION}}g; s{roc_[0-9A-Za-z.\\-]+_(darwin|linux|windows)_(amd64|arm64)(\\.exe)?}{"roc_".$$ENV{VERSION_NO_V}."_".$$1."_".$$2.($$3 // "")}ge; s{rev: v[0-9A-Za-z.\\-]+}{rev: $$ENV{VERSION}}g' README.md
+	@VERSION="$(VERSION)" perl -0pi -e 's{e\\.g\\., v[0-9A-Za-z.\\-]+}{e.g., $$ENV{VERSION}}g' action.yml
+
+version:
+	@echo $(VERSION)

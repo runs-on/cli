@@ -417,7 +417,7 @@ func outputLintAllSARIF(results []fileResult) error {
 						Version string `json:"version"`
 					}{
 						Name:    "roc",
-						Version: version.Version,
+						Version: version.String(),
 					},
 				},
 				Results: allResults,
@@ -638,7 +638,7 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 						Version string `json:"version"`
 					}{
 						Name:    "roc",
-						Version: version.Version,
+						Version: version.String(),
 					},
 				},
 				Results: results,

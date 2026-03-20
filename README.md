@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.14/roc_0.1.14_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.1/roc_2.12.1_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v0.1.14/roc_0.1.14_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.1/roc_2.12.1_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -68,7 +68,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - uses: runs-on/cli@main
       
@@ -281,7 +281,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v0.1.14  # Use the latest release tag
+    rev: v2.12.1  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```

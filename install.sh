@@ -2,6 +2,20 @@
 set -euo pipefail
 
 VERSION="${1:-latest}"
+CURL_RETRY_ARGS=(--retry 3 --retry-delay 1 --retry-all-errors)
+
+extract_json_string() {
+  local key="$1"
+  local body="$2"
+
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" <<<"$body" | head -1
+}
+
+summarize_response() {
+  local body="$1"
+
+  tr '\r\n' ' ' <<<"$body" | sed 's/[[:space:]]\+/ /g' | cut -c1-200
+}
 
 # Detect OS
 case "${RUNNER_OS:-}" in
@@ -49,13 +63,47 @@ esac
 # Get version if latest
 if [ "$VERSION" = "latest" ]; then
   echo "Fetching latest version..."
-  # Use a more portable method to extract tag_name from JSON
-  VERSION=$(curl -sSL -H "Accept: application/vnd.github.v3+json" \
-    https://api.github.com/repos/runs-on/cli/releases/latest | \
-    grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | head -1)
-  
+  API_HEADERS=(
+    -H "Accept: application/vnd.github+json"
+    -H "User-Agent: runs-on-cli-installer"
+    -H "X-GitHub-Api-Version: 2022-11-28"
+  )
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    API_HEADERS+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+
+  if ! RELEASE_RESPONSE=$(curl -sSL "${CURL_RETRY_ARGS[@]}" "${API_HEADERS[@]}" \
+    -w $'\n%{http_code}' \
+    https://api.github.com/repos/runs-on/cli/releases/latest); then
+    echo "Error: Failed to fetch latest version metadata from GitHub"
+    exit 1
+  fi
+
+  RELEASE_STATUS="${RELEASE_RESPONSE##*$'\n'}"
+  RELEASE_BODY="${RELEASE_RESPONSE%$'\n'*}"
+
+  if [[ ! "$RELEASE_STATUS" =~ ^[0-9]{3}$ ]]; then
+    echo "Error: Failed to fetch latest version metadata from GitHub"
+    echo "Unexpected HTTP status payload: $(summarize_response "$RELEASE_RESPONSE")"
+    exit 1
+  fi
+
+  if [ "$RELEASE_STATUS" -ge 400 ]; then
+    API_MESSAGE=$(extract_json_string "message" "$RELEASE_BODY")
+    echo "Error: Failed to fetch latest version metadata from GitHub (HTTP ${RELEASE_STATUS})"
+    if [ -n "$API_MESSAGE" ]; then
+      echo "GitHub API message: ${API_MESSAGE}"
+    else
+      echo "GitHub API response: $(summarize_response "$RELEASE_BODY")"
+    fi
+    exit 1
+  fi
+
+  VERSION=$(extract_json_string "tag_name" "$RELEASE_BODY")
+
   if [ -z "$VERSION" ]; then
     echo "Error: Failed to fetch latest version"
+    echo "GitHub API response: $(summarize_response "$RELEASE_BODY")"
     exit 1
   fi
   
@@ -85,7 +133,7 @@ TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 # Download binary
-if ! curl -fsSL -o "${TEMP_DIR}/${INSTALL_NAME}" "${DOWNLOAD_URL}"; then
+if ! curl -fsSL "${CURL_RETRY_ARGS[@]}" -o "${TEMP_DIR}/${INSTALL_NAME}" "${DOWNLOAD_URL}"; then
   echo "Error: Failed to download binary from ${DOWNLOAD_URL}"
   exit 1
 fi
@@ -128,4 +176,3 @@ if [ "$OS" = "windows" ]; then
 else
   "$INSTALL_PATH" version || echo "Warning: Could not verify installation"
 fi
-
