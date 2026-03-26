@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.1/roc_2.12.1_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.2/roc_2.12.2_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.1/roc_2.12.1_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.2/roc_2.12.2_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -69,9 +69,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      
+
       - uses: runs-on/cli@main
-      
+
       - name: Lint runs-on.yml
         run: roc lint .github/runs-on.yml
 ```
@@ -130,7 +130,7 @@ Usage:
 
 Flags:
   -d, --debug                 Enable debug output
-  -f, --format string         Output format: long (default) or short (default "long")  
+  -f, --format string         Output format: long (default) or short (default "long")
   -h, --help                  help for logs
       --include strings       Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)
       --no-color              Disable color output
@@ -147,7 +147,7 @@ Examples:
 # Fetch logs for a specific job (default behavior)
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --watch
 
-# Fetch all application logs for a run (all jobs in the run)  
+# Fetch all application logs for a run (all jobs in the run)
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --include=run --watch
 
 # Fetch EC2 instance console logs
@@ -281,7 +281,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v2.12.1  # Use the latest release tag
+    rev: v2.12.2  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
