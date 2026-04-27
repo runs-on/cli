@@ -85,9 +85,18 @@ func TestLintAllFiles_NoFiles(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Change to temp directory
-	oldWd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(oldWd)
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Failed to change working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(oldWd); err != nil {
+			t.Fatalf("Failed to restore working directory: %v", err)
+		}
+	}()
 
 	// Capture stdout
 	oldStdout := os.Stdout
@@ -95,7 +104,7 @@ func TestLintAllFiles_NoFiles(t *testing.T) {
 	os.Stdout = w
 
 	ctx := context.Background()
-	err := lintAllFiles(ctx, "text")
+	err = lintAllFiles(ctx, "text")
 
 	w.Close()
 	os.Stdout = oldStdout
@@ -105,7 +114,9 @@ func TestLintAllFiles_NoFiles(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 	output := buf.String()
 
 	if !strings.Contains(output, "No runs-on.yml files found") {
@@ -125,8 +136,12 @@ func TestLintAllFiles_MultipleFiles_Original(t *testing.T) {
 	// Create subdirectories with runs-on.yml files
 	subDir1 := filepath.Join(tmpDir, "dir1")
 	subDir2 := filepath.Join(tmpDir, "dir2")
-	os.MkdirAll(subDir1, 0755)
-	os.MkdirAll(subDir2, 0755)
+	if err := os.MkdirAll(subDir1, 0755); err != nil {
+		t.Fatalf("Failed to create %s: %v", subDir1, err)
+	}
+	if err := os.MkdirAll(subDir2, 0755); err != nil {
+		t.Fatalf("Failed to create %s: %v", subDir2, err)
+	}
 
 	validYAML := `
 runners:
@@ -141,13 +156,26 @@ pools:
       - test-runner
 `
 
-	os.WriteFile(filepath.Join(subDir1, "runs-on.yml"), []byte(validYAML), 0644)
-	os.WriteFile(filepath.Join(subDir2, "runs-on.yml"), []byte(validYAML), 0644)
+	if err := os.WriteFile(filepath.Join(subDir1, "runs-on.yml"), []byte(validYAML), 0644); err != nil {
+		t.Fatalf("Failed to write first config file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir2, "runs-on.yml"), []byte(validYAML), 0644); err != nil {
+		t.Fatalf("Failed to write second config file: %v", err)
+	}
 
 	// Change to temp directory
-	oldWd, _ := os.Getwd()
-	os.Chdir(tmpDir)
-	defer os.Chdir(oldWd)
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Failed to change working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(oldWd); err != nil {
+			t.Fatalf("Failed to restore working directory: %v", err)
+		}
+	}()
 
 	// Capture stdout
 	oldStdout := os.Stdout
@@ -155,7 +183,7 @@ pools:
 	os.Stdout = w
 
 	ctx := context.Background()
-	err := lintAllFiles(ctx, "text")
+	err = lintAllFiles(ctx, "text")
 
 	w.Close()
 	os.Stdout = oldStdout
@@ -165,7 +193,9 @@ pools:
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 	output := buf.String()
 
 	// Should find both files
@@ -200,7 +230,9 @@ func TestOutputLintResults_TextFormat(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 	output := buf.String()
 
 	// Should contain warning information
@@ -235,7 +267,9 @@ func TestOutputLintResults_JSONFormat(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 
 	// Parse JSON to verify structure
 	var result struct {
@@ -293,7 +327,9 @@ func TestOutputLintResults_SARIFFormat(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 
 	// Parse SARIF JSON to verify structure
 	var result struct {
@@ -480,7 +516,9 @@ func TestOutputLintAllJSON(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 
 	var result struct {
 		Valid bool `json:"valid"`
@@ -547,7 +585,9 @@ func TestOutputLintAllSARIF(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
 
 	var result struct {
 		Version string `json:"version"`

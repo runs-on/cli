@@ -9,24 +9,22 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/cloudformation"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/google/go-github/v66/github"
 	"github.com/spf13/cobra"
 )
 
 type StackOutputs struct {
-	AppRunnerServiceArn    string
+	ServiceLogGroupName    string
 	EC2InstanceLogGroupArn string
-	BucketConfig           string
 }
 
 type LogOptions struct {
@@ -38,17 +36,14 @@ type LogOptions struct {
 }
 
 type LogFetcher struct {
-	cfg          aws.Config
 	cwl          *cloudwatchlogs.Client
-	s3           *s3.Client
-	cfn          *cloudformation.Client
+	jobs         workflowJobsAPI
 	ec2          *ec2.Client
-	stackName    string
 	outputs      *StackOutputs
+	jobsTable    string
 	instanceID   string
+	runID        int64
 	jobID        string
-	runID        string
-	workflowJob  *github.WorkflowJob
 	logger       *log.Logger
 	collector    *logCollector
 	includeTypes []string
@@ -57,19 +52,26 @@ type LogFetcher struct {
 func NewLogFetcher(config *RunsOnConfig) *LogFetcher {
 	logger := log.New(io.Discard, "", 0)
 	return &LogFetcher{
-		cfg:       config.AWSConfig,
 		cwl:       cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		s3:        s3.NewFromConfig(config.AWSConfig),
-		cfn:       cloudformation.NewFromConfig(config.AWSConfig),
+		jobs:      dynamodb.NewFromConfig(config.AWSConfig),
 		ec2:       ec2.NewFromConfig(config.AWSConfig),
-		stackName: config.StackName,
+		jobsTable: config.WorkflowJobsTable,
 		outputs: &StackOutputs{
-			AppRunnerServiceArn:    config.AppRunnerServiceArn,
-			EC2InstanceLogGroupArn: config.EC2LogGroupArn,
-			BucketConfig:           config.BucketConfig,
+			ServiceLogGroupName:    config.ServiceLogGroupName,
+			EC2InstanceLogGroupArn: config.EC2InstanceLogGroupArn,
 		},
 		logger: logger,
 	}
+}
+
+func (o *StackOutputs) applicationLogGroupIdentifier() (string, error) {
+	if o == nil {
+		return "", fmt.Errorf("application log group not found")
+	}
+	if o.ServiceLogGroupName != "" {
+		return o.ServiceLogGroupName, nil
+	}
+	return "", fmt.Errorf("application log group not found")
 }
 
 func (f *LogFetcher) Init(ctx context.Context, jobID string, includeTypes []string) error {
@@ -77,20 +79,11 @@ func (f *LogFetcher) Init(ctx context.Context, jobID string, includeTypes []stri
 	f.includeTypes = includeTypes
 	f.logger.Printf("Fetching logs for job ID: %s (include types: %v)", jobID, includeTypes)
 
-	if err := f.refreshWorkflowJobDetails(ctx); err != nil {
-		return err
-	}
-	if err := f.refreshInstanceID(ctx); err != nil {
+	if err := f.refreshJobLookup(ctx); err != nil {
 		return err
 	}
 
-	// If using run filter, extract run ID from workflow job
-	if f.hasIncludeType("run") && f.workflowJob != nil {
-		f.runID = fmt.Sprintf("%d", *f.workflowJob.RunID)
-		f.logger.Printf("Using run ID for filtering: %s", f.runID)
-	}
-
-	// Start goroutine to refresh instance ID every 5s
+	// Refresh the job lookup so reschedules follow the latest instance.
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -100,14 +93,8 @@ func (f *LogFetcher) Init(ctx context.Context, jobID string, includeTypes []stri
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if f.workflowJob == nil {
-					if err := f.refreshWorkflowJobDetails(ctx); err != nil {
-						f.logger.Printf("Error refreshing workflow job details: %v", err)
-					}
-				}
-				// keep refreshing instance ID, because a job might get rescheduled on another instance
-				if err := f.refreshInstanceID(ctx); err != nil {
-					f.logger.Printf("Error refreshing instance ID: %v", err)
+				if err := f.refreshJobLookup(ctx); err != nil {
+					f.logger.Printf("Error refreshing job lookup: %v", err)
 				}
 				if f.instanceID != "" {
 					f.logger.Printf("Instance ID for job %s: %s", f.jobID, f.instanceID)
@@ -120,61 +107,38 @@ func (f *LogFetcher) Init(ctx context.Context, jobID string, includeTypes []stri
 }
 
 func (f *LogFetcher) hasIncludeType(includeType string) bool {
-	for _, t := range f.includeTypes {
-		if t == includeType {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.includeTypes, includeType)
 }
 
-func (f *LogFetcher) refreshInstanceID(ctx context.Context) error {
-	instanceKey := fmt.Sprintf("runs-on/db/jobs/%s/instance-id", f.jobID)
-	instanceOut, err := f.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &f.outputs.BucketConfig,
-		Key:    &instanceKey,
-	})
+func (f *LogFetcher) refreshJobLookup(ctx context.Context) error {
+	jobLookup, err := findJobLookup(ctx, f.jobs, f.jobsTable, f.jobID)
 	if err != nil {
-		f.logger.Printf("Error fetching instance ID from S3: %v", err)
+		f.logger.Printf("Error discovering workflow job lookup: %v", err)
 		f.instanceID = ""
+		f.runID = 0
 		return nil
 	}
-	defer instanceOut.Body.Close()
-
-	instanceData, err := io.ReadAll(instanceOut.Body)
-	if err != nil {
-		return err
+	if jobLookup == nil {
+		f.instanceID = ""
+		f.runID = 0
+		return nil
 	}
-	f.instanceID = string(instanceData)
+	f.instanceID = jobLookup.InstanceID
+	f.runID = jobLookup.RunID
 	return nil
 }
 
-func (f *LogFetcher) refreshWorkflowJobDetails(ctx context.Context) error {
-	jobDetailsKey := fmt.Sprintf("runs-on/db/jobs/%s/webhooks/queued", f.jobID)
-	payload, err := f.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &f.outputs.BucketConfig,
-		Key:    &jobDetailsKey,
-	})
-	if err != nil {
-		f.logger.Printf("Error fetching workflow job details from S3: %v", err)
-		return nil
+func (f *LogFetcher) applicationFilterPattern() (string, error) {
+	if f.hasIncludeType("run") {
+		if f.runID == 0 {
+			return "", fmt.Errorf("workflow run ID for job %s not available yet", f.jobID)
+		}
+		return fmt.Sprintf(`{ ( $.run_id = "%d" ) }`, f.runID), nil
 	}
-	defer payload.Body.Close()
-
-	body, err := io.ReadAll(payload.Body)
-	if err != nil {
-		return err
+	if f.instanceID == "" {
+		return fmt.Sprintf(`{ ( $.job_id = "%s" ) }`, f.jobID), nil
 	}
-	workflowJob := &github.WorkflowJob{}
-	err = json.Unmarshal(body, workflowJob)
-	if err != nil {
-		return err
-	}
-
-	f.workflowJob = workflowJob
-	// Process jobDetailsData as needed
-	f.logger.Printf("Fetched workflow job details: %s", *workflowJob.Name)
-	return nil
+	return fmt.Sprintf(`{ ( $.job_id = "%s" ) || ( $.message = "*%s*" ) }`, f.jobID, f.instanceID), nil
 }
 
 type logEvent struct {
@@ -216,10 +180,11 @@ func (e *logEvent) print(format string) {
 
 	color := "\033[34m" // blue for instance
 	stream := e.stream
-	if e.prefix == "application" {
+	switch e.prefix {
+	case "application":
 		color = "\033[33m" // yellow for application
 		stream = e.prefix
-	} else if e.prefix == "console" {
+	case "console":
 		color = "\033[35m" // magenta for console
 		stream = e.prefix
 	}
@@ -340,14 +305,8 @@ func (f *LogFetcher) streamInstanceLogs(ctx context.Context, opts *LogOptions) e
 	updateInput := func(input *cloudwatchlogs.FilterLogEventsInput) error {
 		input.LogGroupIdentifier = &f.outputs.EC2InstanceLogGroupArn
 		input.FilterPattern = aws.String("")
-
-		if f.workflowJob != nil {
-			// only set start time if it's not already set
-			if input.StartTime == nil {
-				input.StartTime = aws.Int64(f.workflowJob.CreatedAt.UnixMilli() - 10000)
-			}
-		} else {
-			return fmt.Errorf("workflow job queued event not found yet for job %s", f.jobID)
+		if input.StartTime == nil {
+			input.StartTime = aws.Int64(opts.StartTime)
 		}
 		if f.instanceID == "" {
 			return fmt.Errorf("instance ID for job %s not available yet", f.jobID)
@@ -408,6 +367,18 @@ func (f *LogFetcher) streamConsoleLogs(ctx context.Context, opts *LogOptions) er
 	return nil
 }
 
+func (f *LogFetcher) streamApplicationLogs(ctx context.Context, opts *LogOptions, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) error {
+	logGroupArn, err := f.outputs.applicationLogGroupIdentifier()
+	if err != nil {
+		return err
+	}
+
+	return f.streamLogs(ctx, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
+		input.LogGroupIdentifier = &logGroupArn
+		return updateInput(input)
+	}, opts)
+}
+
 func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 	f.collector = newLogCollector()
 	collector := f.collector
@@ -421,42 +392,27 @@ func (f *LogFetcher) FetchLogs(ctx context.Context, opts *LogOptions) error {
 
 	// Add console logs if requested
 	if f.hasIncludeType("console") {
-		collector.wg.Add(1)
-		go func() {
-			defer collector.wg.Done()
+		collector.wg.Go(func() {
 			if err := f.streamConsoleLogs(ctx, opts); err != nil {
 				f.logger.Printf("Error streaming console logs: %v", err)
 			}
-		}()
+		})
 	}
 
 	collector.wg.Add(1)
 	go func() {
-		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
-		if err := f.streamLogs(ctx, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
-			input.LogGroupIdentifier = &logGroupArn
-			filterPatterns := []string{}
-			if f.workflowJob != nil {
-				if f.hasIncludeType("run") {
-					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.run_id = \"%s\" )", f.runID))
-				} else {
-					filterPatterns = append(filterPatterns, fmt.Sprintf("( $.job_id = \"%d\" )", *f.workflowJob.ID))
-				}
-				// only set start time if it's not already set
-				if input.StartTime == nil {
-					input.StartTime = aws.Int64(f.workflowJob.CreatedAt.UnixMilli() - 10000)
-				}
-			} else {
-				return fmt.Errorf("workflow job queued event not found yet for job %s", f.jobID)
+		if err := f.streamApplicationLogs(ctx, opts, func(input *cloudwatchlogs.FilterLogEventsInput) error {
+			if input.StartTime == nil {
+				input.StartTime = aws.Int64(opts.StartTime)
 			}
-			// also grep for messages mentioning the instance ID (only for job filtering)
-			if f.instanceID != "" {
-				filterPatterns = append(filterPatterns, fmt.Sprintf(`( $.message = "*%s*" )`, f.instanceID))
+			filterPattern, err := f.applicationFilterPattern()
+			if err != nil {
+				return err
 			}
-			input.FilterPattern = aws.String(fmt.Sprintf("{ %s }", strings.Join(filterPatterns, " || ")))
+			input.FilterPattern = aws.String(filterPattern)
 			f.logger.Printf("Filter pattern: %s", *input.FilterPattern)
 			return nil
-		}, opts); err != nil {
+		}); err != nil {
 			f.logger.Printf("Error streaming application logs: %v", err)
 		}
 	}()
@@ -503,9 +459,7 @@ func (f *LogFetcher) FetchAllApplicationLogs(ctx context.Context, opts *LogOptio
 
 	collector.wg.Add(1)
 	go func() {
-		logGroupArn := getLogGroupArn(f.outputs.AppRunnerServiceArn, "application")
-		if err := f.streamLogs(ctx, "application", func(input *cloudwatchlogs.FilterLogEventsInput) error {
-			input.LogGroupIdentifier = &logGroupArn
+		if err := f.streamApplicationLogs(ctx, opts, func(input *cloudwatchlogs.FilterLogEventsInput) error {
 			// No filtering pattern for all logs
 			input.FilterPattern = aws.String("")
 			// Set start time from options
@@ -513,7 +467,7 @@ func (f *LogFetcher) FetchAllApplicationLogs(ctx context.Context, opts *LogOptio
 				input.StartTime = aws.Int64(opts.StartTime)
 			}
 			return nil
-		}, opts); err != nil {
+		}); err != nil {
 			f.logger.Printf("Error streaming application logs: %v", err)
 		}
 	}()
@@ -554,10 +508,6 @@ func (f *LogFetcher) FetchAllApplicationLogs(ctx context.Context, opts *LogOptio
 	}
 }
 
-func getLogGroupArn(arn string, name string) string {
-	return fmt.Sprintf("%s/%s", strings.Replace(strings.Replace(arn, "apprunner", "logs", 1), ":service", ":log-group:/aws/apprunner", 1), name)
-}
-
 func extractJobID(input string) string {
 	url, err := url.Parse(input)
 	if err == nil && url.Scheme == "https" {
@@ -590,6 +540,9 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
+				return err
+			}
+			if err := config.validateJobLogs(); err != nil {
 				return err
 			}
 
@@ -664,13 +617,16 @@ func NewStackLogsCmd(stack *Stack) *cobra.Command {
 		Use:   "logs",
 		Short: "Stream all RunsOn application logs from CloudWatch",
 		Long: `Stream all RunsOn application logs from the CloudWatch log group.
-		
+
 This command streams all application logs from the RunsOn service, not filtered
 by specific jobs. Use this to monitor overall service activity and troubleshoot
 system-wide issues.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
+				return err
+			}
+			if err := config.validateStackLogs(); err != nil {
 				return err
 			}
 

@@ -7,10 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/spf13/cobra"
@@ -31,6 +30,9 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := config.validateJobLookup(); err != nil {
+				return err
+			}
 
 			jobID := extractJobID(args[0])
 			ctx := cmd.Context()
@@ -40,35 +42,13 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 				logger.SetOutput(cmd.OutOrStderr())
 			}
 
-			s3Client := s3.NewFromConfig(config.AWSConfig)
+			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
 			ssmClient := ssm.NewFromConfig(config.AWSConfig)
-
-			// Get instance ID from S3
-			key := fmt.Sprintf("runs-on/db/jobs/%s/instance-id", jobID)
-			var instanceID string
-
-			for {
-				out, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-					Bucket: &config.BucketConfig,
-					Key:    &key,
-				})
-				if err != nil {
-					if !watch {
-						return fmt.Errorf("instance ID not found for job %s", jobID)
-					}
-					logger.Printf("Waiting for instance ID for job %s...\n", jobID)
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				defer out.Body.Close()
-
-				data, err := io.ReadAll(out.Body)
-				if err != nil {
-					return err
-				}
-				instanceID = string(data)
-				break
+			jobLookup, err := waitForJobLookup(ctx, jobsClient, config.WorkflowJobsTable, jobID, watch, logger)
+			if err != nil {
+				return err
 			}
+			instanceID := jobLookup.InstanceID
 
 			// Check if instance is running and get platform type
 			describeInput := &ssm.DescribeInstanceInformationInput{
