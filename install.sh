@@ -106,19 +106,16 @@ if [ "$VERSION" = "latest" ]; then
     echo "GitHub API response: $(summarize_response "$RELEASE_BODY")"
     exit 1
   fi
-  
+
   echo "Latest version: $VERSION"
 fi
 
-# Remove 'v' prefix if present for binary name
-VERSION_NO_V="${VERSION#v}"
-
 # Construct binary name
 if [ "$OS" = "windows" ]; then
-  BINARY_NAME="roc_${VERSION_NO_V}_${OS}_${ARCH}.exe"
+  BINARY_NAME="roc_${VERSION}_${OS}_${ARCH}.exe"
   INSTALL_NAME="roc.exe"
 else
-  BINARY_NAME="roc_${VERSION_NO_V}_${OS}_${ARCH}"
+  BINARY_NAME="roc_${VERSION}_${OS}_${ARCH}"
   INSTALL_NAME="roc"
 fi
 
@@ -130,7 +127,7 @@ echo "URL: ${DOWNLOAD_URL}"
 
 # Create temp directory
 TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
+trap 'rm -rf "$TEMP_DIR"' EXIT
 
 # Download binary
 if ! curl -fsSL "${CURL_RETRY_ARGS[@]}" -o "${TEMP_DIR}/${INSTALL_NAME}" "${DOWNLOAD_URL}"; then

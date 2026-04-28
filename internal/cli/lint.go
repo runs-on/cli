@@ -159,6 +159,20 @@ type fileResult struct {
 	Diagnostics []validate.Diagnostic
 }
 
+func splitDiagnostics(diags []validate.Diagnostic) ([]validate.Diagnostic, []validate.Diagnostic) {
+	var errors []validate.Diagnostic
+	var warnings []validate.Diagnostic
+	for _, diag := range diags {
+		switch diag.Severity {
+		case validate.SeverityError:
+			errors = append(errors, diag)
+		case validate.SeverityWarning:
+			warnings = append(warnings, diag)
+		}
+	}
+	return errors, warnings
+}
+
 func outputLintAllText(results []fileResult) error {
 	allValid := true
 	for _, result := range results {
@@ -173,15 +187,7 @@ func outputLintAllText(results []fileResult) error {
 		for _, result := range results {
 			if !result.Valid {
 				fmt.Printf("\n%s:\n", result.Path)
-				var errors []validate.Diagnostic
-				var warnings []validate.Diagnostic
-				for _, diag := range result.Diagnostics {
-					if diag.Severity == validate.SeverityError {
-						errors = append(errors, diag)
-					} else if diag.Severity == validate.SeverityWarning {
-						warnings = append(warnings, diag)
-					}
-				}
+				errors, warnings := splitDiagnostics(result.Diagnostics)
 				for i, diag := range errors {
 					fmt.Printf("  %d. ", i+1)
 					if diag.Line > 0 {
@@ -341,7 +347,7 @@ func outputLintAllSARIF(results []fileResult) error {
 		Region struct {
 			StartLine   int `json:"startLine,omitempty"`
 			StartColumn int `json:"startColumn,omitempty"`
-		} `json:"region,omitempty"`
+		} `json:"region"`
 	}
 
 	type sarifResult struct {
@@ -461,15 +467,7 @@ func outputLintResults(diags []validate.Diagnostic, sourceName string, format st
 
 func outputLintText(diags []validate.Diagnostic, sourceName string) error {
 	// Separate errors and warnings
-	var errors []validate.Diagnostic
-	var warnings []validate.Diagnostic
-	for _, diag := range diags {
-		if diag.Severity == validate.SeverityError {
-			errors = append(errors, diag)
-		} else if diag.Severity == validate.SeverityWarning {
-			warnings = append(warnings, diag)
-		}
-	}
+	errors, warnings := splitDiagnostics(diags)
 
 	if len(errors) == 0 && len(warnings) == 0 {
 		fmt.Printf("✅ Configuration file '%s' is valid!\n", sourceName)
@@ -564,7 +562,7 @@ func outputLintSARIF(diags []validate.Diagnostic) error {
 		Region struct {
 			StartLine   int `json:"startLine,omitempty"`
 			StartColumn int `json:"startColumn,omitempty"`
-		} `json:"region,omitempty"`
+		} `json:"region"`
 	}
 
 	type sarifResult struct {
