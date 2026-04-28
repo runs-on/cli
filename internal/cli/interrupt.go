@@ -9,11 +9,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/fis"
 	"github.com/aws/aws-sdk-go-v2/service/fis/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 )
@@ -67,6 +67,9 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := config.validateJobLookup(); err != nil {
+				return err
+			}
 
 			jobID := extractJobID(args[0])
 			ctx := cmd.Context()
@@ -76,34 +79,16 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 				logger.SetOutput(cmd.OutOrStderr())
 			}
 
-			s3Client := s3.NewFromConfig(config.AWSConfig)
-
-			// Get instance ID from S3
-			key := fmt.Sprintf("runs-on/db/jobs/%s/instance-id", jobID)
-			var instanceID string
-
-			for {
-				out, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-					Bucket: &config.BucketConfig,
-					Key:    &key,
-				})
-				if err != nil {
-					if !wait {
-						return fmt.Errorf("instance ID not found for job %s. Use -w to wait for instance", jobID)
-					}
-					logger.Printf("Waiting for instance ID for job %s...\n", jobID)
-					time.Sleep(5 * time.Second)
-					continue
+			ec2Client := ec2.NewFromConfig(config.AWSConfig)
+			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
+			jobLookup, err := waitForJobLookup(ctx, jobsClient, config.WorkflowJobsTable, jobID, wait, logger)
+			if err != nil {
+				if !wait {
+					return fmt.Errorf("%w. Use -w to wait for instance", err)
 				}
-				defer out.Body.Close()
-
-				data, err := io.ReadAll(out.Body)
-				if err != nil {
-					return err
-				}
-				instanceID = string(data)
-				break
+				return err
 			}
+			instanceID := jobLookup.InstanceID
 
 			fmt.Printf("Found instance %s for job %s\n", instanceID, jobID)
 
@@ -140,7 +125,6 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			}
 
 			// Check EC2 instance details
-			ec2Client := ec2.NewFromConfig(config.AWSConfig)
 			logger.Printf("Verifying instance %s details...\n", instanceID)
 
 			instanceResp, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
