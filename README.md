@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.5/roc_v3.0.5_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.6/roc_v3.0.6_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.5/roc_v3.0.5_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.6/roc_v3.0.6_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -123,7 +123,7 @@ AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions
 
 ### `roc logs`
 
-Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional log types.
+Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional streamed log types, or `--full` to export a complete diagnostic archive.
 
 ```
 Usage:
@@ -132,10 +132,10 @@ Usage:
 Flags:
   -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
+      --full                  Export full diagnostic archive for the job
   -h, --help                  help for logs
       --include strings       Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)
-      --no-color              Disable color output
-  -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
+      --no-color              Disable color output for streamed logs
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
@@ -156,7 +156,14 @@ AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=console
 
 # Fetch both run logs and console logs
 AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=run,console --watch
+
+# Export a diagnostic archive for a job
+AWS_PROFILE=runs-on-admin roc logs 34661958899 --full
 ```
+
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the raw DynamoDB workflow-job item, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the DynamoDB job creation timestamp, from one hour before creation through one hour after creation.
+
+`--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
 ### `roc interrupt`
 
@@ -282,7 +289,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.0.5  # Use the latest release tag
+    rev: v3.0.6  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
@@ -352,7 +359,7 @@ Flags:
   -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
   -h, --help                  help for logs
-      --no-color              Disable color output
+      --no-color              Disable color output for streamed logs
   -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 

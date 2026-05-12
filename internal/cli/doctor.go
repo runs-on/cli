@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -342,18 +341,15 @@ func (d *StackDoctor) createZipFile() (string, error) {
 	timestamp := time.Now().Format("2006-01-02-15-04-05")
 	zipFileName := fmt.Sprintf("roc-doctor-%s.zip", timestamp)
 
-	zipFile, err := os.Create(zipFileName)
+	archive, err := newArchiveWriter(zipFileName)
 	if err != nil {
 		return "", fmt.Errorf("failed to create zip file: %w", err)
 	}
-	defer zipFile.Close()
-
-	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
+	defer archive.Close()
 
 	// Add checks.json from workspace
 	checksPath := filepath.Join(d.workDir, "checks.json")
-	err = addFileToZipWithPath(zipWriter, checksPath, "checks.json")
+	err = archive.writeFile("checks.json", checksPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to add checks.json to zip: %w", err)
 	}
@@ -369,41 +365,17 @@ func (d *StackDoctor) createZipFile() (string, error) {
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			logPath := filepath.Join(logsDir, entry.Name())
-			err = addFileToZipWithPath(zipWriter, logPath, filepath.Join("logs", entry.Name()))
+			err = archive.writeFile(filepath.Join("logs", entry.Name()), logPath)
 			if err != nil {
 				return "", fmt.Errorf("failed to add log file %s to zip: %w", entry.Name(), err)
 			}
 		}
 	}
 
+	if err := archive.Close(); err != nil {
+		return "", fmt.Errorf("failed to finalize zip file: %w", err)
+	}
 	return zipFileName, nil
-}
-
-func addFileToZipWithPath(zipWriter *zip.Writer, filePath, zipPath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-	header.Name = zipPath
-
-	writer, err := zipWriter.CreateHeader(header)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(writer, file)
-	return err
 }
 
 func (d *StackDoctor) cleanup() {

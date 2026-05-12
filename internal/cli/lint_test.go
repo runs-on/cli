@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,50 +13,157 @@ import (
 	"github.com/runs-on/config/pkg/validate"
 )
 
+const validLintYAML = `
+runners:
+  test-runner:
+    cpu: [2]
+    ram: [16]
+    family: [c7a]
+
+pools:
+  test-pool:
+    runner: test-runner
+    schedule:
+      - name: default
+        hot: 1
+        stopped: 2
+`
+
+const invalidLintYAML = `
+runners:
+  invalid-runner:
+    cpu: "not-a-number"
+    spot: "invalid-spot-value"
+    family: []
+
+pools:
+  invalid-pool:
+    runner: ""
+    schedule:
+      - name: test
+        hot: -1
+        stopped: -2
+`
+
+func writeRunsOnConfig(t *testing.T, dir, content string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, "runs-on.yml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write %s: %v", path, err)
+	}
+	return path
+}
+
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to capture stdout: %v", err)
+	}
+	os.Stdout = w
+
+	fnErr := fn()
+
+	if err := w.Close(); err != nil {
+		os.Stdout = oldStdout
+		t.Fatalf("Failed to close stdout writer: %v", err)
+	}
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read stdout: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Failed to close stdout reader: %v", err)
+	}
+
+	return buf.String(), fnErr
+}
+
+func withStdin(t *testing.T, input string, fn func() error) error {
+	t.Helper()
+
+	stdinFile := filepath.Join(t.TempDir(), "stdin.yml")
+	if err := os.WriteFile(stdinFile, []byte(input), 0644); err != nil {
+		t.Fatalf("Failed to write stdin fixture: %v", err)
+	}
+
+	f, err := os.Open(stdinFile)
+	if err != nil {
+		t.Fatalf("Failed to open stdin fixture: %v", err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Fatalf("Failed to close stdin fixture: %v", err)
+		}
+	}()
+
+	oldStdin := os.Stdin
+	os.Stdin = f
+	defer func() {
+		os.Stdin = oldStdin
+	}()
+
+	return fn()
+}
+
+func withWorkingDir(t *testing.T, dir string, fn func()) {
+	t.Helper()
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Failed to change working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(oldWd); err != nil {
+			t.Fatalf("Failed to restore working directory: %v", err)
+		}
+	}()
+
+	fn()
+}
+
 func TestLintFile_ValidFile(t *testing.T) {
-	t.Skip("Skipping due to os.Exit behavior - validation logic tested via TestOutputLintResults_* tests")
+	tmpDir := t.TempDir()
+	validFile := writeRunsOnConfig(t, tmpDir, validLintYAML)
+
+	output, err := captureStdout(t, func() error {
+		return lintFile(context.Background(), validFile, "text")
+	})
+
+	if err != nil {
+		t.Errorf("lintFile returned error for valid file: %v", err)
+	}
+
+	if !strings.Contains(output, "is valid!") {
+		t.Errorf("Expected valid output, got: %s", output)
+	}
 }
 
 func TestLintFile_InvalidFile(t *testing.T) {
-	// Create a temporary invalid YAML file
 	tmpDir := t.TempDir()
-	invalidFile := filepath.Join(tmpDir, "runs-on.yml")
-	invalidYAML := `
-pools:
-  - name: test-pool
-    schedule: "invalid-schedule"
-    runners:
-      - name: test-runner
-        cpu: -1
-        ram: 0
-`
-	if err := os.WriteFile(invalidFile, []byte(invalidYAML), 0644); err != nil {
-		t.Fatalf("Failed to create test file: %v", err)
+	invalidFile := writeRunsOnConfig(t, tmpDir, invalidLintYAML)
+
+	output, err := captureStdout(t, func() error {
+		return lintFile(context.Background(), invalidFile, "text")
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	// Test validation directly to avoid os.Exit issues
-	ctx := context.Background()
-	diags, err := validate.ValidateFile(ctx, invalidFile)
-	// Validation might succeed but return diagnostics, or might fail
-	if err != nil {
-		// If validation fails completely, that's also a valid test case
-		return
+	if !strings.Contains(output, "has ") || !strings.Contains(output, "error(s)") {
+		t.Errorf("Expected error output, got: %s", output)
 	}
-
-	// Test output function separately - this will call os.Exit for errors,
-	// so we'll just verify it produces error output
-	// Note: We can't fully test os.Exit behavior in unit tests
-	if len(diags) > 0 {
-		hasErr := false
-		for _, d := range diags {
-			if d.Severity == validate.SeverityError {
-				hasErr = true
-				break
-			}
-		}
-		if !hasErr {
-			t.Log("No errors in diagnostics, test may need adjustment")
-		}
+	if !strings.Contains(output, "Please fix the errors above") {
+		t.Errorf("Expected fix guidance in output, got: %s", output)
 	}
 }
 
@@ -73,51 +181,85 @@ func TestLintFile_NonexistentFile(t *testing.T) {
 }
 
 func TestLintStdin_ValidInput(t *testing.T) {
-	t.Skip("Skipping due to os.Exit behavior - stdin logic tested via output format tests")
+	output, err := captureStdout(t, func() error {
+		return withStdin(t, validLintYAML, func() error {
+			return lintStdin(context.Background(), "text")
+		})
+	})
+
+	if err != nil {
+		t.Errorf("lintStdin returned error for valid input: %v", err)
+	}
+
+	if !strings.Contains(output, "Configuration file '<stdin>' is valid!") {
+		t.Errorf("Expected valid stdin output, got: %s", output)
+	}
 }
 
 func TestLintStdin_InvalidInput(t *testing.T) {
-	t.Skip("Skipping due to os.Exit behavior")
+	output, err := captureStdout(t, func() error {
+		return withStdin(t, invalidLintYAML, func() error {
+			return lintStdin(context.Background(), "text")
+		})
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+
+	if !strings.Contains(output, "Configuration file '<stdin>' has") {
+		t.Errorf("Expected invalid stdin output, got: %s", output)
+	}
+}
+
+func TestLintCommand_InvalidFileReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	invalidFile := writeRunsOnConfig(t, tmpDir, invalidLintYAML)
+
+	output, err := captureStdout(t, func() error {
+		cmd := NewLintCmd()
+		cmd.SetArgs([]string{"--format", "json", invalidFile})
+		return cmd.Execute()
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error from Cobra command execution, got: %v", err)
+	}
+
+	var result struct {
+		Valid       bool `json:"valid"`
+		Diagnostics []struct {
+			Severity string `json:"severity"`
+		} `json:"diagnostics"`
+	}
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("Failed to parse JSON output: %v", err)
+	}
+	if result.Valid {
+		t.Error("Expected valid=false for invalid command execution")
+	}
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("Expected diagnostics for invalid command execution")
+	}
+	if result.Diagnostics[0].Severity != "error" {
+		t.Errorf("Expected first diagnostic severity error, got %s", result.Diagnostics[0].Severity)
+	}
 }
 
 func TestLintAllFiles_NoFiles(t *testing.T) {
-	// Create empty temp directory
 	tmpDir := t.TempDir()
 
-	// Change to temp directory
-	oldWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get working directory: %v", err)
-	}
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("Failed to change working directory: %v", err)
-	}
-	defer func() {
-		if err := os.Chdir(oldWd); err != nil {
-			t.Fatalf("Failed to restore working directory: %v", err)
-		}
-	}()
-
-	// Capture stdout
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	ctx := context.Background()
-	err = lintAllFiles(ctx, "text")
-
-	w.Close()
-	os.Stdout = oldStdout
+	var output string
+	var err error
+	withWorkingDir(t, tmpDir, func() {
+		output, err = captureStdout(t, func() error {
+			return lintAllFiles(context.Background(), "text")
+		})
+	})
 
 	if err != nil {
 		t.Errorf("lintAllFiles returned error when no files found: %v", err)
 	}
-
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-	output := buf.String()
 
 	if !strings.Contains(output, "No runs-on.yml files found") {
 		t.Errorf("Expected 'No runs-on.yml files found' message, got: %s", output)
@@ -125,15 +267,8 @@ func TestLintAllFiles_NoFiles(t *testing.T) {
 }
 
 func TestLintAllFiles_MultipleFiles(t *testing.T) {
-	t.Skip("Skipping due to os.Exit behavior - file finding logic works but validation may trigger exit")
-}
-
-func TestLintAllFiles_MultipleFiles_Original(t *testing.T) {
-	t.Skip("Skipping due to os.Exit behavior")
-	// Create temp directory with multiple files
 	tmpDir := t.TempDir()
 
-	// Create subdirectories with runs-on.yml files
 	subDir1 := filepath.Join(tmpDir, "dir1")
 	subDir2 := filepath.Join(tmpDir, "dir2")
 	if err := os.MkdirAll(subDir1, 0755); err != nil {
@@ -143,69 +278,30 @@ func TestLintAllFiles_MultipleFiles_Original(t *testing.T) {
 		t.Fatalf("Failed to create %s: %v", subDir2, err)
 	}
 
-	validYAML := `
-runners:
-  - name: test-runner
-    cpu: 2
-    ram: 4
-    family: t3.medium
-pools:
-  - name: test-pool
-    schedule: "* * * * *"
-    runners:
-      - test-runner
-`
+	writeRunsOnConfig(t, subDir1, validLintYAML)
+	writeRunsOnConfig(t, subDir2, invalidLintYAML)
 
-	if err := os.WriteFile(filepath.Join(subDir1, "runs-on.yml"), []byte(validYAML), 0644); err != nil {
-		t.Fatalf("Failed to write first config file: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(subDir2, "runs-on.yml"), []byte(validYAML), 0644); err != nil {
-		t.Fatalf("Failed to write second config file: %v", err)
+	var output string
+	var err error
+	withWorkingDir(t, tmpDir, func() {
+		output, err = captureStdout(t, func() error {
+			return lintAllFiles(context.Background(), "text")
+		})
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	// Change to temp directory
-	oldWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get working directory: %v", err)
-	}
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("Failed to change working directory: %v", err)
-	}
-	defer func() {
-		if err := os.Chdir(oldWd); err != nil {
-			t.Fatalf("Failed to restore working directory: %v", err)
-		}
-	}()
-
-	// Capture stdout
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	ctx := context.Background()
-	err = lintAllFiles(ctx, "text")
-
-	w.Close()
-	os.Stdout = oldStdout
-
-	if err != nil {
-		t.Errorf("lintAllFiles returned error: %v", err)
-	}
-
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-	output := buf.String()
-
-	// Should find both files
-	if !strings.Contains(output, "dir1/runs-on.yml") && !strings.Contains(output, "dir2/runs-on.yml") {
+	if !strings.Contains(output, "dir1/runs-on.yml") || !strings.Contains(output, "dir2/runs-on.yml") {
 		t.Errorf("Expected to find both files, got: %s", output)
+	}
+	if !strings.Contains(output, "Detailed errors:") {
+		t.Errorf("Expected detailed errors output, got: %s", output)
 	}
 }
 
 func TestOutputLintResults_TextFormat(t *testing.T) {
-	// Test with warnings only (no errors) to avoid os.Exit
 	diags := []validate.Diagnostic{
 		{
 			Path:     "test.yml",
@@ -241,8 +337,33 @@ func TestOutputLintResults_TextFormat(t *testing.T) {
 	}
 }
 
+func TestOutputLintResults_TextFormatWithErrors(t *testing.T) {
+	diags := []validate.Diagnostic{
+		{
+			Path:     "test.yml",
+			Line:     5,
+			Column:   10,
+			Message:  "Invalid value",
+			Severity: validate.SeverityError,
+		},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return outputLintResults(diags, "test.yml", "text")
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+	if !strings.Contains(output, "Configuration file 'test.yml' has 1 error(s)") {
+		t.Errorf("Expected text error summary, got: %s", output)
+	}
+	if !strings.Contains(output, "error: Invalid value") {
+		t.Errorf("Expected diagnostic message, got: %s", output)
+	}
+}
+
 func TestOutputLintResults_JSONFormat(t *testing.T) {
-	// Test with warnings only to avoid os.Exit - JSON format calls os.Exit for errors
 	diags := []validate.Diagnostic{
 		{
 			Path:     "test.yml",
@@ -301,8 +422,54 @@ func TestOutputLintResults_JSONFormat(t *testing.T) {
 	}
 }
 
+func TestOutputLintResults_JSONFormatWithErrors(t *testing.T) {
+	diags := []validate.Diagnostic{
+		{
+			Path:     "test.yml",
+			Line:     7,
+			Column:   3,
+			Message:  "Invalid value",
+			Severity: validate.SeverityError,
+		},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return outputLintResults(diags, "test.yml", "json")
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+
+	var result struct {
+		Valid       bool `json:"valid"`
+		Diagnostics []struct {
+			Path     string `json:"path"`
+			Line     int    `json:"line"`
+			Column   int    `json:"column"`
+			Message  string `json:"message"`
+			Severity string `json:"severity"`
+		} `json:"diagnostics"`
+	}
+
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Errorf("Failed to parse JSON output: %v", err)
+	}
+	if result.Valid {
+		t.Error("Expected valid=false for error diagnostics")
+	}
+	if len(result.Diagnostics) != 1 {
+		t.Fatalf("Expected 1 diagnostic, got %d", len(result.Diagnostics))
+	}
+	if result.Diagnostics[0].Message != "Invalid value" {
+		t.Errorf("Expected diagnostic message to be preserved, got %s", result.Diagnostics[0].Message)
+	}
+	if result.Diagnostics[0].Severity != "error" {
+		t.Errorf("Expected error severity, got %s", result.Diagnostics[0].Severity)
+	}
+}
+
 func TestOutputLintResults_SARIFFormat(t *testing.T) {
-	// Test with warnings only to avoid os.Exit - SARIF format calls os.Exit for errors
 	diags := []validate.Diagnostic{
 		{
 			Path:     "test.yml",
@@ -378,6 +545,63 @@ func TestOutputLintResults_SARIFFormat(t *testing.T) {
 
 	if result.Runs[0].Results[0].Level != "warning" {
 		t.Errorf("Expected warning level, got %s", result.Runs[0].Results[0].Level)
+	}
+}
+
+func TestOutputLintResults_SARIFFormatWithErrors(t *testing.T) {
+	diags := []validate.Diagnostic{
+		{
+			Path:     "test.yml",
+			Line:     5,
+			Column:   10,
+			Message:  "Invalid value",
+			Severity: validate.SeverityError,
+		},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return outputLintResults(diags, "test.yml", "sarif")
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+
+	var result struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Results []struct {
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+				Locations []struct {
+					PhysicalLocation struct {
+						URI string `json:"uri"`
+					} `json:"physicalLocation"`
+				} `json:"locations"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Errorf("Failed to parse SARIF JSON output: %v", err)
+	}
+	if len(result.Runs) != 1 {
+		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
+	}
+	if len(result.Runs[0].Results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(result.Runs[0].Results))
+	}
+	got := result.Runs[0].Results[0]
+	if got.Level != "error" {
+		t.Errorf("Expected error level, got %s", got.Level)
+	}
+	if got.Message.Text != "Invalid value" {
+		t.Errorf("Expected SARIF message to be preserved, got %s", got.Message.Text)
+	}
+	if len(got.Locations) != 1 || got.Locations[0].PhysicalLocation.URI != "test.yml" {
+		t.Errorf("Expected SARIF location URI to be preserved, got %+v", got.Locations)
 	}
 }
 
@@ -486,7 +710,6 @@ func TestHasErrors(t *testing.T) {
 }
 
 func TestOutputLintAllJSON(t *testing.T) {
-	// Use only warnings to avoid os.Exit
 	results := []fileResult{
 		{
 			Path:  "file1.yml",
@@ -553,8 +776,56 @@ func TestOutputLintAllJSON(t *testing.T) {
 	}
 }
 
+func TestOutputLintAllJSON_InvalidResults(t *testing.T) {
+	results := []fileResult{
+		{
+			Path:  "file1.yml",
+			Valid: false,
+			Diagnostics: []validate.Diagnostic{
+				{Path: "file1.yml", Severity: validate.SeverityError, Message: "error"},
+			},
+		},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return outputLintAllJSON(results)
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+
+	var result struct {
+		Valid bool `json:"valid"`
+		Files []struct {
+			Path        string `json:"path"`
+			Valid       bool   `json:"valid"`
+			Diagnostics []struct {
+				Path     string `json:"path"`
+				Severity string `json:"severity"`
+				Message  string `json:"message"`
+			} `json:"diagnostics"`
+		} `json:"files"`
+	}
+
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Errorf("Failed to parse JSON output: %v", err)
+	}
+	if result.Valid {
+		t.Error("Expected valid=false when a file is invalid")
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("Expected 1 file, got %d", len(result.Files))
+	}
+	if result.Files[0].Valid {
+		t.Error("Expected file1 to be invalid")
+	}
+	if result.Files[0].Diagnostics[0].Message != "error" {
+		t.Errorf("Expected diagnostic message to be preserved, got %s", result.Files[0].Diagnostics[0].Message)
+	}
+}
+
 func TestOutputLintAllSARIF(t *testing.T) {
-	// Use warnings only to avoid os.Exit
 	results := []fileResult{
 		{
 			Path:  "file1.yml",
@@ -615,6 +886,59 @@ func TestOutputLintAllSARIF(t *testing.T) {
 
 	if result.Runs[0].Results[0].Level != "warning" {
 		t.Errorf("Expected warning level, got %s", result.Runs[0].Results[0].Level)
+	}
+}
+
+func TestOutputLintAllSARIF_InvalidResults(t *testing.T) {
+	results := []fileResult{
+		{
+			Path:  "file1.yml",
+			Valid: false,
+			Diagnostics: []validate.Diagnostic{
+				{
+					Path:     "file1.yml",
+					Line:     5,
+					Column:   10,
+					Message:  "Error message",
+					Severity: validate.SeverityError,
+				},
+			},
+		},
+	}
+
+	output, err := captureStdout(t, func() error {
+		return outputLintAllSARIF(results)
+	})
+
+	if !errors.Is(err, errLintInvalid) {
+		t.Fatalf("Expected lint invalid error, got: %v", err)
+	}
+
+	var result struct {
+		Runs []struct {
+			Results []struct {
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Errorf("Failed to parse SARIF JSON output: %v", err)
+	}
+	if len(result.Runs) != 1 {
+		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
+	}
+	if len(result.Runs[0].Results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(result.Runs[0].Results))
+	}
+	if result.Runs[0].Results[0].Level != "error" {
+		t.Errorf("Expected error level, got %s", result.Runs[0].Results[0].Level)
+	}
+	if result.Runs[0].Results[0].Message.Text != "file1.yml: Error message" {
+		t.Errorf("Expected SARIF message to be preserved, got %s", result.Runs[0].Results[0].Message.Text)
 	}
 }
 

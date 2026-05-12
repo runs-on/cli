@@ -19,7 +19,7 @@ func (m *mockWorkflowJobsClient) GetItem(ctx context.Context, params *dynamodb.G
 	return m.getItem(ctx, params, optFns...)
 }
 
-func marshalWorkflowJobItem(t *testing.T, record workflowJobLookupRecord) map[string]dynamodbtypes.AttributeValue {
+func marshalWorkflowJobItem(t *testing.T, record workflowJobFactsRecord) map[string]dynamodbtypes.AttributeValue {
 	t.Helper()
 
 	item, err := attributevalue.MarshalMap(record)
@@ -29,11 +29,11 @@ func marshalWorkflowJobItem(t *testing.T, record workflowJobLookupRecord) map[st
 	return item
 }
 
-func TestFindJobLookupReturnsRunAndInstance(t *testing.T) {
+func TestFindWorkflowJobFactsReturnsRunAndInstance(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{
-				Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 					RunID:           1234,
 					Status:          "queued",
 					SchedulingState: "active",
@@ -47,23 +47,23 @@ func TestFindJobLookupReturnsRunAndInstance(t *testing.T) {
 		},
 	}
 
-	lookup, err := findJobLookup(context.Background(), client, "runs-on-workflow-jobs", "42")
+	facts, err := findWorkflowJobFacts(context.Background(), client, "runs-on-workflow-jobs", "42")
 	if err != nil {
-		t.Fatalf("findJobLookup returned error: %v", err)
+		t.Fatalf("findWorkflowJobFacts returned error: %v", err)
 	}
-	if lookup.RunID != 1234 {
-		t.Fatalf("expected run ID 1234, got %d", lookup.RunID)
+	if facts.RunID != 1234 {
+		t.Fatalf("expected run ID 1234, got %d", facts.RunID)
 	}
-	if lookup.InstanceID != "i-123" {
-		t.Fatalf("expected instance ID i-123, got %q", lookup.InstanceID)
+	if facts.CurrentInstanceID != "i-123" {
+		t.Fatalf("expected instance ID i-123, got %q", facts.CurrentInstanceID)
 	}
 }
 
-func TestFindJobLookupFallsBackToRunnerNameInstanceID(t *testing.T) {
+func TestFindWorkflowJobFactsFallsBackToRunnerNameInstanceID(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{
-				Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 					RunID:      1234,
 					RunnerName: "org--i-123--job",
 					Status:     "completed",
@@ -72,20 +72,20 @@ func TestFindJobLookupFallsBackToRunnerNameInstanceID(t *testing.T) {
 		},
 	}
 
-	lookup, err := findJobLookup(context.Background(), client, "runs-on-workflow-jobs", "42")
+	facts, err := findWorkflowJobFacts(context.Background(), client, "runs-on-workflow-jobs", "42")
 	if err != nil {
-		t.Fatalf("findJobLookup returned error: %v", err)
+		t.Fatalf("findWorkflowJobFacts returned error: %v", err)
 	}
-	if lookup.InstanceID != "i-123" {
-		t.Fatalf("expected runner-name instance ID i-123, got %q", lookup.InstanceID)
+	if facts.CurrentInstanceID != "i-123" {
+		t.Fatalf("expected runner-name instance ID i-123, got %q", facts.CurrentInstanceID)
 	}
 }
 
-func TestFindJobLookupFallsBackToAttemptHistoryInstanceID(t *testing.T) {
+func TestFindWorkflowJobFactsFallsBackToAttemptHistoryInstanceID(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{
-				Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 					RunID:  1234,
 					Status: "completed",
 					AttemptHistory: []struct {
@@ -99,39 +99,101 @@ func TestFindJobLookupFallsBackToAttemptHistoryInstanceID(t *testing.T) {
 		},
 	}
 
-	lookup, err := findJobLookup(context.Background(), client, "runs-on-workflow-jobs", "42")
+	facts, err := findWorkflowJobFacts(context.Background(), client, "runs-on-workflow-jobs", "42")
 	if err != nil {
-		t.Fatalf("findJobLookup returned error: %v", err)
+		t.Fatalf("findWorkflowJobFacts returned error: %v", err)
 	}
-	if lookup.InstanceID != "i-123" {
-		t.Fatalf("expected attempt-history instance ID i-123, got %q", lookup.InstanceID)
+	if facts.CurrentInstanceID != "i-123" {
+		t.Fatalf("expected attempt-history instance ID i-123, got %q", facts.CurrentInstanceID)
 	}
 }
 
-func TestFindJobLookupMissingRow(t *testing.T) {
+func TestFindWorkflowJobFactsDerivesAttemptedInstancesAndCreatedAt(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 30, 0, 0, time.UTC)
+	client := &mockWorkflowJobsClient{
+		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+			return &dynamodb.GetItemOutput{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
+					JobID:         42,
+					RunID:         1234,
+					CreatedAt:     &createdAt,
+					CreatedAtUnix: createdAt.Add(-time.Hour).Unix(),
+					RunnerName:    "runs-on--i-runner--job",
+					ActiveAttempt: &struct {
+						InstanceID string `dynamodbav:"instance_id"`
+					}{InstanceID: "i-active"},
+					AttemptHistory: []struct {
+						InstanceID string `dynamodbav:"instance_id"`
+					}{
+						{InstanceID: "i-old"},
+						{InstanceID: "i-active"},
+					},
+				}),
+			}, nil
+		},
+	}
+
+	facts, err := findWorkflowJobFacts(context.Background(), client, "runs-on-workflow-jobs", "https://github.com/runs-on/server/actions/runs/100/job/42?pr=1")
+	if err != nil {
+		t.Fatalf("findWorkflowJobFacts returned error: %v", err)
+	}
+	if got := strings.Join(facts.AttemptedInstanceIDs, ","); got != "i-active,i-old,i-runner" {
+		t.Fatalf("expected attempted instance IDs to be deduplicated, got %q", got)
+	}
+	if !facts.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected created_at %s, got %s", createdAt, facts.CreatedAt)
+	}
+	if facts.CreatedAtSource != "created_at" {
+		t.Fatalf("expected created_at source, got %q", facts.CreatedAtSource)
+	}
+	if _, err := facts.rawDynamoDBItemJSON(); err != nil {
+		t.Fatalf("rawDynamoDBItemJSON returned error: %v", err)
+	}
+}
+
+func TestWorkflowJobFactsCreatedAtFallsBackToUnix(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 30, 0, 0, time.UTC)
+	facts := workflowJobFactsFromRecord(workflowJobFactsRecord{
+		JobID:         43,
+		CreatedAtUnix: createdAt.Unix(),
+	}, nil)
+
+	got, err := facts.createdAtOrError()
+	if err != nil {
+		t.Fatalf("createdAtOrError returned error: %v", err)
+	}
+	if !got.Equal(createdAt) {
+		t.Fatalf("expected created_at_unix %s, got %s", createdAt, got)
+	}
+	if facts.CreatedAtSource != "created_at_unix" {
+		t.Fatalf("expected created_at_unix source, got %q", facts.CreatedAtSource)
+	}
+}
+
+func TestFindWorkflowJobFactsMissingRow(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{}, nil
 		},
 	}
 
-	lookup, err := findJobLookup(context.Background(), client, "runs-on-workflow-jobs", "42")
+	facts, err := findWorkflowJobFacts(context.Background(), client, "runs-on-workflow-jobs", "42")
 	if err != nil {
-		t.Fatalf("findJobLookup returned error: %v", err)
+		t.Fatalf("findWorkflowJobFacts returned error: %v", err)
 	}
-	if lookup != nil {
-		t.Fatalf("expected missing row to return nil lookup, got %+v", lookup)
+	if facts != nil {
+		t.Fatalf("expected missing row to return nil facts, got %+v", facts)
 	}
 }
 
-func TestWaitForJobLookupWaitsForInstanceID(t *testing.T) {
+func TestWaitForWorkflowJobFactsWaitsForInstanceID(t *testing.T) {
 	var calls int
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			calls++
 			if calls == 1 {
 				return &dynamodb.GetItemOutput{
-					Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+					Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 						RunID:           1234,
 						Status:          "queued",
 						SchedulingState: "launching",
@@ -139,7 +201,7 @@ func TestWaitForJobLookupWaitsForInstanceID(t *testing.T) {
 				}, nil
 			}
 			return &dynamodb.GetItemOutput{
-				Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 					RunID:           1234,
 					Status:          "queued",
 					SchedulingState: "active",
@@ -153,23 +215,23 @@ func TestWaitForJobLookupWaitsForInstanceID(t *testing.T) {
 		},
 	}
 
-	lookup, err := waitForJobLookupWithInterval(context.Background(), client, "runs-on-workflow-jobs", "42", true, nil, 5*time.Millisecond)
+	facts, err := waitForWorkflowJobFactsWithInterval(context.Background(), client, "runs-on-workflow-jobs", "42", true, nil, 5*time.Millisecond)
 	if err != nil {
-		t.Fatalf("waitForJobLookupWithInterval returned error: %v", err)
+		t.Fatalf("waitForWorkflowJobFactsWithInterval returned error: %v", err)
 	}
-	if lookup.InstanceID != "i-123" {
-		t.Fatalf("expected instance ID i-123, got %q", lookup.InstanceID)
+	if facts.CurrentInstanceID != "i-123" {
+		t.Fatalf("expected instance ID i-123, got %q", facts.CurrentInstanceID)
 	}
 	if calls < 2 {
 		t.Fatalf("expected at least 2 GetItem calls, got %d", calls)
 	}
 }
 
-func TestWaitForJobLookupNoWatchReturnsPendingState(t *testing.T) {
+func TestWaitForWorkflowJobFactsNoWatchReturnsPendingState(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{
-				Item: marshalWorkflowJobItem(t, workflowJobLookupRecord{
+				Item: marshalWorkflowJobItem(t, workflowJobFactsRecord{
 					RunID:           1234,
 					Status:          "queued",
 					SchedulingState: "launching",
@@ -178,16 +240,16 @@ func TestWaitForJobLookupNoWatchReturnsPendingState(t *testing.T) {
 		},
 	}
 
-	_, err := waitForJobLookupWithInterval(context.Background(), client, "runs-on-workflow-jobs", "42", false, nil, time.Millisecond)
+	_, err := waitForWorkflowJobFactsWithInterval(context.Background(), client, "runs-on-workflow-jobs", "42", false, nil, time.Millisecond)
 	if err == nil {
-		t.Fatal("expected waitForJobLookupWithInterval to return an error")
+		t.Fatal("expected waitForWorkflowJobFactsWithInterval to return an error")
 	}
 	if !strings.Contains(err.Error(), "status=queued") || !strings.Contains(err.Error(), "scheduling_state=launching") {
 		t.Fatalf("expected status and scheduling state in error, got %v", err)
 	}
 }
 
-func TestWaitForJobLookupHonorsContext(t *testing.T) {
+func TestWaitForWorkflowJobFactsHonorsContext(t *testing.T) {
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{}, nil
@@ -197,7 +259,7 @@ func TestWaitForJobLookupHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	_, err := waitForJobLookupWithInterval(ctx, client, "runs-on-workflow-jobs", "42", true, nil, 50*time.Millisecond)
+	_, err := waitForWorkflowJobFactsWithInterval(ctx, client, "runs-on-workflow-jobs", "42", true, nil, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected context deadline error")
 	}

@@ -44,11 +44,11 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 
 			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
 			ssmClient := ssm.NewFromConfig(config.AWSConfig)
-			jobLookup, err := waitForJobLookup(ctx, jobsClient, config.WorkflowJobsTable, jobID, watch, logger)
+			facts, err := waitForWorkflowJobFacts(ctx, jobsClient, config.WorkflowJobsTable, jobID, watch, logger)
 			if err != nil {
 				return err
 			}
-			instanceID := jobLookup.InstanceID
+			instanceID := facts.CurrentInstanceID
 
 			// Check if instance is running and get platform type
 			describeInput := &ssm.DescribeInstanceInformationInput{
