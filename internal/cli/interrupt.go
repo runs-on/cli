@@ -81,14 +81,14 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 
 			ec2Client := ec2.NewFromConfig(config.AWSConfig)
 			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
-			jobLookup, err := waitForJobLookup(ctx, jobsClient, config.WorkflowJobsTable, jobID, wait, logger)
+			facts, err := waitForWorkflowJobFacts(ctx, jobsClient, config.WorkflowJobsTable, jobID, wait, logger)
 			if err != nil {
 				if !wait {
 					return fmt.Errorf("%w. Use -w to wait for instance", err)
 				}
 				return err
 			}
-			instanceID := jobLookup.InstanceID
+			instanceID := facts.CurrentInstanceID
 
 			fmt.Printf("Found instance %s for job %s\n", instanceID, jobID)
 

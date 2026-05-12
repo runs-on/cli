@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.6
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.20.37
+	github.com/aws/aws-sdk-go-v2/service/cloudtrail v1.55.10
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.62.2
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.57.1
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.289.1
