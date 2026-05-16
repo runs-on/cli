@@ -2,7 +2,7 @@
 
 RunsOn CLI (`roc`) is a command line tool to manage and troubleshoot your [RunsOn](https://runs-on.com) installation.
 
-Note: the CLI only works with RunsOn >= v2.6.3, and each stack must use the matching CLI version. For example, a stack running RunsOn v2.12.5 must be managed with roc v2.12.5.
+Note: the CLI only works with RunsOn >= v2.6.3.
 
 ## Table of Contents
 
@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.7/roc_v3.0.7_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.7/roc_2.12.7_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.7/roc_v3.0.7_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v2.12.7/roc_2.12.7_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -78,21 +78,20 @@ jobs:
 
 ## Resource Discovery
 
-The CLI loads stack metadata from the standard stack config secret at
-`/runs-on/<stack>/stack-config`.
+The CLI discovers RunsOn resources using the AWS Resource Groups Tagging API (RGTA):
 
-That secret provides the stable identifiers needed by the core troubleshooting
-commands:
+1. **Primary**: `runs-on-stack-name` tag (all new CF/TF deployments)
+2. **Fallback**: Dynamic discovery via AppRunner service tags (older stacks)
 
-- `WorkflowJobsTable`
-- `IngressURL`
-- `ServiceLogGroupName`
-- `Ec2InstanceLogGroupArn`
+Resources are identified by their `runs-on-resource` tag (Terraform) or ARN pattern matching (CloudFormation fallback):
 
-`roc stack doctor` also performs one narrow AWS Resource Groups Tagging API
-lookup for the tagged ECS service (`runs-on-stack-name=<stack>`) so it can
-check live service health. The CLI no longer relies on the older broad
-AppRunner-era discovery fallback.
+| Resource | Tag Value | CF Fallback |
+|----------|-----------|-------------|
+| AppRunner Service | `apprunner-service` | ARN pattern |
+| Config S3 Bucket | `config-bucket` | `runs-on/purpose=config` tag or name contains `-config` |
+| EC2 Log Group | `ec2-log-group` | Name contains `{stack}/ec2/instances` |
+
+Tags are automatically applied when deploying RunsOn via Terraform/OpenTofu or CloudFormation.
 
 ## Core Commands
 
@@ -123,7 +122,7 @@ AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions
 
 ### `roc logs`
 
-Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional streamed log types, or `--full` to export a complete diagnostic archive.
+Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional log types.
 
 ```
 Usage:
@@ -132,10 +131,10 @@ Usage:
 Flags:
   -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
-      --full                  Export full diagnostic archive for the job
   -h, --help                  help for logs
       --include strings       Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)
-      --no-color              Disable color output for streamed logs
+      --no-color              Disable color output
+  -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
@@ -156,14 +155,7 @@ AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=console
 
 # Fetch both run logs and console logs
 AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=run,console --watch
-
-# Export a diagnostic archive for a job
-AWS_PROFILE=runs-on-admin roc logs 34661958899 --full
 ```
-
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the raw DynamoDB workflow-job item, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the DynamoDB job creation timestamp, from one hour before creation through one hour after creation.
-
-`--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
 ### `roc interrupt`
 
@@ -289,7 +281,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.0.7  # Use the latest release tag
+    rev: v2.12.7  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
@@ -309,7 +301,7 @@ Now `roc lint` will automatically run on staged `runs-on.yml` files before each 
 Diagnose RunsOn stack health and export troubleshooting information.
 
 This command performs comprehensive health checks on your RunsOn stack:
-- Checks ECS service health
+- Checks AppRunner service health
 - Tests endpoint accessibility
 - Validates service configuration
 - Fetches application logs
@@ -337,10 +329,11 @@ AWS_PROFILE=runs-on-admin roc stack doctor --since 2h
 Output:
 
 ```
-Checking service (https://us-east-1.console.aws.amazon.com/ecs/v2/clusters/runs-on-preview-v3/services/flexd/configuration/overview)... ✅ (status: RUNNING (1/1 tasks))
-Checking service endpoint (https://example.execute-api.us-east-1.amazonaws.com/prod)... ✅
+Checking AppRunner service (https://console.aws.amazon.com/apprunner/home?region=us-east-1#/services/RunsOnService-4rHCauYu4m23)... ✅ (status: RUNNING)
+Checking AppRunner service endpoint (https://wxrwksit5a.us-east-1.awsapprunner.com)... ✅
 Checking for 'Congrats' response... ✅
-Fetching application logs (since 24h0m0s)... ✅ (5419 lines)
+Fetching AppRunner application logs (since 24h0m0s)... ✅ (5419 lines)
+Fetching AppRunner service logs (since 14 days)... ✅ (13 lines)
 
 Full results exported to: /Users/crohr/dev/runs-on/cli/roc-doctor-2025-06-20-12-40-29.zip
 ```
@@ -359,7 +352,7 @@ Flags:
   -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
   -h, --help                  help for logs
-      --no-color              Disable color output for streamed logs
+      --no-color              Disable color output
   -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 

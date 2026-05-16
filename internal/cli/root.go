@@ -8,15 +8,15 @@ import (
 )
 
 type RunsOnConfig struct {
-	StackName              string
-	IngressURL             string
-	ServiceLogGroupName    string
-	EC2InstanceLogGroupArn string
-	WorkflowJobsTable      string
-	AWSConfig              aws.Config
+	StackName           string
+	AppRunnerServiceArn string
+	EC2LogGroupArn      string
+	BucketConfig        string
+	AWSConfig           aws.Config
 }
 
 func NewRootCmd(stack *Stack) *cobra.Command {
+	var noColor bool
 	cmd := &cobra.Command{
 		Use:   "roc",
 		Short: "RunsOn CLI",
@@ -39,6 +39,7 @@ func NewRootCmd(stack *Stack) *cobra.Command {
 	}
 
 	cmd.PersistentFlags().String("stack", defaultStack, "CloudFormation stack name")
+	cmd.PersistentFlags().BoolVar(&noColor, "no-color", false, "Disable color output")
 
 	cmd.AddCommand(
 		NewLogsCmd(stack),
