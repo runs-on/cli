@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,22 +41,17 @@ The validator supports YAML anchors and will automatically expand them during va
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 
-			var err error
 			if stdin {
-				err = lintStdin(ctx, format)
-			} else if len(args) > 0 {
-				// Validate single file
-				err = lintFile(ctx, args[0], format)
-			} else {
-				// Find and validate all runs-on.yml files
-				err = lintAllFiles(ctx, format)
+				return lintStdin(ctx, format)
 			}
 
-			if errors.Is(err, errLintInvalid) {
-				cmd.SilenceUsage = true
-				cmd.SilenceErrors = true
+			if len(args) > 0 {
+				// Validate single file
+				return lintFile(ctx, args[0], format)
 			}
-			return err
+
+			// Find and validate all runs-on.yml files
+			return lintAllFiles(ctx, format)
 		},
 	}
 
@@ -85,8 +79,6 @@ The validator supports YAML anchors and will automatically expand them during va
 
 	return cmd
 }
-
-var errLintInvalid = errors.New("lint found configuration errors")
 
 func lintStdin(ctx context.Context, format string) error {
 	diags, err := validate.ValidateReader(ctx, os.Stdin, "<stdin>")
@@ -167,160 +159,6 @@ type fileResult struct {
 	Diagnostics []validate.Diagnostic
 }
 
-type lintJSONDiagnostic struct {
-	Path     string `json:"path"`
-	Line     int    `json:"line,omitempty"`
-	Column   int    `json:"column,omitempty"`
-	Message  string `json:"message"`
-	Severity string `json:"severity"`
-}
-
-type lintJSONFileResult struct {
-	Path        string               `json:"path"`
-	Valid       bool                 `json:"valid"`
-	Diagnostics []lintJSONDiagnostic `json:"diagnostics"`
-}
-
-type lintSingleJSONOutput struct {
-	Valid       bool                 `json:"valid"`
-	Diagnostics []lintJSONDiagnostic `json:"diagnostics"`
-}
-
-type lintAllJSONOutput struct {
-	Valid bool                 `json:"valid"`
-	Files []lintJSONFileResult `json:"files"`
-}
-
-type sarifRegion struct {
-	StartLine   int `json:"startLine,omitempty"`
-	StartColumn int `json:"startColumn,omitempty"`
-}
-
-type sarifLocation struct {
-	URI    string      `json:"uri"`
-	Region sarifRegion `json:"region"`
-}
-
-type sarifPhysicalLocation struct {
-	PhysicalLocation sarifLocation `json:"physicalLocation"`
-}
-
-type sarifMessage struct {
-	Text string `json:"text"`
-}
-
-type sarifResult struct {
-	RuleID    string                  `json:"ruleId"`
-	Level     string                  `json:"level"`
-	Message   sarifMessage            `json:"message"`
-	Locations []sarifPhysicalLocation `json:"locations"`
-}
-
-type sarifDriver struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-}
-
-type sarifTool struct {
-	Driver sarifDriver `json:"driver"`
-}
-
-type sarifRun struct {
-	Tool    sarifTool     `json:"tool"`
-	Results []sarifResult `json:"results"`
-}
-
-type sarifOutput struct {
-	Version string     `json:"version"`
-	Runs    []sarifRun `json:"runs"`
-}
-
-func lintResultsValid(results []fileResult) bool {
-	for _, result := range results {
-		if !result.Valid {
-			return false
-		}
-	}
-	return true
-}
-
-func lintJSONDiagnostics(diags []validate.Diagnostic) []lintJSONDiagnostic {
-	jsonDiags := make([]lintJSONDiagnostic, len(diags))
-	for i, diag := range diags {
-		jsonDiags[i] = lintJSONDiagnostic{
-			Path:     diag.Path,
-			Line:     diag.Line,
-			Column:   diag.Column,
-			Message:  diag.Message,
-			Severity: string(diag.Severity),
-		}
-	}
-	return jsonDiags
-}
-
-func sarifLevel(severity validate.Severity) string {
-	if severity == validate.SeverityWarning {
-		return "warning"
-	}
-	return "error"
-}
-
-func lintSARIFResult(diag validate.Diagnostic, uri string, message string) sarifResult {
-	location := sarifLocation{URI: uri}
-	if diag.Line > 0 {
-		location.Region.StartLine = diag.Line
-		location.Region.StartColumn = diag.Column
-	}
-	return sarifResult{
-		RuleID:  "config-validation",
-		Level:   sarifLevel(diag.Severity),
-		Message: sarifMessage{Text: message},
-		Locations: []sarifPhysicalLocation{
-			{PhysicalLocation: location},
-		},
-	}
-}
-
-func lintSARIFOutput(results []sarifResult) sarifOutput {
-	return sarifOutput{
-		Version: "2.1.0",
-		Runs: []sarifRun{
-			{
-				Tool: sarifTool{
-					Driver: sarifDriver{
-						Name:    "roc",
-						Version: version.String(),
-					},
-				},
-				Results: results,
-			},
-		},
-	}
-}
-
-func writeIndentedJSON(value any, formatName string) error {
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(value); err != nil {
-		return fmt.Errorf("failed to encode %s: %w", formatName, err)
-	}
-	return nil
-}
-
-func splitDiagnostics(diags []validate.Diagnostic) ([]validate.Diagnostic, []validate.Diagnostic) {
-	var errors []validate.Diagnostic
-	var warnings []validate.Diagnostic
-	for _, diag := range diags {
-		switch diag.Severity {
-		case validate.SeverityError:
-			errors = append(errors, diag)
-		case validate.SeverityWarning:
-			warnings = append(warnings, diag)
-		}
-	}
-	return errors, warnings
-}
-
 func outputLintAllText(results []fileResult) error {
 	allValid := true
 	for _, result := range results {
@@ -335,7 +173,15 @@ func outputLintAllText(results []fileResult) error {
 		for _, result := range results {
 			if !result.Valid {
 				fmt.Printf("\n%s:\n", result.Path)
-				errors, warnings := splitDiagnostics(result.Diagnostics)
+				var errors []validate.Diagnostic
+				var warnings []validate.Diagnostic
+				for _, diag := range result.Diagnostics {
+					if diag.Severity == validate.SeverityError {
+						errors = append(errors, diag)
+					} else if diag.Severity == validate.SeverityWarning {
+						warnings = append(warnings, diag)
+					}
+				}
 				for i, diag := range errors {
 					fmt.Printf("  %d. ", i+1)
 					if diag.Line > 0 {
@@ -368,7 +214,8 @@ func outputLintAllText(results []fileResult) error {
 				}
 			}
 		}
-		return errLintInvalid
+		os.Exit(1)
+		return nil
 	}
 
 	// All files are valid, but check for warnings
@@ -426,46 +273,174 @@ func isValidDiagnostics(diags []validate.Diagnostic) bool {
 }
 
 func outputLintAllJSON(results []fileResult) error {
-	allValid := lintResultsValid(results)
-	jsonResults := make([]lintJSONFileResult, len(results))
+	type jsonDiagnostic struct {
+		Path     string `json:"path"`
+		Line     int    `json:"line,omitempty"`
+		Column   int    `json:"column,omitempty"`
+		Message  string `json:"message"`
+		Severity string `json:"severity"`
+	}
+
+	type jsonFileResult struct {
+		Path        string           `json:"path"`
+		Valid       bool             `json:"valid"`
+		Diagnostics []jsonDiagnostic `json:"diagnostics"`
+	}
+
+	type jsonOutput struct {
+		Valid bool             `json:"valid"`
+		Files []jsonFileResult `json:"files"`
+	}
+
+	allValid := true
+	jsonResults := make([]jsonFileResult, len(results))
 	for i, result := range results {
-		jsonResults[i] = lintJSONFileResult{
+		if !result.Valid {
+			allValid = false
+		}
+
+		diags := make([]jsonDiagnostic, len(result.Diagnostics))
+		for j, diag := range result.Diagnostics {
+			diags[j] = jsonDiagnostic{
+				Path:     diag.Path,
+				Line:     diag.Line,
+				Column:   diag.Column,
+				Message:  diag.Message,
+				Severity: string(diag.Severity),
+			}
+		}
+
+		jsonResults[i] = jsonFileResult{
 			Path:        result.Path,
 			Valid:       result.Valid,
-			Diagnostics: lintJSONDiagnostics(result.Diagnostics),
+			Diagnostics: diags,
 		}
 	}
 
-	output := lintAllJSONOutput{
+	output := jsonOutput{
 		Valid: allValid,
 		Files: jsonResults,
 	}
 
-	if err := writeIndentedJSON(output, "JSON"); err != nil {
-		return err
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		return fmt.Errorf("failed to encode JSON: %w", err)
 	}
 
 	if !allValid {
-		return errLintInvalid
+		os.Exit(1)
 	}
 
 	return nil
 }
 
 func outputLintAllSARIF(results []fileResult) error {
+	type sarifLocation struct {
+		URI    string `json:"uri"`
+		Region struct {
+			StartLine   int `json:"startLine,omitempty"`
+			StartColumn int `json:"startColumn,omitempty"`
+		} `json:"region,omitempty"`
+	}
+
+	type sarifResult struct {
+		RuleID  string `json:"ruleId"`
+		Level   string `json:"level"`
+		Message struct {
+			Text string `json:"text"`
+		} `json:"message"`
+		Locations []struct {
+			PhysicalLocation sarifLocation `json:"physicalLocation"`
+		} `json:"locations"`
+	}
+
+	type sarifRun struct {
+		Tool struct {
+			Driver struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"driver"`
+		} `json:"tool"`
+		Results []sarifResult `json:"results"`
+	}
+
+	type sarifOutput struct {
+		Version string     `json:"version"`
+		Runs    []sarifRun `json:"runs"`
+	}
+
 	var allResults []sarifResult
 	for _, result := range results {
 		for _, diag := range result.Diagnostics {
-			allResults = append(allResults, lintSARIFResult(diag, result.Path, fmt.Sprintf("%s: %s", result.Path, diag.Message)))
+			level := "error"
+			if diag.Severity == validate.SeverityWarning {
+				level = "warning"
+			}
+
+			sarifDiag := sarifResult{
+				RuleID: "config-validation",
+				Level:  level,
+			}
+			sarifDiag.Message.Text = fmt.Sprintf("%s: %s", result.Path, diag.Message)
+
+			loc := sarifLocation{
+				URI: result.Path,
+			}
+			if diag.Line > 0 {
+				loc.Region.StartLine = diag.Line
+				loc.Region.StartColumn = diag.Column
+			}
+
+			sarifDiag.Locations = []struct {
+				PhysicalLocation sarifLocation `json:"physicalLocation"`
+			}{
+				{PhysicalLocation: loc},
+			}
+
+			allResults = append(allResults, sarifDiag)
 		}
 	}
 
-	if err := writeIndentedJSON(lintSARIFOutput(allResults), "SARIF"); err != nil {
-		return err
+	output := sarifOutput{
+		Version: "2.1.0",
+		Runs: []sarifRun{
+			{
+				Tool: struct {
+					Driver struct {
+						Name    string `json:"name"`
+						Version string `json:"version"`
+					} `json:"driver"`
+				}{
+					Driver: struct {
+						Name    string `json:"name"`
+						Version string `json:"version"`
+					}{
+						Name:    "roc",
+						Version: version.String(),
+					},
+				},
+				Results: allResults,
+			},
+		},
 	}
 
-	if !lintResultsValid(results) {
-		return errLintInvalid
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		return fmt.Errorf("failed to encode SARIF: %w", err)
+	}
+
+	allValid := true
+	for _, result := range results {
+		if !result.Valid {
+			allValid = false
+			break
+		}
+	}
+
+	if !allValid {
+		os.Exit(1)
 	}
 
 	return nil
@@ -486,7 +461,15 @@ func outputLintResults(diags []validate.Diagnostic, sourceName string, format st
 
 func outputLintText(diags []validate.Diagnostic, sourceName string) error {
 	// Separate errors and warnings
-	errors, warnings := splitDiagnostics(diags)
+	var errors []validate.Diagnostic
+	var warnings []validate.Diagnostic
+	for _, diag := range diags {
+		if diag.Severity == validate.SeverityError {
+			errors = append(errors, diag)
+		} else if diag.Severity == validate.SeverityWarning {
+			warnings = append(warnings, diag)
+		}
+	}
 
 	if len(errors) == 0 && len(warnings) == 0 {
 		fmt.Printf("✅ Configuration file '%s' is valid!\n", sourceName)
@@ -517,7 +500,8 @@ func outputLintText(diags []validate.Diagnostic, sourceName string) error {
 			}
 		}
 		fmt.Printf("\nPlease fix the errors above and run the validation again.\n")
-		return errLintInvalid
+		os.Exit(1)
+		return nil
 	}
 
 	// Only warnings, no errors
@@ -533,34 +517,143 @@ func outputLintText(diags []validate.Diagnostic, sourceName string) error {
 }
 
 func outputLintJSON(diags []validate.Diagnostic) error {
-	output := lintSingleJSONOutput{
-		Valid:       isValidDiagnostics(diags),
-		Diagnostics: lintJSONDiagnostics(diags),
+	type jsonDiagnostic struct {
+		Path     string `json:"path"`
+		Line     int    `json:"line,omitempty"`
+		Column   int    `json:"column,omitempty"`
+		Message  string `json:"message"`
+		Severity string `json:"severity"`
 	}
 
-	if err := writeIndentedJSON(output, "JSON"); err != nil {
-		return err
+	type jsonOutput struct {
+		Valid       bool             `json:"valid"`
+		Diagnostics []jsonDiagnostic `json:"diagnostics"`
+	}
+
+	output := jsonOutput{
+		Valid:       isValidDiagnostics(diags),
+		Diagnostics: make([]jsonDiagnostic, len(diags)),
+	}
+
+	for i, diag := range diags {
+		output.Diagnostics[i] = jsonDiagnostic{
+			Path:     diag.Path,
+			Line:     diag.Line,
+			Column:   diag.Column,
+			Message:  diag.Message,
+			Severity: string(diag.Severity),
+		}
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		return fmt.Errorf("failed to encode JSON: %w", err)
 	}
 
 	if !output.Valid {
-		return errLintInvalid
+		os.Exit(1)
 	}
 
 	return nil
 }
 
 func outputLintSARIF(diags []validate.Diagnostic) error {
-	results := make([]sarifResult, len(diags))
-	for i, diag := range diags {
-		results[i] = lintSARIFResult(diag, diag.Path, diag.Message)
+	type sarifLocation struct {
+		URI    string `json:"uri"`
+		Region struct {
+			StartLine   int `json:"startLine,omitempty"`
+			StartColumn int `json:"startColumn,omitempty"`
+		} `json:"region,omitempty"`
 	}
 
-	if err := writeIndentedJSON(lintSARIFOutput(results), "SARIF"); err != nil {
-		return err
+	type sarifResult struct {
+		RuleID  string `json:"ruleId"`
+		Level   string `json:"level"`
+		Message struct {
+			Text string `json:"text"`
+		} `json:"message"`
+		Locations []struct {
+			PhysicalLocation sarifLocation `json:"physicalLocation"`
+		} `json:"locations"`
+	}
+
+	type sarifRun struct {
+		Tool struct {
+			Driver struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"driver"`
+		} `json:"tool"`
+		Results []sarifResult `json:"results"`
+	}
+
+	type sarifOutput struct {
+		Version string     `json:"version"`
+		Runs    []sarifRun `json:"runs"`
+	}
+
+	results := make([]sarifResult, len(diags))
+	for i, diag := range diags {
+		level := "error"
+		if diag.Severity == validate.SeverityWarning {
+			level = "warning"
+		}
+
+		result := sarifResult{
+			RuleID: "config-validation",
+			Level:  level,
+		}
+		result.Message.Text = diag.Message
+
+		loc := sarifLocation{
+			URI: diag.Path,
+		}
+		if diag.Line > 0 {
+			loc.Region.StartLine = diag.Line
+			loc.Region.StartColumn = diag.Column
+		}
+
+		result.Locations = []struct {
+			PhysicalLocation sarifLocation `json:"physicalLocation"`
+		}{
+			{PhysicalLocation: loc},
+		}
+
+		results[i] = result
+	}
+
+	output := sarifOutput{
+		Version: "2.1.0",
+		Runs: []sarifRun{
+			{
+				Tool: struct {
+					Driver struct {
+						Name    string `json:"name"`
+						Version string `json:"version"`
+					} `json:"driver"`
+				}{
+					Driver: struct {
+						Name    string `json:"name"`
+						Version string `json:"version"`
+					}{
+						Name:    "roc",
+						Version: version.String(),
+					},
+				},
+				Results: results,
+			},
+		},
+	}
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		return fmt.Errorf("failed to encode SARIF: %w", err)
 	}
 
 	if !isValidDiagnostics(diags) {
-		return errLintInvalid
+		os.Exit(1)
 	}
 
 	return nil

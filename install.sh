@@ -106,28 +106,41 @@ if [ "$VERSION" = "latest" ]; then
     echo "GitHub API response: $(summarize_response "$RELEASE_BODY")"
     exit 1
   fi
-
+  
   echo "Latest version: $VERSION"
+fi
+
+# Normalize version pieces used by the release tag and asset names.
+VERSION_NO_V="${VERSION#v}"
+VERSION_MAJOR="${VERSION_NO_V%%.*}"
+BINARY_VERSION="${VERSION_NO_V}"
+RELEASE_TAG="${VERSION}"
+
+if [[ "$VERSION_MAJOR" =~ ^[0-9]+$ ]]; then
+  RELEASE_TAG="v${VERSION_NO_V}"
+  if [ "$VERSION_MAJOR" -ge 3 ]; then
+    BINARY_VERSION="${RELEASE_TAG}"
+  fi
 fi
 
 # Construct binary name
 if [ "$OS" = "windows" ]; then
-  BINARY_NAME="roc_${VERSION}_${OS}_${ARCH}.exe"
+  BINARY_NAME="roc_${BINARY_VERSION}_${OS}_${ARCH}.exe"
   INSTALL_NAME="roc.exe"
 else
-  BINARY_NAME="roc_${VERSION}_${OS}_${ARCH}"
+  BINARY_NAME="roc_${BINARY_VERSION}_${OS}_${ARCH}"
   INSTALL_NAME="roc"
 fi
 
 # Construct download URL
-DOWNLOAD_URL="https://github.com/runs-on/cli/releases/download/${VERSION}/${BINARY_NAME}"
+DOWNLOAD_URL="https://github.com/runs-on/cli/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
 
 echo "Downloading RunsOn CLI ${VERSION} for ${OS}/${ARCH}..."
 echo "URL: ${DOWNLOAD_URL}"
 
 # Create temp directory
 TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
+trap "rm -rf $TEMP_DIR" EXIT
 
 # Download binary
 if ! curl -fsSL "${CURL_RETRY_ARGS[@]}" -o "${TEMP_DIR}/${INSTALL_NAME}" "${DOWNLOAD_URL}"; then
