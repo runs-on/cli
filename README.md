@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.8/roc_v3.0.8_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.9/roc_v3.0.9_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.8/roc_v3.0.8_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.9/roc_v3.0.9_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -289,7 +289,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.0.8  # Use the latest release tag
+    rev: v3.0.9  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
