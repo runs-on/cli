@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/spf13/cobra"
@@ -20,12 +19,15 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 	var watch bool
 
 	cmd := &cobra.Command{
-		Use:           "connect JOB_ID|JOB_URL",
+		Use:           "connect JOB_URL",
 		Short:         "Connect to the instance running a specific job via SSM",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := requireGitHubJobURL(args[0]); err != nil {
+				return err
+			}
 			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
 				return err
@@ -34,7 +36,7 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 				return err
 			}
 
-			jobID := extractJobID(args[0])
+			jobRef := args[0]
 			ctx := cmd.Context()
 
 			logger := log.New(io.Discard, "", 0)
@@ -42,9 +44,8 @@ func NewConnectCmd(stack *Stack) *cobra.Command {
 				logger.SetOutput(cmd.OutOrStderr())
 			}
 
-			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
 			ssmClient := ssm.NewFromConfig(config.AWSConfig)
-			facts, err := waitForWorkflowJobFacts(ctx, jobsClient, config.WorkflowJobsTable, jobID, watch, logger)
+			facts, err := lookupWorkflowJobFacts(ctx, config, jobRef, watch, logger)
 			if err != nil {
 				return err
 			}
