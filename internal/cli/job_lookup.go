@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +30,7 @@ type workflowJobFacts struct {
 	CreatedAt            time.Time
 	CreatedAtSource      string
 	rawItem              map[string]dynamodbtypes.AttributeValue
+	rawJSON              []byte
 }
 
 type workflowJobFactsRecord struct {
@@ -102,69 +102,275 @@ func findWorkflowJobFacts(ctx context.Context, jobsClient workflowJobsAPI, table
 	return workflowJobFactsFromRecord(record, output.Item), nil
 }
 
-type workflowJobFactsProvider struct {
-	jobs      workflowJobsAPI
-	tableName string
-	jobID     string
-	logger    *log.Logger
+type jobFactsProvider struct {
+	product     string
+	resolver    *jobDiagnosticsResolver
+	github      localGitHubWorkflowJobFetcher
+	jobID       string
+	jobRef      string
+	logger      *log.Logger
+	diagnostics *jobDiagnosticsResponse
 
 	mu    sync.RWMutex
 	facts *workflowJobFacts
 }
 
-func newWorkflowJobFactsProvider(config *RunsOnConfig, jobID string, logger *log.Logger) *workflowJobFactsProvider {
-	return &workflowJobFactsProvider{
-		jobs:      dynamodb.NewFromConfig(config.AWSConfig),
-		tableName: config.WorkflowJobsTable,
-		jobID:     jobID,
-		logger:    logger,
+func newJobFactsProvider(config *RunsOnConfig, jobRef string, logger *log.Logger) *jobFactsProvider {
+	return &jobFactsProvider{
+		product:  strings.TrimSpace(config.Product),
+		resolver: newJobDiagnosticsResolver(config),
+		github:   ghCLIWorkflowJobFetcher{},
+		jobID:    extractJobID(strings.TrimSpace(jobRef)),
+		jobRef:   strings.TrimSpace(jobRef),
+		logger:   logger,
 	}
 }
 
-func (p *workflowJobFactsProvider) refresh(ctx context.Context) {
-	facts, err := findWorkflowJobFacts(ctx, p.jobs, p.tableName, p.jobID)
+func (p *jobFactsProvider) refresh(ctx context.Context) error {
+	facts, err := p.find(ctx)
 	if err != nil {
 		if p.logger != nil {
-			p.logger.Printf("Error discovering workflow job facts: %v", err)
+			p.logger.Printf("Error discovering job facts: %v", err)
 		}
 		p.set(nil)
-		return
+		return err
 	}
 	p.set(facts)
+	return nil
 }
 
-func (p *workflowJobFactsProvider) startRefresh(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+func (p *jobFactsProvider) find(ctx context.Context) (*workflowJobFacts, error) {
+	response, err := p.resolver.Resolve(ctx, p.jobRef)
+	if err != nil {
+		return nil, err
+	}
+	if response != nil && p.logger != nil {
+		response.logDebug(p.logger)
+	}
+	if p.shouldUseLocalGitHubFallback(response) {
+		p.enrichWithLocalGitHub(ctx, response)
+	}
+	p.setDiagnostics(response)
+	return response.workflowFacts(parsedJobIDOrZero(p.jobID)), nil
+}
 
+func (p *jobFactsProvider) shouldUseLocalGitHubFallback(response *jobDiagnosticsResponse) bool {
+	if response == nil || p.github == nil || !strings.EqualFold(response.Product, "fleet") {
+		return false
+	}
+	if response.GitHub.WorkflowJob != nil {
+		return false
+	}
+	if response.Request.WorkflowJobID == 0 || response.Request.Owner == "" || response.Request.Repo == "" {
+		return false
+	}
+	return response.Local == nil || response.Status == "ambiguous"
+}
+
+func (p *jobFactsProvider) enrichWithLocalGitHub(ctx context.Context, response *jobDiagnosticsResponse) {
+	response.Diagnostics = append(response.Diagnostics, jobDiagnosticsDiagnostic{
+		Level:   "info",
+		Code:    "local_gh_workflow_job_fetch_attempt",
+		Message: "resolver could not resolve the Fleet workflow job; trying local gh CLI",
+	})
+	if p.logger != nil {
+		p.logger.Printf("Job diagnostics info local_gh_workflow_job_fetch_attempt: resolver could not resolve the Fleet workflow job; trying local gh CLI")
+	}
+	workflowJob, err := p.github.FetchWorkflowJob(ctx, response.Request)
+	if err != nil {
+		response.Diagnostics = append(response.Diagnostics, jobDiagnosticsDiagnostic{
+			Level:   "warn",
+			Code:    "local_gh_workflow_job_fetch_failed",
+			Message: err.Error(),
+		})
+		if p.logger != nil {
+			p.logger.Printf("Job diagnostics warn local_gh_workflow_job_fetch_failed: %s", err.Error())
+		}
+		return
+	}
+	response.GitHub.WorkflowJob = workflowJob
+	response.Status = "partial"
+	response.Diagnostics = append(response.Diagnostics, jobDiagnosticsDiagnostic{
+		Level:   "info",
+		Code:    "local_gh_workflow_job_fetched",
+		Message: "workflow job details fetched with local gh CLI fallback",
+	})
+	if p.logger != nil {
+		p.logger.Printf("Job diagnostics info local_gh_workflow_job_fetched: workflow job details fetched with local gh CLI fallback")
+	}
+}
+
+func (p *jobFactsProvider) productType() string {
+	if strings.EqualFold(strings.TrimSpace(p.product), "fleet") {
+		return "fleet"
+	}
+	return "flex"
+}
+
+func (p *jobFactsProvider) lookupTarget() string {
+	return fmt.Sprintf("job diagnostics resolver Lambda %s", displayValue(p.resolverName()))
+}
+
+func (p *jobFactsProvider) resolverName() string {
+	if p == nil || p.resolver == nil {
+		return ""
+	}
+	return p.resolver.functionName
+}
+
+func displayValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "(not configured)"
+	}
+	return value
+}
+
+func parsedJobIDOrZero(jobID string) int64 {
+	parsed, _ := strconv.ParseInt(strings.TrimSpace(jobID), 10, 64)
+	return parsed
+}
+
+func (p *jobFactsProvider) logLookupSnapshot() {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Printf("Stack product detected: %s", p.productType())
+	p.logger.Printf("Job lookup target: %s", p.lookupTarget())
+	p.logger.Printf("%s", p.lookupStatusLine())
+}
+
+func (p *jobFactsProvider) lookupStatusLine() string {
+	jobID := extractJobID(strings.TrimSpace(p.jobID))
+	facts := p.current()
+	if facts == nil {
+		return fmt.Sprintf("Job %s not found in %s", jobID, p.lookupTarget())
+	}
+
+	instanceIDs := jobFactsInstanceIDs(facts)
+	currentInstanceID := displayValue(facts.CurrentInstanceID)
+	attemptedInstanceIDs := "(none)"
+	if len(instanceIDs) > 0 {
+		attemptedInstanceIDs = strings.Join(instanceIDs, ",")
+	}
+
+	if p.productType() == "fleet" {
+		return fmt.Sprintf(
+			"Job %s found in %s: workflow_run_id=%d state=%s current_instance_id=%s attempted_instance_ids=%s",
+			jobID,
+			p.lookupTarget(),
+			facts.RunID,
+			displayValue(facts.Status),
+			currentInstanceID,
+			attemptedInstanceIDs,
+		)
+	}
+
+	return fmt.Sprintf(
+		"Job %s found in %s: run_id=%d status=%s scheduling_state=%s current_instance_id=%s attempted_instance_ids=%s",
+		jobID,
+		p.lookupTarget(),
+		facts.RunID,
+		displayValue(facts.Status),
+		displayValue(facts.SchedulingState),
+		currentInstanceID,
+		attemptedInstanceIDs,
+	)
+}
+
+func (p *jobFactsProvider) instanceUnavailableError() error {
+	return jobFactsInstanceError(p.current(), extractJobID(strings.TrimSpace(p.jobID)), p.lookupTarget())
+}
+
+func lookupWorkflowJobFacts(ctx context.Context, config *RunsOnConfig, jobRef string, watch bool, logger *log.Logger) (*workflowJobFacts, error) {
+	if config == nil {
+		return nil, fmt.Errorf("runs-on config is required")
+	}
+	if strings.EqualFold(config.Product, "fleet") {
+		return waitForJobFactsProviderWithInterval(ctx, newJobFactsProvider(config, jobRef, logger), watch, logger, 5*time.Second)
+	}
+	jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
+	return waitForWorkflowJobFacts(ctx, jobsClient, config.WorkflowJobsTable, jobRef, watch, logger)
+}
+
+func waitForJobFactsProviderWithInterval(ctx context.Context, factsProvider *jobFactsProvider, watch bool, logger *log.Logger, interval time.Duration) (*workflowJobFacts, error) {
+	if factsProvider == nil {
+		return nil, fmt.Errorf("workflow job facts provider is required")
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	jobID := extractJobID(strings.TrimSpace(factsProvider.jobID))
+	for {
+		if err := factsProvider.refresh(ctx); err != nil {
+			return nil, err
+		}
+		facts := factsProvider.current()
+		if facts != nil && facts.CurrentInstanceID != "" {
+			return facts, nil
+		}
+		if !watch {
+			return nil, factsProvider.instanceUnavailableError()
+		}
+		if logger != nil {
+			logger.Printf("Waiting for instance ID for job %s...\n", jobID)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+func (p *jobFactsProvider) startRefreshWithInterval(ctx context.Context, interval time.Duration) {
+	if p == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.refresh(ctx)
-				if instanceID := p.currentInstanceID(); instanceID != "" && p.logger != nil {
-					p.logger.Printf("Instance ID for job %s: %s", p.jobID, instanceID)
+				if err := p.refresh(ctx); err != nil && p.logger != nil {
+					p.logger.Printf("Error refreshing job facts: %v", err)
 				}
 			}
 		}
 	}()
 }
 
-func (p *workflowJobFactsProvider) set(facts *workflowJobFacts) {
+func (p *jobFactsProvider) set(facts *workflowJobFacts) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.facts = facts
 }
 
-func (p *workflowJobFactsProvider) current() *workflowJobFacts {
+func (p *jobFactsProvider) setDiagnostics(diagnostics *jobDiagnosticsResponse) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.diagnostics = diagnostics
+}
+
+func (p *jobFactsProvider) current() *workflowJobFacts {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.facts
 }
 
-func (p *workflowJobFactsProvider) currentInstanceID() string {
+func (p *jobFactsProvider) currentDiagnostics() *jobDiagnosticsResponse {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.diagnostics
+}
+
+func (p *jobFactsProvider) currentInstanceID() string {
 	facts := p.current()
 	if facts == nil {
 		return ""
@@ -172,12 +378,55 @@ func (p *workflowJobFactsProvider) currentInstanceID() string {
 	return facts.CurrentInstanceID
 }
 
-func (p *workflowJobFactsProvider) runID() int64 {
+func (p *jobFactsProvider) currentInstanceIDs() []string {
 	facts := p.current()
 	if facts == nil {
-		return 0
+		return nil
 	}
-	return facts.RunID
+	return jobFactsInstanceIDs(facts)
+}
+
+func (p *jobFactsProvider) runID() int64 {
+	facts := p.current()
+	if facts != nil && facts.RunID != 0 {
+		return facts.RunID
+	}
+	if diagnostics := p.currentDiagnostics(); diagnostics != nil {
+		if diagnostics.Request.WorkflowRunID != 0 {
+			return diagnostics.Request.WorkflowRunID
+		}
+		if diagnostics.GitHub.WorkflowJob != nil && diagnostics.GitHub.WorkflowJob.RunID != 0 {
+			return diagnostics.GitHub.WorkflowJob.RunID
+		}
+		if diagnostics.GitHub.WorkflowRun != nil {
+			return diagnostics.GitHub.WorkflowRun.ID
+		}
+	}
+	return 0
+}
+
+func jobFactsInstanceIDs(facts *workflowJobFacts) []string {
+	if facts == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(facts.AttemptedInstanceIDs)+1)
+	ids := make([]string, 0, len(facts.AttemptedInstanceIDs)+1)
+	add := func(instanceID string) {
+		instanceID = strings.TrimSpace(instanceID)
+		if instanceID == "" {
+			return
+		}
+		if _, ok := seen[instanceID]; ok {
+			return
+		}
+		seen[instanceID] = struct{}{}
+		ids = append(ids, instanceID)
+	}
+	for _, instanceID := range facts.AttemptedInstanceIDs {
+		add(instanceID)
+	}
+	add(facts.CurrentInstanceID)
+	return ids
 }
 
 func workflowJobFactsFromRecord(record workflowJobFactsRecord, rawItem map[string]dynamodbtypes.AttributeValue) *workflowJobFacts {
@@ -218,6 +467,9 @@ func (f *workflowJobFacts) createdAtOrError() (time.Time, error) {
 func (f *workflowJobFacts) rawDynamoDBItemJSON() ([]byte, error) {
 	if f == nil {
 		return nil, fmt.Errorf("workflow job facts are required")
+	}
+	if len(f.rawJSON) > 0 {
+		return append([]byte(nil), f.rawJSON...), nil
 	}
 	data, err := attributevalue.MarshalMapJSON(f.rawItem)
 	if err != nil {
@@ -264,7 +516,6 @@ func workflowJobAttemptedInstanceIDs(record workflowJobFactsRecord) []string {
 	}
 	add(parseRunnerNameInstanceID(record.RunnerName))
 
-	sort.Strings(ids)
 	return ids
 }
 
@@ -295,7 +546,7 @@ func waitForWorkflowJobFactsWithInterval(ctx context.Context, jobsClient workflo
 			return facts, nil
 		}
 		if !watch {
-			return nil, workflowJobFactsInstanceError(facts, jobID)
+			return nil, jobFactsInstanceError(facts, jobID, fmt.Sprintf("workflow jobs table %s", displayValue(tableName)))
 		}
 		if logger != nil {
 			logger.Printf("Waiting for instance ID for job %s...\n", jobID)
@@ -308,14 +559,17 @@ func waitForWorkflowJobFactsWithInterval(ctx context.Context, jobsClient workflo
 	}
 }
 
-func workflowJobFactsInstanceError(facts *workflowJobFacts, jobID string) error {
+func jobFactsInstanceError(facts *workflowJobFacts, jobID string, lookupTarget string) error {
 	switch {
 	case facts == nil:
-		return fmt.Errorf("job %s not found in workflow jobs table", jobID)
+		return fmt.Errorf("job %s not found in %s", jobID, lookupTarget)
 	case facts.CurrentInstanceID != "":
 		return nil
 	default:
 		parts := []string{fmt.Sprintf("instance ID for job %s not available yet", jobID)}
+		if lookupTarget != "" {
+			parts = append(parts, fmt.Sprintf("job_found_in=%q", lookupTarget))
+		}
 		if facts.Status != "" {
 			parts = append(parts, fmt.Sprintf("status=%s", facts.Status))
 		}

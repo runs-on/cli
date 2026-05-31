@@ -17,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	cloudtrailtypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
@@ -41,11 +40,10 @@ type fullArtifactError struct {
 
 type fullLogExporter struct {
 	cwl        cloudWatchLogsAPI
-	jobs       workflowJobsAPI
+	resolver   *jobDiagnosticsResolver
 	ec2        ec2ConsoleAPI
 	cloudtrail cloudTrailLookupAPI
 	outputs    *StackOutputs
-	jobsTable  string
 	stackName  string
 	region     string
 }
@@ -57,10 +55,9 @@ type cloudTrailLookupAPI interface {
 func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 	return &fullLogExporter{
 		cwl:        cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		jobs:       dynamodb.NewFromConfig(config.AWSConfig),
+		resolver:   newJobDiagnosticsResolver(config),
 		ec2:        ec2.NewFromConfig(config.AWSConfig),
 		cloudtrail: cloudtrail.NewFromConfig(config.AWSConfig),
-		jobsTable:  config.WorkflowJobsTable,
 		stackName:  config.StackName,
 		region:     config.AWSConfig.Region,
 		outputs: &StackOutputs{
@@ -71,12 +68,16 @@ func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 }
 
 func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, error) {
-	facts, err := findWorkflowJobFacts(ctx, f.jobs, f.jobsTable, jobID)
+	diagnostics, err := f.resolveJobDiagnostics(ctx, jobID)
 	if err != nil {
 		return "", err
 	}
+	if diagnostics.Local == nil && diagnostics.GitHub.WorkflowJob == nil {
+		return "", fmt.Errorf("job %s not found", jobID)
+	}
+	facts := diagnostics.workflowFacts(parsedJobIDOrZero(extractJobID(jobID)))
 	if facts == nil {
-		return "", fmt.Errorf("job %s not found in workflow jobs table", jobID)
+		return "", fmt.Errorf("job %s not found", jobID)
 	}
 
 	createdAt, err := facts.createdAtOrError()
@@ -112,10 +113,16 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		addArtifactError(jobRecordPath, err)
 	}
 
+	if len(diagnostics.raw) > 0 {
+		if err := archive.writeBytes("diagnostics/resolver.json", prettyJSON(diagnostics.raw)); err != nil {
+			addArtifactError("diagnostics/resolver.json", err)
+		}
+	}
+
 	jobLogsPath := fmt.Sprintf("server/job-%s.jsonl", parsedJobID)
 	if err := f.writeCloudWatchMessages(ctx, archive, jobLogsPath, cloudWatchLogRequest{
 		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
-		FilterPattern:      fullJobFilterPattern(parsedJobID, instanceIDs),
+		FilterPattern:      fullJobFilterPattern(parsedJobID, facts.RunID, instanceIDs),
 		StartTime:          windowStart,
 		EndTime:            windowEnd,
 	}); err != nil {
@@ -185,8 +192,21 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	return zipPath, fmt.Errorf("full log archive completed with %d artifact errors: %w", len(artifactErrors), errors.Join(joined...))
 }
 
-func fullJobFilterPattern(jobID string, instanceIDs []string) string {
-	terms := []string{fmt.Sprintf(`( $.job_id = "%s" )`, jobID)}
+func (f *fullLogExporter) resolveJobDiagnostics(ctx context.Context, jobID string) (*jobDiagnosticsResponse, error) {
+	if f.resolver == nil {
+		return nil, fmt.Errorf("job diagnostics resolver is required")
+	}
+	return f.resolver.Resolve(ctx, jobID)
+}
+
+func fullJobFilterPattern(jobID string, runID int64, instanceIDs []string) string {
+	terms := []string{
+		fmt.Sprintf(`( $.job_id = "%s" )`, jobID),
+		fmt.Sprintf(`( $.workflow_job_id = "%s" )`, jobID),
+	}
+	if runID != 0 {
+		terms = append(terms, fmt.Sprintf(`( $.run_id = "%d" )`, runID))
+	}
 	for _, instanceID := range instanceIDs {
 		terms = append(terms, fmt.Sprintf(`( $.message = "*%s*" )`, instanceID))
 	}

@@ -32,11 +32,14 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "logs JOB_ID|JOB_URL|RUN_ID",
-		Short: "Fetch RunsOn and instance logs for a specific job ID. Use --include to specify log types (run, console)",
+		Use:   "logs JOB_URL",
+		Short: "Fetch RunsOn and instance logs for a specific GitHub Actions job URL. Use --include to specify log types (run, console)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+			if _, err := requireGitHubJobURL(args[0]); err != nil {
+				return err
+			}
 
 			watch, watchInterval, err := parseLogWatch(watchDuration)
 			if err != nil {
@@ -54,10 +57,11 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				return err
 			}
 
-			jobID := extractJobID(args[0])
+			jobRef := args[0]
+			jobID := extractJobID(jobRef)
 			if full {
 				exporter := newFullLogExporter(config)
-				zipPath, fullErr := exporter.Export(ctx, jobID)
+				zipPath, fullErr := exporter.Export(ctx, jobRef)
 				if zipPath != "" {
 					fmt.Printf("Full log archive exported to: %s\n", zipPath)
 				}
@@ -77,7 +81,7 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				NoColor:       noColor,
 			}
 
-			facts := newWorkflowJobFactsProvider(config, jobID, streamer.logger)
+			facts := newJobFactsProvider(config, jobRef, streamer.logger)
 			return streamer.Stream(ctx, jobID, facts, includeFlags, logOptions)
 		},
 	}
