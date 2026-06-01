@@ -24,14 +24,28 @@ type taggedResourcesAPI interface {
 }
 
 type stackConfigSecretValue struct {
-	WorkflowJobsTable      string `json:"WorkflowJobsTable"`
-	IngressURL             string `json:"IngressURL"`
-	ServiceLogGroupName    string `json:"ServiceLogGroupName"`
-	EC2InstanceLogGroupArn string `json:"Ec2InstanceLogGroupArn"`
+	WorkflowJobsTable                  string `json:"WorkflowJobsTable"`
+	JobDiagnosticsResolverFunctionName string `json:"JobDiagnosticsResolverFunctionName"`
+	IngressURL                         string `json:"IngressURL"`
+	ServiceLogGroupName                string `json:"ServiceLogGroupName"`
+	EC2InstanceLogGroupArn             string `json:"Ec2InstanceLogGroupArn"`
+}
+
+type fleetConfigSecretValue struct {
+	Infra struct {
+		ClaimTableName                     string `json:"claim_table_name"`
+		JobDiagnosticsResolverFunctionName string `json:"job_diagnostics_resolver_function_name"`
+		ServiceLogGroupName                string `json:"service_log_group_name"`
+		EC2InstanceLogGroup                string `json:"ec2_instance_log_group"`
+	} `json:"infra"`
 }
 
 func stackConfigSecretID(stackName string) string {
 	return fmt.Sprintf("/runs-on/%s/stack-config", strings.TrimSpace(stackName))
+}
+
+func fleetConfigSecretID(stackName string) string {
+	return fmt.Sprintf("/runs-on/%s/fleet-config", strings.TrimSpace(stackName))
 }
 
 func (s *Stack) discoverResources(cmd *cobra.Command) (*RunsOnConfig, error) {
@@ -54,6 +68,9 @@ func loadRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackNam
 		SecretId: aws.String(secretID),
 	})
 	if err != nil {
+		if isSecretNotFound(err) {
+			return loadFleetRunsOnConfig(ctx, client, stackName, cfg, err)
+		}
 		return nil, formatStackConfigSecretLoadError(secretID, cfg, err)
 	}
 	if output.SecretString == nil || strings.TrimSpace(*output.SecretString) == "" {
@@ -64,8 +81,7 @@ func loadRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackNam
 }
 
 func formatStackConfigSecretLoadError(secretID string, cfg aws.Config, err error) error {
-	var notFound *secretstypes.ResourceNotFoundException
-	if errors.As(err, &notFound) {
+	if isSecretNotFound(err) {
 		message := fmt.Sprintf("the stack config secret %s couldn't be found in AWS Secrets Manager", secretID)
 		if region := strings.TrimSpace(cfg.Region); region != "" {
 			message += fmt.Sprintf(" region %s", region)
@@ -76,6 +92,28 @@ func formatStackConfigSecretLoadError(secretID string, cfg aws.Config, err error
 	return fmt.Errorf("load stack config secret %s: %w", secretID, err)
 }
 
+func isSecretNotFound(err error) bool {
+	var notFound *secretstypes.ResourceNotFoundException
+	return errors.As(err, &notFound)
+}
+
+func loadFleetRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackName string, cfg aws.Config, stackErr error) (*RunsOnConfig, error) {
+	secretID := fleetConfigSecretID(stackName)
+	output, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretID),
+	})
+	if err != nil {
+		if isSecretNotFound(err) {
+			return nil, formatStackConfigSecretLoadError(stackConfigSecretID(stackName), cfg, stackErr)
+		}
+		return nil, fmt.Errorf("load fleet config secret %s: %w", secretID, err)
+	}
+	if output.SecretString == nil || strings.TrimSpace(*output.SecretString) == "" {
+		return nil, fmt.Errorf("fleet config secret %s is empty", secretID)
+	}
+	return parseFleetRunsOnConfig(stackName, cfg, *output.SecretString)
+}
+
 func parseRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*RunsOnConfig, error) {
 	var secret stackConfigSecretValue
 	if err := json.Unmarshal([]byte(secretValue), &secret); err != nil {
@@ -84,10 +122,29 @@ func parseRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*R
 
 	return &RunsOnConfig{
 		StackName:              strings.TrimSpace(stackName),
+		Product:                "flex",
 		IngressURL:             normalizeDoctorServiceURL(secret.IngressURL),
 		ServiceLogGroupName:    strings.TrimSpace(secret.ServiceLogGroupName),
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.EC2InstanceLogGroupArn),
 		WorkflowJobsTable:      strings.TrimSpace(secret.WorkflowJobsTable),
+		JobDiagnosticsResolver: strings.TrimSpace(secret.JobDiagnosticsResolverFunctionName),
+		AWSConfig:              cfg,
+	}, nil
+}
+
+func parseFleetRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*RunsOnConfig, error) {
+	var secret fleetConfigSecretValue
+	if err := json.Unmarshal([]byte(secretValue), &secret); err != nil {
+		return nil, fmt.Errorf("parse fleet config: %w", err)
+	}
+
+	return &RunsOnConfig{
+		StackName:              strings.TrimSpace(stackName),
+		Product:                "fleet",
+		ServiceLogGroupName:    strings.TrimSpace(secret.Infra.ServiceLogGroupName),
+		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.Infra.EC2InstanceLogGroup),
+		ClaimTableName:         strings.TrimSpace(secret.Infra.ClaimTableName),
+		JobDiagnosticsResolver: strings.TrimSpace(secret.Infra.JobDiagnosticsResolverFunctionName),
 		AWSConfig:              cfg,
 	}, nil
 }
@@ -149,6 +206,15 @@ func discoverTaggedECSServiceARN(ctx context.Context, client taggedResourcesAPI,
 }
 
 func (c *RunsOnConfig) validateJobLookup() error {
+	if c.Product == "fleet" {
+		if c.ClaimTableName == "" {
+			return fmt.Errorf("fleet claims table not found for stack %q", c.StackName)
+		}
+		if c.JobDiagnosticsResolver == "" {
+			return fmt.Errorf("job diagnostics resolver Lambda not found for stack %q; make sure the roc CLI version matches the deployed RunsOn stack version", c.StackName)
+		}
+		return nil
+	}
 	if c.WorkflowJobsTable == "" {
 		return fmt.Errorf("workflow jobs table not found for stack %q", c.StackName)
 	}
@@ -158,6 +224,9 @@ func (c *RunsOnConfig) validateJobLookup() error {
 func (c *RunsOnConfig) validateJobLogs() error {
 	if err := c.validateJobLookup(); err != nil {
 		return err
+	}
+	if c.JobDiagnosticsResolver == "" {
+		return fmt.Errorf("job diagnostics resolver Lambda not found for stack %q; make sure the roc CLI version matches the deployed RunsOn stack version", c.StackName)
 	}
 	if c.EC2InstanceLogGroupArn == "" {
 		return fmt.Errorf("EC2 instance log group not found for stack %q", c.StackName)

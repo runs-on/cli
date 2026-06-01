@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/fis"
 	"github.com/aws/aws-sdk-go-v2/service/fis/types"
@@ -57,12 +56,15 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 	var delay time.Duration
 
 	cmd := &cobra.Command{
-		Use:           "interrupt JOB_ID|JOB_URL",
+		Use:           "interrupt JOB_URL",
 		Short:         "Trigger a spot interruption on the instance running a specific job",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := requireGitHubJobURL(args[0]); err != nil {
+				return err
+			}
 			config, err := stack.getStackOutputs(cmd)
 			if err != nil {
 				return err
@@ -80,8 +82,7 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			}
 
 			ec2Client := ec2.NewFromConfig(config.AWSConfig)
-			jobsClient := dynamodb.NewFromConfig(config.AWSConfig)
-			facts, err := waitForWorkflowJobFacts(ctx, jobsClient, config.WorkflowJobsTable, jobID, wait, logger)
+			facts, err := lookupWorkflowJobFacts(ctx, config, args[0], wait, logger)
 			if err != nil {
 				if !wait {
 					return fmt.Errorf("%w. Use -w to wait for instance", err)

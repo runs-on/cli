@@ -92,6 +92,11 @@ func (d *StackDoctor) failCheck(name, message string, err error) error {
 	return err
 }
 
+func (d *StackDoctor) skipCheck(name, message string) {
+	d.addCheck(name, "⏭️", message, nil)
+	d.printCheckResult("⏭️", message)
+}
+
 func (d *StackDoctor) getServiceURL() (string, error) {
 	entryPoint := strings.TrimSpace(d.config.IngressURL)
 	if entryPoint == "" {
@@ -258,6 +263,19 @@ func (d *StackDoctor) checkReadiness() error {
 	return nil
 }
 
+func (d *StackDoctor) checkHTTPHealth() {
+	if strings.EqualFold(strings.TrimSpace(d.config.Product), "fleet") {
+		fmt.Print("Checking service endpoint...")
+		d.skipCheck("Service endpoint accessible", "Skipped - Fleet does not expose a public service endpoint")
+		fmt.Print("Checking service readiness...")
+		d.skipCheck("Service readiness", "Skipped - Fleet does not expose a public readiness endpoint")
+		return
+	}
+
+	_ = d.checkEndpointAccessibility()
+	_ = d.checkReadiness()
+}
+
 func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, logGroupIdentifier, outputName string, since time.Duration) (int, error) {
 	logsDir := filepath.Join(d.workDir, "logs")
 
@@ -395,8 +413,7 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 
 	// Run all checks, but continue on failures so doctor can export partial results.
 	_ = d.checkService(ctx)
-	_ = d.checkEndpointAccessibility()
-	_ = d.checkReadiness()
+	d.checkHTTPHealth()
 	_, _ = d.fetchLogs(ctx, since)
 
 	// Save results
@@ -432,8 +449,8 @@ func NewDoctorCmd(stack *Stack) *cobra.Command {
 
 This command performs comprehensive health checks on your RunsOn stack:
 - Checks ECS service health
-- Tests endpoint accessibility
-- Validates service readiness
+- Tests endpoint accessibility for Flex stacks
+- Validates service readiness for Flex stacks
 - Fetches application logs
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.
