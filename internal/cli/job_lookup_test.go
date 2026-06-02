@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 )
 
 type mockWorkflowJobsClient struct {
@@ -110,6 +112,7 @@ func TestFindWorkflowJobFactsFallsBackToAttemptHistoryInstanceID(t *testing.T) {
 
 func TestFindWorkflowJobFactsDerivesAttemptedInstancesAndCreatedAt(t *testing.T) {
 	createdAt := time.Date(2026, 5, 8, 12, 30, 0, 0, time.UTC)
+	completedAt := createdAt.Add(35 * time.Minute)
 	client := &mockWorkflowJobsClient{
 		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
 			return &dynamodb.GetItemOutput{
@@ -118,6 +121,7 @@ func TestFindWorkflowJobFactsDerivesAttemptedInstancesAndCreatedAt(t *testing.T)
 					RunID:         1234,
 					CreatedAt:     &createdAt,
 					CreatedAtUnix: createdAt.Add(-time.Hour).Unix(),
+					CompletedAt:   &completedAt,
 					RunnerName:    "runs-on--i-runner--job",
 					ActiveAttempt: &struct {
 						InstanceID string `dynamodbav:"instance_id"`
@@ -145,6 +149,9 @@ func TestFindWorkflowJobFactsDerivesAttemptedInstancesAndCreatedAt(t *testing.T)
 	}
 	if facts.CreatedAtSource != "created_at" {
 		t.Fatalf("expected created_at source, got %q", facts.CreatedAtSource)
+	}
+	if !facts.CompletedAt.Equal(completedAt) || facts.CompletedAtSource != "completed_at" {
+		t.Fatalf("unexpected completed_at facts: %s source=%q", facts.CompletedAt, facts.CompletedAtSource)
 	}
 	if _, err := facts.rawDynamoDBItemJSON(); err != nil {
 		t.Fatalf("rawDynamoDBItemJSON returned error: %v", err)
@@ -224,6 +231,80 @@ func TestWaitForWorkflowJobFactsWaitsForInstanceID(t *testing.T) {
 	}
 	if calls < 2 {
 		t.Fatalf("expected at least 2 GetItem calls, got %d", calls)
+	}
+}
+
+func TestWaitForJobFactsProviderUsesResolverUntilFleetInstanceIDAppears(t *testing.T) {
+	var calls int
+	resolverClient := &mockJobDiagnosticsLambda{}
+	resolverClient.invoke = func(context.Context, *lambda.InvokeInput, ...func(*lambda.Options)) (*lambda.InvokeOutput, error) {
+		calls++
+		response := jobDiagnosticsResponse{
+			Status:  "found",
+			Product: "fleet",
+			GitHub: jobDiagnosticsGitHub{
+				WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234},
+			},
+			Local: &jobDiagnosticsLocal{
+				Source:        "fleet_claims",
+				WorkflowJobID: 42,
+				WorkflowRunID: 1234,
+				Status:        "queued",
+			},
+		}
+		if calls > 1 {
+			response.Local.InstanceIDs = []string{"i-fleet"}
+			response.Local.Status = "job_claimed"
+		}
+		payload, err := json.Marshal(response)
+		if err != nil {
+			return nil, err
+		}
+		return &lambda.InvokeOutput{Payload: payload}, nil
+	}
+	factsProvider := &jobFactsProvider{
+		product: "fleet",
+		resolver: &jobDiagnosticsResolver{
+			client:       resolverClient,
+			functionName: "job-diagnostics",
+		},
+		jobID:  "42",
+		jobRef: "https://github.com/runs-on/server/actions/runs/1234/job/42",
+	}
+
+	facts, err := waitForJobFactsProviderWithInterval(context.Background(), factsProvider, true, nil, time.Millisecond)
+	if err != nil {
+		t.Fatalf("waitForJobFactsProviderWithInterval returned error: %v", err)
+	}
+	if facts.CurrentInstanceID != "i-fleet" {
+		t.Fatalf("expected Fleet instance ID i-fleet, got %q", facts.CurrentInstanceID)
+	}
+	if calls < 2 {
+		t.Fatalf("expected resolver to be retried, got %d calls", calls)
+	}
+}
+
+func TestWaitForJobFactsProviderNoWatchReturnsResolverState(t *testing.T) {
+	factsProvider := testJobFactsProvider(jobDiagnosticsResponse{
+		Status:  "found",
+		Product: "fleet",
+		GitHub: jobDiagnosticsGitHub{
+			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234},
+		},
+		Local: &jobDiagnosticsLocal{
+			Source:        "fleet_claims",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			Status:        "queued",
+		},
+	})
+
+	_, err := waitForJobFactsProviderWithInterval(context.Background(), factsProvider, false, nil, time.Millisecond)
+	if err == nil {
+		t.Fatal("expected missing Fleet instance ID to return an error")
+	}
+	if !strings.Contains(err.Error(), "job_found_in=\"job diagnostics resolver Lambda job-diagnostics\"") || !strings.Contains(err.Error(), "status=queued") {
+		t.Fatalf("expected resolver target and status in error, got %v", err)
 	}
 }
 

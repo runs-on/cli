@@ -31,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.10/roc_v3.0.10_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.0/roc_v3.1.0_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -39,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.0.10/roc_v3.0.10_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.0/roc_v3.1.0_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -79,12 +79,14 @@ jobs:
 ## Resource Discovery
 
 The CLI loads stack metadata from the standard stack config secret at
-`/runs-on/<stack>/stack-config`.
+`/runs-on/<stack>/stack-config`. For Fleet stacks, it falls back to the Fleet
+config secret at `/runs-on/<stack>/fleet-config`.
 
 That secret provides the stable identifiers needed by the core troubleshooting
 commands:
 
 - `WorkflowJobsTable`
+- Fleet claim table name
 - `IngressURL`
 - `ServiceLogGroupName`
 - `Ec2InstanceLogGroupArn`
@@ -98,13 +100,13 @@ AppRunner-era discovery fallback.
 
 ### `roc connect`
 
-Connect to the instance running a specific job via SSM, by just pasting the GitHub Actions job URL or ID.
+Connect to the instance running a specific job via SSM, by pasting the GitHub Actions job URL.
 
 This feature requires the [AWS Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) to be installed on your local machine.
 
 ```
 Usage:
-  roc connect JOB_ID|JOB_URL [flags]
+  roc connect JOB_URL [flags]
 
 Flags:
       --debug   Enable debug output
@@ -123,11 +125,11 @@ AWS_PROFILE=runs-on-admin roc connect https://github.com/runs-on/runs-on/actions
 
 ### `roc logs`
 
-Fetch RunsOn server and instance logs for a specific job ID or URL. Use the `--include` flag to specify additional streamed log types, or `--full` to export a complete diagnostic archive.
+Fetch RunsOn server and instance logs for a specific GitHub Actions job URL. Use the `--include` flag to specify additional streamed log types, or `--full` to export a complete diagnostic archive.
 
 ```
 Usage:
-  roc logs JOB_ID|JOB_URL [flags]
+  roc logs JOB_URL [flags]
 
 Flags:
   -d, --debug                 Enable debug output
@@ -152,18 +154,24 @@ AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/ru
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --include=run --watch
 
 # Fetch EC2 instance console logs
-AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=console
+AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --include=console
 
 # Fetch both run logs and console logs
-AWS_PROFILE=runs-on-admin roc logs 34661958899 --include=run,console --watch
+AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --include=run,console --watch
 
 # Export a diagnostic archive for a job
-AWS_PROFILE=runs-on-admin roc logs 34661958899 --full
+AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --full
 ```
 
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the raw DynamoDB workflow-job item, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the DynamoDB job creation timestamp, from one hour before creation through one hour after creation.
+`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, GitHub workflow job/run details, and delivery metadata when available.
+
+For Fleet stacks, if the resolver cannot fetch GitHub workflow job details and local claim data is ambiguous, `roc logs` tries the local GitHub CLI (`gh`) as a fallback. Install `gh` and run `gh auth login` with repository Actions read access to enable that fallback.
+
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the resolved job creation timestamp, from one hour before creation through one hour after creation.
 
 `--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
+
+With `--debug`, `roc logs` also reports the full resolver diagnostics before streaming logs.
 
 ### `roc interrupt`
 
@@ -173,7 +181,7 @@ This command uses AWS Fault Injection Simulator (FIS) to send a spot interruptio
 
 ```
 Usage:
-  roc interrupt JOB_ID|JOB_URL [flags]
+  roc interrupt JOB_URL [flags]
 
 Flags:
       --debug            Enable debug output
@@ -204,10 +212,10 @@ AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actio
 
 ```bash
 # Wait for instance if job hasn't started yet
-AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --wait
+AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --wait
 
 # Custom delay before interruption (default is 5 seconds)
-AWS_PROFILE=runs-on-admin roc interrupt 34661958899 --delay 30s
+AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --delay 30s
 ```
 
 ### `roc lint`
@@ -289,7 +297,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.0.10  # Use the latest release tag
+    rev: v3.1.0  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
@@ -310,8 +318,8 @@ Diagnose RunsOn stack health and export troubleshooting information.
 
 This command performs comprehensive health checks on your RunsOn stack:
 - Checks ECS service health
-- Tests endpoint accessibility
-- Validates service configuration
+- Tests endpoint accessibility for Flex stacks
+- Validates service readiness for Flex stacks
 - Fetches application logs
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.

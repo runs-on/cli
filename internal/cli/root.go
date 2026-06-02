@@ -9,10 +9,13 @@ import (
 
 type RunsOnConfig struct {
 	StackName              string
+	Product                string
 	IngressURL             string
 	ServiceLogGroupName    string
 	EC2InstanceLogGroupArn string
 	WorkflowJobsTable      string
+	ClaimTableName         string
+	JobDiagnosticsResolver string
 	AWSConfig              aws.Config
 }
 
