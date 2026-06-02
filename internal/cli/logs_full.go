@@ -17,17 +17,24 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	cloudtrailtypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
-const fullLogWindowPadding = time.Hour
+const (
+	fullLogWindowBefore       = 5 * time.Minute
+	fullLogWindowAfter        = 10 * time.Minute
+	fullLogDefaultJobDuration = 30 * time.Minute
+)
 
 type fullLogManifest struct {
 	StackName          string              `json:"stack_name,omitempty"`
 	Region             string              `json:"region,omitempty"`
 	JobID              int64               `json:"job_id"`
 	RunID              int64               `json:"run_id,omitempty"`
+	JobStart           time.Time           `json:"job_start"`
+	JobEnd             time.Time           `json:"job_end"`
+	JobStartSource     string              `json:"job_start_source,omitempty"`
+	JobEndSource       string              `json:"job_end_source,omitempty"`
 	WindowStart        time.Time           `json:"window_start"`
 	WindowEnd          time.Time           `json:"window_end"`
 	AttemptedInstances []string            `json:"attempted_instances"`
@@ -41,12 +48,12 @@ type fullArtifactError struct {
 
 type fullLogExporter struct {
 	cwl        cloudWatchLogsAPI
-	jobs       workflowJobsAPI
+	resolver   *jobDiagnosticsResolver
 	ec2        ec2ConsoleAPI
 	cloudtrail cloudTrailLookupAPI
 	outputs    *StackOutputs
-	jobsTable  string
 	stackName  string
+	product    string
 	region     string
 }
 
@@ -57,11 +64,11 @@ type cloudTrailLookupAPI interface {
 func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 	return &fullLogExporter{
 		cwl:        cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		jobs:       dynamodb.NewFromConfig(config.AWSConfig),
+		resolver:   newJobDiagnosticsResolver(config),
 		ec2:        ec2.NewFromConfig(config.AWSConfig),
 		cloudtrail: cloudtrail.NewFromConfig(config.AWSConfig),
-		jobsTable:  config.WorkflowJobsTable,
 		stackName:  config.StackName,
+		product:    config.Product,
 		region:     config.AWSConfig.Region,
 		outputs: &StackOutputs{
 			ServiceLogGroupName:    config.ServiceLogGroupName,
@@ -71,20 +78,22 @@ func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 }
 
 func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, error) {
-	facts, err := findWorkflowJobFacts(ctx, f.jobs, f.jobsTable, jobID)
+	diagnostics, err := f.resolveJobDiagnostics(ctx, jobID)
 	if err != nil {
 		return "", err
 	}
+	if diagnostics.Local == nil && diagnostics.GitHub.WorkflowJob == nil {
+		return "", fmt.Errorf("job %s not found", jobID)
+	}
+	facts := diagnostics.workflowFacts(parsedJobIDOrZero(extractJobID(jobID)))
 	if facts == nil {
-		return "", fmt.Errorf("job %s not found in workflow jobs table", jobID)
+		return "", fmt.Errorf("job %s not found", jobID)
 	}
 
-	createdAt, err := facts.createdAtOrError()
+	window, err := facts.fullLogWindow()
 	if err != nil {
 		return "", err
 	}
-	windowStart := createdAt.Add(-fullLogWindowPadding)
-	windowEnd := createdAt.Add(fullLogWindowPadding)
 	instanceIDs := facts.AttemptedInstanceIDs
 	parsedJobID := strconv.FormatInt(facts.JobID, 10)
 
@@ -112,12 +121,27 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		addArtifactError(jobRecordPath, err)
 	}
 
+	if len(diagnostics.raw) > 0 {
+		if err := archive.writeBytes("diagnostics/resolver.json", prettyJSON(diagnostics.raw)); err != nil {
+			addArtifactError("diagnostics/resolver.json", err)
+		}
+	}
+
+	ecsLogsPath := "server/ecs.jsonl"
+	if err := f.writeCloudWatchMessages(ctx, archive, ecsLogsPath, cloudWatchLogRequest{
+		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
+		StartTime:          window.Start,
+		EndTime:            window.End,
+	}); err != nil {
+		addArtifactError(ecsLogsPath, err)
+	}
+
 	jobLogsPath := fmt.Sprintf("server/job-%s.jsonl", parsedJobID)
 	if err := f.writeCloudWatchMessages(ctx, archive, jobLogsPath, cloudWatchLogRequest{
 		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
-		FilterPattern:      fullJobFilterPattern(parsedJobID, instanceIDs),
-		StartTime:          windowStart,
-		EndTime:            windowEnd,
+		FilterPattern:      fullJobFilterPattern(parsedJobID, facts.RunID, instanceIDs),
+		StartTime:          window.Start,
+		EndTime:            window.End,
 	}); err != nil {
 		addArtifactError(jobLogsPath, err)
 	}
@@ -128,8 +152,8 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	} else if err := f.writeCloudWatchMessages(ctx, archive, runLogsPath, cloudWatchLogRequest{
 		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
 		FilterPattern:      runFilterPattern(facts.RunID),
-		StartTime:          windowStart,
-		EndTime:            windowEnd,
+		StartTime:          window.Start,
+		EndTime:            window.End,
 	}); err != nil {
 		addArtifactError(runLogsPath, err)
 	}
@@ -137,7 +161,7 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	for _, instanceID := range instanceIDs {
 		instanceDir := path.Join("instances", instanceID)
 		cloudTrailPath := path.Join(instanceDir, "cloudtrail.json")
-		if err := f.writeCloudTrailEvents(ctx, archive, cloudTrailPath, instanceID, windowStart, windowEnd); err != nil {
+		if err := f.writeCloudTrailEvents(ctx, archive, cloudTrailPath, instanceID, window.Start, window.End); err != nil {
 			addArtifactError(cloudTrailPath, err)
 		}
 
@@ -150,8 +174,8 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		if err := f.writeCloudWatchMessages(ctx, archive, agentPath, cloudWatchLogRequest{
 			LogGroupIdentifier:  f.outputs.EC2InstanceLogGroupArn,
 			LogStreamNamePrefix: fmt.Sprintf("%s/", instanceID),
-			StartTime:           windowStart,
-			EndTime:             windowEnd,
+			StartTime:           window.Start,
+			EndTime:             window.End,
 		}); err != nil {
 			addArtifactError(agentPath, err)
 		}
@@ -162,8 +186,12 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		Region:             f.region,
 		JobID:              facts.JobID,
 		RunID:              facts.RunID,
-		WindowStart:        windowStart.UTC(),
-		WindowEnd:          windowEnd.UTC(),
+		JobStart:           window.JobStart.UTC(),
+		JobEnd:             window.JobEnd.UTC(),
+		JobStartSource:     window.JobStartSource,
+		JobEndSource:       window.JobEndSource,
+		WindowStart:        window.Start.UTC(),
+		WindowEnd:          window.End.UTC(),
 		AttemptedInstances: instanceIDs,
 		Errors:             artifactErrors,
 	}
@@ -185,8 +213,64 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	return zipPath, fmt.Errorf("full log archive completed with %d artifact errors: %w", len(artifactErrors), errors.Join(joined...))
 }
 
-func fullJobFilterPattern(jobID string, instanceIDs []string) string {
-	terms := []string{fmt.Sprintf(`( $.job_id = "%s" )`, jobID)}
+type fullLogWindow struct {
+	JobStart       time.Time
+	JobEnd         time.Time
+	JobStartSource string
+	JobEndSource   string
+	Start          time.Time
+	End            time.Time
+}
+
+func (f *workflowJobFacts) fullLogWindow() (fullLogWindow, error) {
+	createdAt, err := f.createdAtOrError()
+	if err != nil {
+		return fullLogWindow{}, err
+	}
+
+	jobEnd := f.CompletedAt
+	jobEndSource := f.CompletedAtSource
+	if jobEnd.IsZero() {
+		jobEnd = createdAt.Add(fullLogDefaultJobDuration)
+		jobEndSource = strings.TrimSpace(f.CreatedAtSource)
+		if jobEndSource == "" {
+			jobEndSource = "created_at"
+		}
+		jobEndSource += "+30m"
+	}
+
+	return fullLogWindow{
+		JobStart:       createdAt.UTC(),
+		JobEnd:         jobEnd.UTC(),
+		JobStartSource: f.CreatedAtSource,
+		JobEndSource:   jobEndSource,
+		Start:          createdAt.Add(-fullLogWindowBefore).UTC(),
+		End:            jobEnd.Add(fullLogWindowAfter).UTC(),
+	}, nil
+}
+
+func (f *fullLogExporter) resolveJobDiagnostics(ctx context.Context, jobID string) (*jobDiagnosticsResponse, error) {
+	if f.resolver == nil {
+		return nil, fmt.Errorf("job diagnostics resolver is required")
+	}
+	diagnostics, err := f.resolver.Resolve(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if err := diagnostics.validateStackProduct(f.product, f.stackName, parsedJobIDOrZero(extractJobID(jobID))); err != nil {
+		return nil, err
+	}
+	return diagnostics, nil
+}
+
+func fullJobFilterPattern(jobID string, runID int64, instanceIDs []string) string {
+	terms := []string{
+		fmt.Sprintf(`( $.job_id = "%s" )`, jobID),
+		fmt.Sprintf(`( $.workflow_job_id = "%s" )`, jobID),
+	}
+	if runID != 0 {
+		terms = append(terms, fmt.Sprintf(`( $.run_id = "%d" )`, runID))
+	}
 	for _, instanceID := range instanceIDs {
 		terms = append(terms, fmt.Sprintf(`( $.message = "*%s*" )`, instanceID))
 	}

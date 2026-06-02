@@ -4,7 +4,9 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,26 +15,28 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	cloudtrailtypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
 type mockCloudWatchLogsClient struct {
-	mu     sync.Mutex
-	inputs []*cloudwatchlogs.FilterLogEventsInput
+	mu      sync.Mutex
+	inputs  []*cloudwatchlogs.FilterLogEventsInput
+	onInput func(*cloudwatchlogs.FilterLogEventsInput)
 }
 
 func (m *mockCloudWatchLogsClient) FilterLogEvents(ctx context.Context, params *cloudwatchlogs.FilterLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.FilterLogEventsOutput, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.inputs = append(m.inputs, cloneFilterLogEventsInput(params))
+	onInput := m.onInput
+	m.mu.Unlock()
 
-	m.inputs = append(m.inputs, params)
+	if onInput != nil {
+		onInput(params)
+	}
 	message := "server"
 	if strings.Contains(aws.ToString(params.FilterPattern), "$.run_id") {
 		message = "run"
@@ -50,6 +54,14 @@ func (m *mockCloudWatchLogsClient) FilterLogEvents(ctx context.Context, params *
 			},
 		},
 	}, nil
+}
+
+func cloneFilterLogEventsInput(input *cloudwatchlogs.FilterLogEventsInput) *cloudwatchlogs.FilterLogEventsInput {
+	if input == nil {
+		return nil
+	}
+	cloned := *input
+	return &cloned
 }
 
 type mockCloudTrailClient struct {
@@ -130,9 +142,29 @@ func TestWorkflowJobAttemptedInstanceIDsDeduplicatesSources(t *testing.T) {
 	}
 }
 
+func TestWorkflowJobAttemptedInstanceIDsPreservesAttemptOrder(t *testing.T) {
+	record := workflowJobFactsRecord{
+		AttemptHistory: []struct {
+			InstanceID string `dynamodbav:"instance_id"`
+		}{
+			{InstanceID: "i-z-old"},
+			{InstanceID: "i-a-new"},
+		},
+	}
+
+	got := strings.Join(workflowJobAttemptedInstanceIDs(record), ",")
+	want := "i-z-old,i-a-new"
+	if got != want {
+		t.Fatalf("expected attempt order %s, got %s", want, got)
+	}
+	if current := workflowJobCurrentInstanceID(record); current != "i-a-new" {
+		t.Fatalf("expected current instance to use latest attempt i-a-new, got %q", current)
+	}
+}
+
 func TestFullLogFilterPatterns(t *testing.T) {
-	jobPattern := fullJobFilterPattern("42", []string{"i-1", "i-2"})
-	for _, want := range []string{`$.job_id = "42"`, `$.message = "*i-1*"`, `$.message = "*i-2*"`} {
+	jobPattern := fullJobFilterPattern("42", 1234, []string{"i-1", "i-2"})
+	for _, want := range []string{`$.job_id = "42"`, `$.workflow_job_id = "42"`, `$.run_id = "1234"`, `$.message = "*i-1*"`, `$.message = "*i-2*"`} {
 		if !strings.Contains(jobPattern, want) {
 			t.Fatalf("expected job filter pattern %q to contain %q", jobPattern, want)
 		}
@@ -144,7 +176,7 @@ func TestFullLogFilterPatterns(t *testing.T) {
 
 func TestLogsCommandFullModeValidationAndFlags(t *testing.T) {
 	cmd := NewLogsCmd(&Stack{})
-	cmd.SetArgs([]string{"42", "--full", "--watch"})
+	cmd.SetArgs([]string{"https://github.com/runs-on/server/actions/runs/1234/job/42", "--full", "--watch"})
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("expected --full --watch to be rejected")
 	}
@@ -159,37 +191,41 @@ func TestLogsCommandFullModeValidationAndFlags(t *testing.T) {
 
 func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
-	record := workflowJobFactsRecord{
-		JobID:         42,
-		RunID:         1234,
-		CreatedAt:     &createdAt,
-		CreatedAtUnix: createdAt.Unix(),
-		RunnerName:    "runs-on--i-runner--job",
-		ActiveAttempt: &struct {
-			InstanceID string `dynamodbav:"instance_id"`
-		}{InstanceID: "i-active"},
-		AttemptHistory: []struct {
-			InstanceID string `dynamodbav:"instance_id"`
-		}{
-			{InstanceID: "i-old"},
-		},
-	}
-	item := marshalFullWorkflowJobItem(t, record)
-
-	jobsClient := &mockWorkflowJobsClient{
-		getItem: func(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
-			return &dynamodb.GetItemOutput{Item: item}, nil
-		},
-	}
+	completedAt := time.Date(2026, 5, 8, 12, 30, 0, 0, time.UTC)
 	cwl := &mockCloudWatchLogsClient{}
 	trail := &mockCloudTrailClient{}
 	ec2Client := &mockEC2ConsoleClient{}
+	resolverClient := &mockJobDiagnosticsLambda{
+		response: jobDiagnosticsResponse{
+			Status:  "found",
+			Product: "flex",
+			GitHub: jobDiagnosticsGitHub{
+				WorkflowJob: &jobDiagnosticsWorkflowJob{
+					ID:          42,
+					RunID:       1234,
+					RunnerName:  "runs-on--i-runner--job",
+					CreatedAt:   createdAt.Format(time.RFC3339),
+					CompletedAt: completedAt.Format(time.RFC3339),
+				},
+			},
+			Local: &jobDiagnosticsLocal{
+				Source:          "flex_workflow_jobs",
+				WorkflowJobID:   42,
+				WorkflowRunID:   1234,
+				RunnerName:      "runs-on--i-runner--job",
+				InstanceIDs:     []string{"i-active", "i-old", "i-runner"},
+				Status:          "completed",
+				SchedulingState: "completed",
+				CreatedAt:       createdAt.Format(time.RFC3339),
+				Record:          json.RawMessage(`{"job_id":42,"run_id":1234}`),
+			},
+		},
+	}
 	exporter := &fullLogExporter{
 		cwl:        cwl,
-		jobs:       jobsClient,
+		resolver:   &jobDiagnosticsResolver{client: resolverClient, functionName: "job-diagnostics"},
 		ec2:        ec2Client,
 		cloudtrail: trail,
-		jobsTable:  "workflow-jobs",
 		stackName:  "runs-on-dev",
 		region:     "us-east-1",
 		outputs: &StackOutputs{
@@ -199,7 +235,7 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 
 	t.Chdir(t.TempDir())
-	zipPath, err := exporter.Export(context.Background(), "42")
+	zipPath, err := exporter.Export(context.Background(), "https://github.com/runs-on/server/actions/runs/1234/job/42")
 	if err != nil {
 		t.Fatalf("Export returned error: %v", err)
 	}
@@ -208,6 +244,8 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	for _, path := range []string{
 		"manifest.json",
 		"dynamodb/job-42.ddb.json",
+		"diagnostics/resolver.json",
+		"server/ecs.jsonl",
 		"server/job-42.jsonl",
 		"server/run-1234.jsonl",
 		"instances/i-active/cloudtrail.json",
@@ -220,19 +258,29 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 			t.Fatalf("expected archive to contain %s; files: %v", path, sortedZipFileNames(files))
 		}
 	}
-	if !strings.Contains(files["manifest.json"], `"window_start": "2026-05-08T11:00:00Z"`) ||
-		!strings.Contains(files["manifest.json"], `"window_end": "2026-05-08T13:00:00Z"`) {
+	if !strings.Contains(files["manifest.json"], `"job_start": "2026-05-08T12:00:00Z"`) ||
+		!strings.Contains(files["manifest.json"], `"job_end": "2026-05-08T12:30:00Z"`) ||
+		!strings.Contains(files["manifest.json"], `"job_start_source": "github.workflow_job.created_at"`) ||
+		!strings.Contains(files["manifest.json"], `"job_end_source": "github.workflow_job.completed_at"`) ||
+		!strings.Contains(files["manifest.json"], `"window_start": "2026-05-08T11:55:00Z"`) ||
+		!strings.Contains(files["manifest.json"], `"window_end": "2026-05-08T12:40:00Z"`) {
 		t.Fatalf("manifest did not contain derived window: %s", files["manifest.json"])
 	}
 	if !strings.Contains(files["instances/i-active/console.log"], "console line") {
 		t.Fatalf("console log missing decoded output: %q", files["instances/i-active/console.log"])
 	}
 
-	if len(cwl.inputs) != 5 {
-		t.Fatalf("expected job, run, and 3 agent CloudWatch fetches, got %d", len(cwl.inputs))
+	if len(cwl.inputs) != 6 {
+		t.Fatalf("expected ecs, job, run, and 3 agent CloudWatch fetches, got %d", len(cwl.inputs))
 	}
-	if got := aws.ToInt64(cwl.inputs[0].StartTime); got != createdAt.Add(-time.Hour).UnixMilli() {
+	if got := aws.ToString(cwl.inputs[0].FilterPattern); got != "" {
+		t.Fatalf("expected ECS server logs to use empty filter pattern, got %q", got)
+	}
+	if got := aws.ToInt64(cwl.inputs[0].StartTime); got != createdAt.Add(-5*time.Minute).UnixMilli() {
 		t.Fatalf("expected derived CloudWatch start time, got %d", got)
+	}
+	if got := aws.ToInt64(cwl.inputs[0].EndTime); got != completedAt.Add(10*time.Minute).UnixMilli() {
+		t.Fatalf("expected derived CloudWatch end time, got %d", got)
 	}
 	if len(trail.inputs) != 3 {
 		t.Fatalf("expected CloudTrail lookup per instance, got %d", len(trail.inputs))
@@ -242,14 +290,104 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 }
 
-func marshalFullWorkflowJobItem(t *testing.T, record workflowJobFactsRecord) map[string]dynamodbtypes.AttributeValue {
-	t.Helper()
-
-	item, err := attributevalue.MarshalMap(record)
-	if err != nil {
-		t.Fatalf("failed to marshal workflow job item: %v", err)
+func TestFullLogWindowFallsBackToLocalTimestamps(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	completedAt := time.Date(2026, 5, 8, 12, 45, 0, 0, time.UTC)
+	response := &jobDiagnosticsResponse{
+		Status:  "found",
+		Product: "fleet",
+		GitHub: jobDiagnosticsGitHub{
+			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234},
+		},
+		Local: &jobDiagnosticsLocal{
+			Source:        "fleet_claims",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			CreatedAt:     createdAt.Format(time.RFC3339),
+			CompletedAt:   completedAt.Format(time.RFC3339),
+		},
 	}
-	return item
+	facts := response.workflowFacts(42)
+
+	window, err := facts.fullLogWindow()
+	if err != nil {
+		t.Fatalf("fullLogWindow returned error: %v", err)
+	}
+	if !window.Start.Equal(createdAt.Add(-5 * time.Minute)) {
+		t.Fatalf("window start = %s, want %s", window.Start, createdAt.Add(-5*time.Minute))
+	}
+	if !window.End.Equal(completedAt.Add(10 * time.Minute)) {
+		t.Fatalf("window end = %s, want %s", window.End, completedAt.Add(10*time.Minute))
+	}
+	if window.JobStartSource != "local.created_at" || window.JobEndSource != "local.completed_at" {
+		t.Fatalf("unexpected timestamp sources: %+v", window)
+	}
+}
+
+func TestFullLogWindowUsesDefaultDurationWithoutCompletion(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	facts := &workflowJobFacts{
+		JobID:           42,
+		CreatedAt:       createdAt,
+		CreatedAtSource: "github.workflow_job.created_at",
+	}
+
+	window, err := facts.fullLogWindow()
+	if err != nil {
+		t.Fatalf("fullLogWindow returned error: %v", err)
+	}
+	if !window.JobEnd.Equal(createdAt.Add(30 * time.Minute)) {
+		t.Fatalf("job end = %s, want %s", window.JobEnd, createdAt.Add(30*time.Minute))
+	}
+	if !window.End.Equal(createdAt.Add(40 * time.Minute)) {
+		t.Fatalf("window end = %s, want %s", window.End, createdAt.Add(40*time.Minute))
+	}
+	if window.JobEndSource != "github.workflow_job.created_at+30m" {
+		t.Fatalf("job end source = %q", window.JobEndSource)
+	}
+}
+
+func TestFullLogExportRejectsCrossProductDiagnosticsBeforeArchive(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	resolverClient := &mockJobDiagnosticsLambda{
+		response: jobDiagnosticsResponse{
+			Status:  "partial",
+			Product: "fleet",
+			Request: jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+			GitHub: jobDiagnosticsGitHub{
+				WorkflowJob: &jobDiagnosticsWorkflowJob{
+					ID:     42,
+					RunID:  1234,
+					Labels: []string{"runs-on=123/runner=1cpu-linux-x64/env=dev"},
+				},
+			},
+		},
+	}
+	exporter := &fullLogExporter{
+		resolver:  &jobDiagnosticsResolver{client: resolverClient, functionName: "job-diagnostics"},
+		stackName: "runs-on-fleet-dev-v3",
+		product:   "fleet",
+	}
+
+	zipPath, err := exporter.Export(context.Background(), "https://github.com/runs-on/server/actions/runs/1234/job/42")
+	if err == nil {
+		t.Fatal("expected cross-product full log export to fail")
+	}
+	want := `job 42 is a Flex job, but stack "runs-on-fleet-dev-v3" is a Fleet stack`
+	if err.Error() != want {
+		t.Fatalf("Export error = %v, want %q", err, want)
+	}
+	if zipPath != "" {
+		t.Fatalf("zipPath = %q, want empty before archive creation", zipPath)
+	}
+	entries, readErr := os.ReadDir(".")
+	if readErr != nil {
+		t.Fatalf("read temp dir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no archive files, got %v", entries)
+	}
 }
 
 func readZipFiles(t *testing.T, zipPath string) map[string]string {

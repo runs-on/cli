@@ -46,3 +46,24 @@ func TestStackDoctorGetServiceURLErrorsWithoutIngress(t *testing.T) {
 		t.Fatal("expected getServiceURL to fail when ingress URL is missing")
 	}
 }
+
+func TestStackDoctorSkipsHTTPHealthChecksForFleet(t *testing.T) {
+	doctor := NewStackDoctor(&RunsOnConfig{Product: "fleet"})
+
+	doctor.checkHTTPHealth()
+
+	if len(doctor.result.Checks) != 2 {
+		t.Fatalf("expected two skipped checks, got %+v", doctor.result.Checks)
+	}
+	for _, check := range doctor.result.Checks {
+		if check.Status != "⏭️" {
+			t.Fatalf("expected skipped status, got %+v", check)
+		}
+	}
+	if doctor.result.Checks[0].Name != "Service endpoint accessible" {
+		t.Fatalf("unexpected first check %+v", doctor.result.Checks[0])
+	}
+	if doctor.result.Checks[1].Name != "Service readiness" {
+		t.Fatalf("unexpected second check %+v", doctor.result.Checks[1])
+	}
+}
