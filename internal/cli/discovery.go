@@ -29,6 +29,7 @@ type stackConfigSecretValue struct {
 	IngressURL                         string `json:"IngressURL"`
 	ServiceLogGroupName                string `json:"ServiceLogGroupName"`
 	EC2InstanceLogGroupArn             string `json:"Ec2InstanceLogGroupArn"`
+	EbsEncryptionKey                   string `json:"EbsEncryptionKey"`
 }
 
 type fleetConfigSecretValue struct {

@@ -414,6 +414,7 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 	// Run all checks, but continue on failures so doctor can export partial results.
 	_ = d.checkService(ctx)
 	d.checkHTTPHealth()
+	_ = d.checkEBSEncryptionKMS(ctx)
 	_, _ = d.fetchLogs(ctx, since)
 
 	// Save results
@@ -451,6 +452,7 @@ This command performs comprehensive health checks on your RunsOn stack:
 - Checks ECS service health
 - Tests endpoint accessibility for Flex stacks
 - Validates service readiness for Flex stacks
+- Validates Flex EBS encryption KMS permissions on the flex role
 - Fetches application logs
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.

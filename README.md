@@ -320,6 +320,7 @@ This command performs comprehensive health checks on your RunsOn stack:
 - Checks ECS service health
 - Tests endpoint accessibility for Flex stacks
 - Validates service readiness for Flex stacks
+- Validates Flex EBS encryption KMS permissions on the flex role
 - Fetches application logs
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.

@@ -13,6 +13,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.80.0
 	github.com/aws/aws-sdk-go-v2/service/fis v1.37.22
 	github.com/aws/aws-sdk-go-v2/service/iam v1.53.10
+	github.com/aws/aws-sdk-go-v2/service/kms v1.49.3
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.90.1
 	github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi v1.31.12
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.7

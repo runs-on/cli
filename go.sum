@@ -42,6 +42,8 @@ github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.11.23 h1:3Eo
 github.com/aws/aws-sdk-go-v2/service/internal/endpoint-discovery v1.11.23/go.mod h1:3oh+5xGSd1iuxonVb3Qbm+WJYlbhczT9kbzr6doJLzY=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.23 h1:pbrxO/kuIwgEsOPLkaHu0O+m4fNgLU8B3vxQ+72jTPw=
 github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.23/go.mod h1:/CMNUqoj46HpS3MNRDEDIwcgEnrtZlKRaHNaHxIFpNA=
+github.com/aws/aws-sdk-go-v2/service/kms v1.49.3 h1:FtjNR2BaMf/Wu3Um8RNSAfi9An5bEYxJU6f4rLOqSLU=
+github.com/aws/aws-sdk-go-v2/service/kms v1.49.3/go.mod h1:HO31s0qt0lso/ADvZQyzKs8js/ku0fMHsfyXW8OPVYc=
 github.com/aws/aws-sdk-go-v2/service/lambda v1.90.1 h1:odCeJgHXfQoXEWQUIzPkKvsJTWcLMsaOWowNpovPFFw=
 github.com/aws/aws-sdk-go-v2/service/lambda v1.90.1/go.mod h1:NbtJVztitG7JkuoI4GSrDUlsB32zeXqKBvXj6bUxcMo=
 github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi v1.31.12 h1:kOX5fCUb0BSMNHbRm7icw/dEyTjiYCLczIYglbYFJnI=
