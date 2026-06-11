@@ -24,7 +24,7 @@ func TestFlexRoleName(t *testing.T) {
 func TestMissingFlexRoleKMSPermissionsDetectsMissingActions(t *testing.T) {
 	t.Parallel()
 
-	keyARN := "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+	keyARN := "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 	policy := `{
 		"Statement": [{
 			"Effect": "Allow",
@@ -37,7 +37,7 @@ func TestMissingFlexRoleKMSPermissionsDetectsMissingActions(t *testing.T) {
 				"kms:ReEncryptFrom",
 				"kms:ReEncryptTo"
 			],
-			"Resource": "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+			"Resource": "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 		}]
 	}`
 
@@ -53,7 +53,7 @@ func TestMissingFlexRoleKMSPermissionsDetectsMissingActions(t *testing.T) {
 func TestMissingFlexRoleKMSPermissionsAcceptsCompletePolicy(t *testing.T) {
 	t.Parallel()
 
-	keyARN := "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+	keyARN := "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 	policy := `{
 		"Statement": [
 			{
@@ -67,12 +67,12 @@ func TestMissingFlexRoleKMSPermissionsAcceptsCompletePolicy(t *testing.T) {
 					"kms:ReEncryptFrom",
 					"kms:ReEncryptTo"
 				],
-				"Resource": "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+				"Resource": "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 			},
 			{
 				"Effect": "Allow",
 				"Action": ["kms:CreateGrant"],
-				"Resource": "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd",
+				"Resource": "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd",
 				"Condition": {
 					"Bool": {
 						"kms:GrantIsForAWSResource": true
@@ -94,12 +94,12 @@ func TestMissingFlexRoleKMSPermissionsAcceptsCompletePolicy(t *testing.T) {
 func TestMissingFlexRoleKMSPermissionsMatchesWildcardResource(t *testing.T) {
 	t.Parallel()
 
-	keyARN := "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+	keyARN := "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 	policy := `{
 		"Statement": [{
 			"Effect": "Allow",
 			"Action": "kms:*",
-			"Resource": "arn:aws:kms:us-west-2:411491144243:key/*"
+			"Resource": "arn:aws:kms:us-west-2:123456789011:key/*"
 		}]
 	}`
 
@@ -298,11 +298,11 @@ func (m *mockDoctorIAMClient) GetPolicyVersion(ctx context.Context, input *iam.G
 func TestIAMResourceMatchesSupportsKeyWildcard(t *testing.T) {
 	t.Parallel()
 
-	keyARN := "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
-	if !iamResourceMatches("arn:aws:kms:us-west-2:411491144243:key/*", keyARN) {
+	keyARN := "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
+	if !iamResourceMatches("arn:aws:kms:us-west-2:123456789011:key/*", keyARN) {
 		t.Fatal("expected wildcard key resource to match")
 	}
-	if iamResourceMatches("arn:aws:kms:us-east-1:411491144243:key/*", keyARN) {
+	if iamResourceMatches("arn:aws:kms:us-east-1:123456789011:key/*", keyARN) {
 		t.Fatal("expected different region wildcard not to match")
 	}
 }
@@ -321,7 +321,7 @@ func TestIAMCreateGrantConditionMatchesStringTrue(t *testing.T) {
 func TestMissingFlexRoleKMSPermissionsRejectsCreateGrantWithoutCondition(t *testing.T) {
 	t.Parallel()
 
-	keyARN := "arn:aws:kms:us-west-2:411491144243:key/35207482-6234-45c5-adfc-41184d40e7cd"
+	keyARN := "arn:aws:kms:us-west-2:123456789011:key/35207482-6234-45c5-adfc-41184d40e7cd"
 	policy := `{
 		"Statement": [{
 			"Effect": "Allow",
