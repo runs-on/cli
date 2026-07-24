@@ -232,9 +232,14 @@ func TestJobDiagnosticsClassifiesJobProduct(t *testing.T) {
 			want: "flex",
 		},
 		{
-			name:     "local flex source",
-			response: &jobDiagnosticsResponse{Local: &jobDiagnosticsLocal{Source: "flex_workflow_jobs"}},
-			want:     "flex",
+			name: "local flex source overrides fleet-shaped label",
+			response: &jobDiagnosticsResponse{
+				GitHub: jobDiagnosticsGitHub{
+					WorkflowJob: &jobDiagnosticsWorkflowJob{Labels: []string{"runs-on/fleet=linux-small/env=production"}},
+				},
+				Local: &jobDiagnosticsLocal{Source: "flex_workflow_jobs"},
+			},
+			want: "flex",
 		},
 		{
 			name:     "local fleet source",
@@ -257,6 +262,57 @@ func TestJobDiagnosticsClassifiesJobProduct(t *testing.T) {
 				t.Fatalf("classifiedJobProduct() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestJobFactsProviderRejectsWrongDiagnosticsStack(t *testing.T) {
+	t.Parallel()
+
+	facts := testJobFactsProvider(jobDiagnosticsResponse{
+		Status:    "found",
+		Product:   "fleet",
+		StackName: "runs-on-fleet-stage-v3",
+		Request:   jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+		Local: &jobDiagnosticsLocal{
+			Source:        "fleet_claims",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			InstanceIDs:   []string{"i-fleet"},
+		},
+	})
+	facts.product = "fleet"
+	facts.stackName = "runs-on-fleet-preview-v3"
+
+	err := facts.refresh(context.Background())
+	want := `job 42 diagnostics resolved stack "runs-on-fleet-stage-v3", but CLI selected stack "runs-on-fleet-preview-v3"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("refresh error = %v, want %q", err, want)
+	}
+}
+
+func TestJobFactsProviderAcceptsMatchingDiagnosticsStack(t *testing.T) {
+	t.Parallel()
+
+	facts := testJobFactsProvider(jobDiagnosticsResponse{
+		Status:    "found",
+		Product:   "fleet",
+		StackName: "runs-on-fleet-stage-v3",
+		Request:   jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+		Local: &jobDiagnosticsLocal{
+			Source:        "fleet_claims",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			InstanceIDs:   []string{"i-fleet"},
+		},
+	})
+	facts.product = "fleet"
+	facts.stackName = "runs-on-fleet-stage-v3"
+
+	if err := facts.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+	if got := facts.currentInstanceID(); got != "i-fleet" {
+		t.Fatalf("current instance ID = %q, want i-fleet", got)
 	}
 }
 
@@ -305,6 +361,39 @@ func TestJobFactsProviderRejectsCrossProductDiagnostics(t *testing.T) {
 				t.Fatalf("refresh error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestJobFactsProviderAcceptsFlexSourceWithFleetShapedLabel(t *testing.T) {
+	t.Parallel()
+
+	facts := testJobFactsProvider(jobDiagnosticsResponse{
+		Status:    "found",
+		Product:   "flex",
+		StackName: "runs-on-flex-dev-v3",
+		Request:   jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+		GitHub: jobDiagnosticsGitHub{
+			WorkflowJob: &jobDiagnosticsWorkflowJob{
+				ID:     42,
+				RunID:  1234,
+				Labels: []string{"runs-on/fleet=linux-small/env=dev"},
+			},
+		},
+		Local: &jobDiagnosticsLocal{
+			Source:        "flex_workflow_jobs",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			InstanceIDs:   []string{"i-flex"},
+		},
+	})
+	facts.product = "flex"
+	facts.stackName = "runs-on-flex-dev-v3"
+
+	if err := facts.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+	if got := facts.currentInstanceID(); got != "i-flex" {
+		t.Fatalf("current instance ID = %q, want i-flex", got)
 	}
 }
 
