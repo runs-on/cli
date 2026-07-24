@@ -244,6 +244,14 @@ func createSpotInterruption(ctx context.Context, fisClient *fis.Client, iamClien
 func getOrCreateFISRole(ctx context.Context, iamClient *iam.Client, accountID string, logger *log.Logger) (*string, error) {
 	roleARN := fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, fisRoleName)
 
+	// Prefer a plain lookup: callers running under a restricted principal
+	// (for example the CI role) may hold iam:GetRole/iam:PassRole on this
+	// role without being allowed to create IAM roles at all.
+	if _, err := iamClient.GetRole(ctx, &iam.GetRoleInput{RoleName: aws.String(fisRoleName)}); err == nil {
+		logger.Printf("Role %s already exists\n", fisRoleName)
+		return &roleARN, nil
+	}
+
 	// Try to create the role
 	logger.Printf("Creating IAM role: %s\n", fisRoleName)
 	out, err := iamClient.CreateRole(ctx, &iam.CreateRoleInput{
