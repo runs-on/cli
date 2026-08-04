@@ -34,6 +34,9 @@ func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
 	if err := archive.writeText("server/job-42.jsonl", `{"message":"server"}`+"\n"); err != nil {
 		t.Fatalf("writeText returned error: %v", err)
 	}
+	if err := archive.writeReader("instances/i-123/metrics.jsonl", strings.NewReader(`{"cpu":42}`+"\n")); err != nil {
+		t.Fatalf("writeReader returned error: %v", err)
+	}
 	if err := archive.writeFile("logs\\application.log", sourcePath); err != nil {
 		t.Fatalf("writeFile returned error: %v", err)
 	}
@@ -50,6 +53,7 @@ func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
 		"checks.json",
 		"dynamodb/job-42.ddb.json",
 		"instances/i-123/console.log",
+		"instances/i-123/metrics.jsonl",
 		"logs/application.log",
 		"manifest.json",
 		"server/job-42.jsonl",

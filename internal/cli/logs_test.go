@@ -175,6 +175,42 @@ func TestStreamRejectsCrossProductDiagnosticsBeforeCloudWatch(t *testing.T) {
 	}
 }
 
+func TestStreamRejectsWrongDiagnosticsStackBeforeCloudWatch(t *testing.T) {
+	t.Parallel()
+
+	cwl := &mockCloudWatchLogsClient{}
+	streamer := &jobLogStreamer{
+		cwl: cwl,
+		outputs: &StackOutputs{
+			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
+			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
+		},
+	}
+	facts := testJobFactsProvider(jobDiagnosticsResponse{
+		Status:    "found",
+		Product:   "fleet",
+		StackName: "runs-on-fleet-stage-v3",
+		Request:   jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+		Local: &jobDiagnosticsLocal{
+			Source:        "fleet_claims",
+			WorkflowJobID: 42,
+			WorkflowRunID: 1234,
+			InstanceIDs:   []string{"i-fleet"},
+		},
+	})
+	facts.product = "fleet"
+	facts.stackName = "runs-on-fleet-preview-v3"
+
+	err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true})
+	want := `job 42 diagnostics resolved stack "runs-on-fleet-stage-v3", but CLI selected stack "runs-on-fleet-preview-v3"`
+	if err == nil || err.Error() != want {
+		t.Fatalf("Stream error = %v, want %q", err, want)
+	}
+	if len(cwl.inputs) != 0 {
+		t.Fatalf("expected no CloudWatch fetches before stack mismatch error, got %d", len(cwl.inputs))
+	}
+}
+
 func TestApplicationLogGroupIdentifierPrefersServiceLogGroup(t *testing.T) {
 	outputs := &StackOutputs{
 		ServiceLogGroupName: "/aws/ecs/runs-on-preview-v3/flexd",
