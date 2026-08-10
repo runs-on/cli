@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -19,7 +18,6 @@ import (
 	cloudtrailtypes "github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 const (
@@ -49,38 +47,29 @@ type fullArtifactError struct {
 }
 
 type fullLogExporter struct {
-	cwl         cloudWatchLogsAPI
-	resolver    *jobDiagnosticsResolver
-	ec2         ec2ConsoleAPI
-	cloudtrail  cloudTrailLookupAPI
-	s3          metricsS3API
-	outputs     *StackOutputs
-	cacheBucket string
-	stackName   string
-	product     string
-	region      string
+	cwl        cloudWatchLogsAPI
+	resolver   *jobDiagnosticsResolver
+	ec2        ec2ConsoleAPI
+	cloudtrail cloudTrailLookupAPI
+	outputs    *StackOutputs
+	stackName  string
+	product    string
+	region     string
 }
 
 type cloudTrailLookupAPI interface {
 	LookupEvents(ctx context.Context, params *cloudtrail.LookupEventsInput, optFns ...func(*cloudtrail.Options)) (*cloudtrail.LookupEventsOutput, error)
 }
 
-type metricsS3API interface {
-	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
-}
-
 func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 	return &fullLogExporter{
-		cwl:         cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		resolver:    newJobDiagnosticsResolver(config),
-		ec2:         ec2.NewFromConfig(config.AWSConfig),
-		cloudtrail:  cloudtrail.NewFromConfig(config.AWSConfig),
-		s3:          s3.NewFromConfig(config.AWSConfig),
-		cacheBucket: config.CacheBucket,
-		stackName:   config.StackName,
-		product:     config.Product,
-		region:      config.AWSConfig.Region,
+		cwl:        cloudwatchlogs.NewFromConfig(config.AWSConfig),
+		resolver:   newJobDiagnosticsResolver(config),
+		ec2:        ec2.NewFromConfig(config.AWSConfig),
+		cloudtrail: cloudtrail.NewFromConfig(config.AWSConfig),
+		stackName:  config.StackName,
+		product:    config.Product,
+		region:     config.AWSConfig.Region,
 		outputs: &StackOutputs{
 			ServiceLogGroupName:    config.ServiceLogGroupName,
 			EC2InstanceLogGroupArn: config.EC2InstanceLogGroupArn,
@@ -89,10 +78,6 @@ func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 }
 
 func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, error) {
-	request, err := buildJobDiagnosticsRequest(jobID)
-	if err != nil {
-		return "", err
-	}
 	diagnostics, err := f.resolveJobDiagnostics(ctx, jobID)
 	if err != nil {
 		return "", err
@@ -104,7 +89,6 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	if facts == nil {
 		return "", fmt.Errorf("job %s not found", jobID)
 	}
-	metricsRequest := canonicalMetricsRequest(diagnostics, request)
 
 	window, err := facts.fullLogWindow()
 	if err != nil {
@@ -197,10 +181,6 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		}
 	}
 
-	for _, artifactErr := range f.writeMetricsFiles(ctx, archive, metricsRequest, facts.RunID, instanceIDs) {
-		addArtifactError(artifactErr.Path, errors.New(artifactErr.Error))
-	}
-
 	manifest := fullLogManifest{
 		StackName:          f.stackName,
 		Region:             f.region,
@@ -231,128 +211,6 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		joined = append(joined, fmt.Errorf("%s: %s", artifactErr.Path, artifactErr.Error))
 	}
 	return zipPath, fmt.Errorf("full log archive completed with %d artifact errors: %w", len(artifactErrors), errors.Join(joined...))
-}
-
-func canonicalMetricsRequest(diagnostics *jobDiagnosticsResponse, fallback jobDiagnosticsRequest) jobDiagnosticsRequest {
-	if diagnostics == nil {
-		return fallback
-	}
-
-	var repositoryCandidates []string
-	if diagnostics.GitHub.WorkflowJob != nil {
-		repositoryCandidates = append(repositoryCandidates, diagnostics.GitHub.WorkflowJob.HTMLURL)
-	}
-	if diagnostics.GitHub.WorkflowRun != nil {
-		repositoryCandidates = append(repositoryCandidates, diagnostics.GitHub.WorkflowRun.HTMLURL)
-	}
-
-	var local struct {
-		JobHTMLURL     string `json:"job_html_url"`
-		OrgName        string `json:"org_name"`
-		RepoName       string `json:"repo_name"`
-		OwnerName      string `json:"owner_name"`
-		RepositoryName string `json:"repository_name"`
-	}
-	if diagnostics.Local != nil && len(diagnostics.Local.Record) > 0 && json.Unmarshal(diagnostics.Local.Record, &local) == nil {
-		repositoryCandidates = append(repositoryCandidates, local.JobHTMLURL)
-		if strings.TrimSpace(local.OrgName) != "" && strings.TrimSpace(local.RepoName) != "" {
-			fallback.Owner = strings.TrimSpace(local.OrgName)
-			fallback.Repo = strings.TrimSpace(local.RepoName)
-		}
-		if strings.TrimSpace(local.OwnerName) != "" && strings.TrimSpace(local.RepositoryName) != "" {
-			fallback.Owner = strings.TrimSpace(local.OwnerName)
-			fallback.Repo = strings.TrimSpace(local.RepositoryName)
-		}
-	}
-
-	for _, candidate := range repositoryCandidates {
-		owner, repo, ok := repositoryFromGitHubURL(candidate)
-		if !ok {
-			continue
-		}
-		fallback.Owner = owner
-		fallback.Repo = repo
-		return fallback
-	}
-	return fallback
-}
-
-func repositoryFromGitHubURL(input string) (string, string, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(input))
-	if err != nil || parsed.Scheme != "https" {
-		return "", "", false
-	}
-	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
-}
-
-func (f *fullLogExporter) writeMetricsFiles(ctx context.Context, archive *archiveWriter, request jobDiagnosticsRequest, runID int64, instanceIDs []string) []fullArtifactError {
-	if f.s3 == nil || strings.TrimSpace(f.cacheBucket) == "" || strings.TrimSpace(request.Owner) == "" || strings.TrimSpace(request.Repo) == "" || runID == 0 || len(instanceIDs) == 0 {
-		return nil
-	}
-
-	prefix := fmt.Sprintf("cache/metrics/v1/%s/%s/%d/", request.Owner, request.Repo, runID)
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.cacheBucket),
-		Prefix: aws.String(prefix),
-	}
-	paginator := s3.NewListObjectsV2Paginator(f.s3, input)
-	keysByInstance := make(map[string]string, len(instanceIDs))
-	instances := make(map[string]struct{}, len(instanceIDs))
-	for _, instanceID := range instanceIDs {
-		instances[instanceID] = struct{}{}
-	}
-
-	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(ctx)
-		if err != nil {
-			return []fullArtifactError{{Path: "instances/metrics.jsonl", Error: fmt.Sprintf("list metrics files: %v", err)}}
-		}
-		for _, object := range output.Contents {
-			key := aws.ToString(object.Key)
-			parts := strings.Split(strings.TrimPrefix(key, prefix), "/")
-			if len(parts) != 3 || parts[2] != "metrics.jsonl" {
-				continue
-			}
-			instanceID := parts[1]
-			if _, ok := instances[instanceID]; !ok {
-				continue
-			}
-			if _, exists := keysByInstance[instanceID]; !exists {
-				keysByInstance[instanceID] = key
-			}
-		}
-	}
-
-	var artifactErrors []fullArtifactError
-	for _, instanceID := range instanceIDs {
-		key, ok := keysByInstance[instanceID]
-		if !ok {
-			continue
-		}
-		artifactPath := path.Join("instances", instanceID, "metrics.jsonl")
-		output, err := f.s3.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(f.cacheBucket),
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("fetch metrics file: %v", err)})
-			continue
-		}
-		writeErr := archive.writeReader(artifactPath, output.Body)
-		closeErr := output.Body.Close()
-		if writeErr != nil {
-			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("write metrics file: %v", writeErr)})
-			continue
-		}
-		if closeErr != nil {
-			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("close metrics file: %v", closeErr)})
-		}
-	}
-	return artifactErrors
 }
 
 type fullLogWindow struct {

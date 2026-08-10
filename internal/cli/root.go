@@ -16,7 +16,6 @@ type RunsOnConfig struct {
 	WorkflowJobsTable      string
 	ClaimTableName         string
 	JobDiagnosticsResolver string
-	CacheBucket            string
 	AWSConfig              aws.Config
 }
 
@@ -48,7 +47,6 @@ func NewRootCmd(stack *Stack) *cobra.Command {
 		NewLogsCmd(stack),
 		NewConnectCmd(stack),
 		NewInterruptCmd(stack),
-		NewCleanupCmd(stack),
 		NewStackCmd(stack),
 		NewLintCmd(),
 		NewVersionCmd(),

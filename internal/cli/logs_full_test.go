@@ -20,8 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type mockCloudWatchLogsClient struct {
@@ -84,28 +82,6 @@ func (m *mockCloudTrailClient) LookupEvents(ctx context.Context, params *cloudtr
 
 type mockEC2ConsoleClient struct {
 	inputs []*ec2.GetConsoleOutputInput
-}
-
-type mockMetricsS3Client struct {
-	objects    map[string]string
-	listInputs []*s3.ListObjectsV2Input
-	getInputs  []*s3.GetObjectInput
-}
-
-func (m *mockMetricsS3Client) ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
-	m.listInputs = append(m.listInputs, params)
-	output := &s3.ListObjectsV2Output{}
-	for key := range m.objects {
-		if strings.HasPrefix(key, aws.ToString(params.Prefix)) {
-			output.Contents = append(output.Contents, s3types.Object{Key: aws.String(key)})
-		}
-	}
-	return output, nil
-}
-
-func (m *mockMetricsS3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	m.getInputs = append(m.getInputs, params)
-	return &s3.GetObjectOutput{Body: io.NopCloser(strings.NewReader(m.objects[aws.ToString(params.Key)]))}, nil
 }
 
 func (m *mockEC2ConsoleClient) GetConsoleOutput(ctx context.Context, params *ec2.GetConsoleOutputInput, optFns ...func(*ec2.Options)) (*ec2.GetConsoleOutputOutput, error) {
@@ -219,20 +195,14 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	cwl := &mockCloudWatchLogsClient{}
 	trail := &mockCloudTrailClient{}
 	ec2Client := &mockEC2ConsoleClient{}
-	metricsClient := &mockMetricsS3Client{objects: map[string]string{
-		"cache/metrics/v1/runs-on/server/1234/unit-tests/i-active/metrics.jsonl":   "{\"cpu\":42}\n",
-		"cache/metrics/v1/runs-on/server/1234/other-job/i-unrelated/metrics.jsonl": "{\"cpu\":99}\n",
-	}}
 	resolverClient := &mockJobDiagnosticsLambda{
 		response: jobDiagnosticsResponse{
 			Status:  "found",
 			Product: "flex",
-			Request: jobDiagnosticsRequest{Owner: "runs-on", Repo: "server", WorkflowRunID: 1234, WorkflowJobID: 42},
 			GitHub: jobDiagnosticsGitHub{
 				WorkflowJob: &jobDiagnosticsWorkflowJob{
 					ID:          42,
 					RunID:       1234,
-					HTMLURL:     "https://github.com/runs-on/server/actions/runs/1234/job/42",
 					RunnerName:  "runs-on--i-runner--job",
 					CreatedAt:   createdAt.Format(time.RFC3339),
 					CompletedAt: completedAt.Format(time.RFC3339),
@@ -252,14 +222,12 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 		},
 	}
 	exporter := &fullLogExporter{
-		cwl:         cwl,
-		resolver:    &jobDiagnosticsResolver{client: resolverClient, functionName: "job-diagnostics"},
-		ec2:         ec2Client,
-		cloudtrail:  trail,
-		s3:          metricsClient,
-		cacheBucket: "runs-on-cache",
-		stackName:   "runs-on-dev",
-		region:      "us-east-1",
+		cwl:        cwl,
+		resolver:   &jobDiagnosticsResolver{client: resolverClient, functionName: "job-diagnostics"},
+		ec2:        ec2Client,
+		cloudtrail: trail,
+		stackName:  "runs-on-dev",
+		region:     "us-east-1",
 		outputs: &StackOutputs{
 			ServiceLogGroupName:    "/aws/ecs/runs-on/flexd",
 			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
@@ -267,7 +235,7 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 
 	t.Chdir(t.TempDir())
-	zipPath, err := exporter.Export(context.Background(), "https://github.com/runs-on/server/actions/runs/9999/job/42")
+	zipPath, err := exporter.Export(context.Background(), "https://github.com/runs-on/server/actions/runs/1234/job/42")
 	if err != nil {
 		t.Fatalf("Export returned error: %v", err)
 	}
@@ -283,7 +251,6 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 		"instances/i-active/cloudtrail.json",
 		"instances/i-active/console.log",
 		"instances/i-active/agent.jsonl",
-		"instances/i-active/metrics.jsonl",
 		"instances/i-old/cloudtrail.json",
 		"instances/i-runner/agent.jsonl",
 	} {
@@ -301,12 +268,6 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 	if !strings.Contains(files["instances/i-active/console.log"], "console line") {
 		t.Fatalf("console log missing decoded output: %q", files["instances/i-active/console.log"])
-	}
-	if files["instances/i-active/metrics.jsonl"] != "{\"cpu\":42}\n" {
-		t.Fatalf("unexpected metrics content: %q", files["instances/i-active/metrics.jsonl"])
-	}
-	if _, ok := files["instances/i-old/metrics.jsonl"]; ok {
-		t.Fatal("did not expect an archive entry when metrics are absent")
 	}
 
 	if len(cwl.inputs) != 6 {
@@ -326,78 +287,6 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 	if len(ec2Client.inputs) != 3 {
 		t.Fatalf("expected console output per instance, got %d", len(ec2Client.inputs))
-	}
-	if len(metricsClient.listInputs) != 1 {
-		t.Fatalf("expected one S3 metrics listing, got %d", len(metricsClient.listInputs))
-	}
-	if got := aws.ToString(metricsClient.listInputs[0].Prefix); got != "cache/metrics/v1/runs-on/server/1234/" {
-		t.Fatalf("unexpected metrics prefix %q", got)
-	}
-	if len(metricsClient.getInputs) != 1 {
-		t.Fatalf("expected one matching metrics download, got %d", len(metricsClient.getInputs))
-	}
-}
-
-func TestCanonicalMetricsRequestUsesResolvedJobURLCasing(t *testing.T) {
-	fallback, err := buildJobDiagnosticsRequest("https://github.com/RUNS-ON/SERVER/actions/runs/1234/job/42")
-	if err != nil {
-		t.Fatalf("buildJobDiagnosticsRequest returned error: %v", err)
-	}
-	diagnostics := &jobDiagnosticsResponse{GitHub: jobDiagnosticsGitHub{
-		WorkflowJob: &jobDiagnosticsWorkflowJob{HTMLURL: "https://github.com/runs-on/server/actions/runs/1234/job/42"},
-	}}
-
-	got := canonicalMetricsRequest(diagnostics, fallback)
-	if got.Owner != "runs-on" || got.Repo != "server" {
-		t.Fatalf("canonical metrics repository = %s/%s, want runs-on/server", got.Owner, got.Repo)
-	}
-}
-
-func TestCanonicalMetricsRequestFallsBackToResolvedRunAndLocalRecords(t *testing.T) {
-	fallback, err := buildJobDiagnosticsRequest("https://github.com/RUNS-ON/SERVER/actions/runs/1234/job/42")
-	if err != nil {
-		t.Fatalf("buildJobDiagnosticsRequest returned error: %v", err)
-	}
-
-	tests := []struct {
-		name        string
-		diagnostics *jobDiagnosticsResponse
-		wantOwner   string
-		wantRepo    string
-	}{
-		{
-			name: "workflow run URL",
-			diagnostics: &jobDiagnosticsResponse{GitHub: jobDiagnosticsGitHub{
-				WorkflowRun: &jobDiagnosticsWorkflowRun{HTMLURL: "https://github.com/runs-on/server/actions/runs/1234"},
-			}},
-			wantOwner: "runs-on",
-			wantRepo:  "server",
-		},
-		{
-			name: "Flex local record",
-			diagnostics: &jobDiagnosticsResponse{Local: &jobDiagnosticsLocal{
-				Record: json.RawMessage(`{"org_name":"Runs-On","repo_name":"Server"}`),
-			}},
-			wantOwner: "Runs-On",
-			wantRepo:  "Server",
-		},
-		{
-			name: "Fleet local record",
-			diagnostics: &jobDiagnosticsResponse{Local: &jobDiagnosticsLocal{
-				Record: json.RawMessage(`{"owner_name":"runs-on-demo","repository_name":"Scaleset-Demo"}`),
-			}},
-			wantOwner: "runs-on-demo",
-			wantRepo:  "Scaleset-Demo",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := canonicalMetricsRequest(tt.diagnostics, fallback)
-			if got.Owner != tt.wantOwner || got.Repo != tt.wantRepo {
-				t.Fatalf("canonical metrics repository = %s/%s, want %s/%s", got.Owner, got.Repo, tt.wantOwner, tt.wantRepo)
-			}
-		})
 	}
 }
 

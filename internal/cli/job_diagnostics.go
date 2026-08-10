@@ -44,7 +44,6 @@ type jobDiagnosticsRequest struct {
 type jobDiagnosticsResponse struct {
 	Status      string                     `json:"status"`
 	Product     string                     `json:"product"`
-	StackName   string                     `json:"stack_name,omitempty"`
 	Request     jobDiagnosticsRequest      `json:"request"`
 	GitHub      jobDiagnosticsGitHub       `json:"github"`
 	Local       *jobDiagnosticsLocal       `json:"local"`
@@ -338,9 +337,6 @@ func (r *jobDiagnosticsResponse) workflowFacts(jobID int64) *workflowJobFacts {
 }
 
 func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct, stackName string, jobID int64) error {
-	if err := r.validateStackName(stackName, jobID); err != nil {
-		return err
-	}
 	stackProduct = normalizeJobProduct(stackProduct)
 	jobProduct := r.classifiedJobProduct()
 	if stackProduct == "" || jobProduct == "" || stackProduct == jobProduct {
@@ -352,21 +348,12 @@ func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct, stackName st
 	return fmt.Errorf("job %d is a %s job, but stack %q is a %s stack", jobID, displayJobProduct(jobProduct), strings.TrimSpace(stackName), displayJobProduct(stackProduct))
 }
 
-func (r *jobDiagnosticsResponse) validateStackName(stackName string, jobID int64) error {
-	expected := strings.TrimSpace(stackName)
-	actual := strings.TrimSpace(r.StackName)
-	if expected == "" || actual == "" || expected == actual {
-		return nil
-	}
-	if jobID == 0 {
-		jobID = r.Request.WorkflowJobID
-	}
-	return fmt.Errorf("job %d diagnostics resolved stack %q, but CLI selected stack %q", jobID, actual, expected)
-}
-
 func (r *jobDiagnosticsResponse) classifiedJobProduct() string {
 	if r == nil {
 		return ""
+	}
+	if product := classifyJobProductFromLabels(r.GitHub.WorkflowJob); product != "" {
+		return product
 	}
 	if r.Local != nil {
 		switch strings.TrimSpace(r.Local.Source) {
@@ -375,9 +362,6 @@ func (r *jobDiagnosticsResponse) classifiedJobProduct() string {
 		case "fleet_claims":
 			return "fleet"
 		}
-	}
-	if product := classifyJobProductFromLabels(r.GitHub.WorkflowJob); product != "" {
-		return product
 	}
 	return ""
 }
@@ -501,9 +485,8 @@ func (r *jobDiagnosticsResponse) writeSummary(w io.Writer) {
 		}
 		instanceIDs = append(instanceIDs, parseRunnerNameInstanceID(r.GitHub.WorkflowJob.RunnerName))
 	}
-	fmt.Fprintf(w, "Job diagnostics: product=%s stack=%s status=%s local=%s runner=%s instance_ids=%s\n",
+	fmt.Fprintf(w, "Job diagnostics: product=%s status=%s local=%s runner=%s instance_ids=%s\n",
 		displayValue(r.Product),
-		displayValue(r.StackName),
 		displayValue(r.Status),
 		source,
 		displayValue(runnerName),

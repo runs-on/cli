@@ -29,7 +29,6 @@ type stackConfigSecretValue struct {
 	IngressURL                         string `json:"IngressURL"`
 	ServiceLogGroupName                string `json:"ServiceLogGroupName"`
 	EC2InstanceLogGroupArn             string `json:"Ec2InstanceLogGroupArn"`
-	BucketCache                        string `json:"BucketCache"`
 }
 
 type fleetConfigSecretValue struct {
@@ -38,7 +37,6 @@ type fleetConfigSecretValue struct {
 		JobDiagnosticsResolverFunctionName string `json:"job_diagnostics_resolver_function_name"`
 		ServiceLogGroupName                string `json:"service_log_group_name"`
 		EC2InstanceLogGroup                string `json:"ec2_instance_log_group"`
-		BucketCache                        string `json:"bucket_cache"`
 	} `json:"infra"`
 }
 
@@ -130,7 +128,6 @@ func parseRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*R
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.EC2InstanceLogGroupArn),
 		WorkflowJobsTable:      strings.TrimSpace(secret.WorkflowJobsTable),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.JobDiagnosticsResolverFunctionName),
-		CacheBucket:            strings.TrimSpace(secret.BucketCache),
 		AWSConfig:              cfg,
 	}, nil
 }
@@ -148,7 +145,6 @@ func parseFleetRunsOnConfig(stackName string, cfg aws.Config, secretValue string
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.Infra.EC2InstanceLogGroup),
 		ClaimTableName:         strings.TrimSpace(secret.Infra.ClaimTableName),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.Infra.JobDiagnosticsResolverFunctionName),
-		CacheBucket:            strings.TrimSpace(secret.Infra.BucketCache),
 		AWSConfig:              cfg,
 	}, nil
 }

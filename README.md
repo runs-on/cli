@@ -10,7 +10,6 @@ Note: the CLI only works with RunsOn >= v2.6.3, and each stack must use the matc
 - [`roc connect`](#roc-connect) - Connect to GitHub Actions runner instances via SSM
 - [`roc logs`](#roc-logs) - Fetch RunsOn server and instance logs for specific jobs
 - [`roc interrupt`](#roc-interrupt) - Trigger spot interruptions for testing
-- [`roc cleanup`](#roc-cleanup) - Delete a ref's caches and sticky-disk snapshots
 - [`roc lint`](#roc-lint) - Validate and lint runs-on configuration files
 
 ### Stack Management
@@ -32,7 +31,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.5/roc_v3.1.5_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -40,7 +39,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.5/roc_v3.1.5_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -164,13 +163,11 @@ AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/ru
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --full
 ```
 
-`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, durable spot-interruption evidence, GitHub workflow job/run details, and delivery metadata when available.
+`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, GitHub workflow job/run details, and delivery metadata when available.
 
 For Fleet stacks, if the resolver cannot fetch GitHub workflow job details and local claim data is ambiguous, `roc logs` tries the local GitHub CLI (`gh`) as a fallback. Install `gh` and run `gh auth login` with repository Actions read access to enable that fallback.
 
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, agent logs for each attempted instance, and each instance's `metrics.jsonl` file when available. The time window starts five minutes before the job and ends ten minutes after it.
-
-Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error and makes the command exit nonzero after writing the archive.
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the resolved job creation timestamp, from one hour before creation through one hour after creation.
 
 `--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
@@ -219,42 +216,6 @@ AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actio
 
 # Custom delay before interruption (default is 5 seconds)
 AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --delay 30s
-```
-
-### `roc cleanup`
-
-Delete everything the RunsOn stack cached for the ref a job ran on: classic cache objects (`cache/v1/<org>/<repo>/<ref>/...`), isolated cache objects (`scoped-cache/<ownerID>/<repoID>/<scope>/...`), and sticky-disk EBS snapshots (tagged for the repo and branch scope).
-
-The refs are resolved from the job's workflow run: pull-request runs clean each associated pull request's `refs/pull/N/merge` scope; other runs clean the head ref as both a branch and a tag (the runs API records only the short name, and everything deleted is re-creatable cache data — the plan is shown for confirmation first). Repo-wide user caches under `cache/repo/<org>/<repo>` are not touched (they are not scoped to a ref).
-
-```
-Usage:
-  roc cleanup JOB_URL [flags]
-
-Flags:
-      --dry-run                  list what would be deleted without deleting anything
-  -h, --help                     help for cleanup
-      --include-default-branch   also delete caches and snapshots for the repository default branch
-      --yes                      skip the confirmation prompt
-
-Global Flags:
-      --stack string   Stack name (default "runs-on")
-```
-
-**Requirements:**
-- The GitHub CLI (`gh`) authenticated with repository read access (job metadata)
-- AWS credentials with `secretsmanager:GetSecretValue` on the stack config secret (`/runs-on/<stack>/stack-config`, or `/runs-on/<stack>/fleet-config` for Fleet stacks) — the command discovers the cache bucket and resolver from it before doing anything else
-- AWS credentials with `lambda:InvokeFunction` on the stack's job diagnostics resolver — before planning anything, the command validates that the job actually ran on the selected stack
-- AWS credentials with S3 `ListBucket`/`DeleteObject` on the stack cache bucket and EC2 `DescribeSnapshots`/`DeleteSnapshot`. Deletes are key-level: on buckets with versioning enabled, the stack's lifecycle rules expire noncurrent versions and stray delete markers within a day.
-
-Example:
-
-```bash
-# Show what would be deleted for the job's ref
-AWS_PROFILE=runs-on-admin roc cleanup https://github.com/acme/widgets/actions/runs/12415485296/job/34661958899 --dry-run
-
-# Delete the ref's caches and snapshots, plus the default branch lineage
-AWS_PROFILE=runs-on-admin roc cleanup https://github.com/acme/widgets/actions/runs/12415485296/job/34661958899 --include-default-branch --yes
 ```
 
 ### `roc lint`
@@ -336,7 +297,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.2.2  # Use the latest release tag
+    rev: v3.1.5  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
