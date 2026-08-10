@@ -2,7 +2,6 @@ package cli
 
 import (
 	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,10 +41,6 @@ func (a *archiveWriter) writeText(entryPath, text string) error {
 }
 
 func (a *archiveWriter) writeBytes(entryPath string, data []byte) error {
-	return a.writeReader(entryPath, bytes.NewReader(data))
-}
-
-func (a *archiveWriter) writeReader(entryPath string, reader io.Reader) error {
 	entryName, err := archiveEntryName(entryPath)
 	if err != nil {
 		return err
@@ -54,7 +49,7 @@ func (a *archiveWriter) writeReader(entryPath string, reader io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(fileWriter, reader)
+	_, err = fileWriter.Write(data)
 	return err
 }
 

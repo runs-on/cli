@@ -32,7 +32,7 @@ You can download the binaries for your platform (Linux, macOS) from the [Release
 Example (macOS ARM64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.4/roc_v3.1.4_darwin_arm64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -40,7 +40,7 @@ chmod a+x ./roc
 Example (Linux AMD64):
 
 ```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.1.4/roc_v3.1.4_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -164,13 +164,11 @@ AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/ru
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --full
 ```
 
-`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, durable spot-interruption evidence, GitHub workflow job/run details, and delivery metadata when available.
+`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, GitHub workflow job/run details, and delivery metadata when available.
 
 For Fleet stacks, if the resolver cannot fetch GitHub workflow job details and local claim data is ambiguous, `roc logs` tries the local GitHub CLI (`gh`) as a fallback. Install `gh` and run `gh auth login` with repository Actions read access to enable that fallback.
 
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, agent logs for each attempted instance, and each instance's `metrics.jsonl` file when available. The time window starts five minutes before the job and ends ten minutes after it.
-
-Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error and makes the command exit nonzero after writing the archive.
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, and agent logs for each attempted instance. The time window is automatically derived from the resolved job creation timestamp, from one hour before creation through one hour after creation.
 
 `--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
@@ -336,7 +334,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.2.2  # Use the latest release tag
+    rev: v3.1.4  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
