@@ -24,9 +24,7 @@ const (
 			{
 				"Effect": "Allow",
 				"Principal": {
-					"Service": [
-					  ["fis.amazonaws.com"]
-					]
+					"Service": "fis.amazonaws.com"
 				},
 				"Action": "sts:AssumeRole"
 			}

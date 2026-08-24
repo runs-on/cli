@@ -18,7 +18,7 @@ test:
 	mise exec -- go test -count=1 ./...
 
 sync-metadata:
-	@VERSION="$(VERSION)" perl -0pi -e 's{releases/download/v[0-9A-Za-z.\\-]+}{releases/download/$$ENV{VERSION}}g; s{roc_v?[0-9A-Za-z.\\-]+_(darwin|linux|windows)_(amd64|arm64)(\\.exe)?}{"roc_".$$ENV{VERSION}."_".$$1."_".$$2.($$3 // "")}ge; s{rev: v[0-9A-Za-z.\\-]+}{rev: $$ENV{VERSION}}g' README.md
+	@VERSION="$(VERSION)" MISE_VERSION="$(patsubst v%,%,$(VERSION))" perl -0pi -e 's{github:runs-on/cli\[bin=roc\]\@v?[0-9][0-9A-Za-z.\\-]*}{github:runs-on/cli[bin=roc]\@$$ENV{MISE_VERSION}}g; s{releases/download/v[0-9A-Za-z.\\-]+}{releases/download/$$ENV{VERSION}}g; s{roc_v?[0-9A-Za-z.\\-]+_(darwin|linux|windows)_(amd64|arm64)(\\.exe)?}{"roc_".$$ENV{VERSION}."_".$$1."_".$$2.($$3 // "")}ge; s{rev: v[0-9A-Za-z.\\-]+}{rev: $$ENV{VERSION}}g' README.md
 	@VERSION="$(VERSION)" perl -0pi -e 's{e\\.g\\., v[0-9A-Za-z.\\-]+}{e.g., $$ENV{VERSION}}g' action.yml
 
 version:
