@@ -25,22 +25,46 @@ Note: the CLI only works with RunsOn >= v2.6.3, and each stack must use the matc
 
 ## Installation
 
+### mise
+
+[mise](https://mise.jdx.dev/) installs CLI versions side by side. Pin the exact
+version for each stack so `roc` changes automatically when you enter its project
+directory:
+
+```bash
+mise use --pin 'github:runs-on/cli[bin=roc]@3.2.3'
+```
+
+Install the latest stable CLI as your global default:
+
+```bash
+mise use --global 'github:runs-on/cli[bin=roc]@latest'
+```
+
+Run an exact version once without changing your configuration:
+
+```bash
+mise x 'github:runs-on/cli[bin=roc]@3.2.3' -- roc version
+```
+
 ### Download Binary
 
-You can download the binaries for your platform (Linux, macOS) from the [Releases](https://github.com/runs-on/cli/releases/latest) page.
+Download the exact CLI version that matches your stack from the
+[Releases](https://github.com/runs-on/cli/releases) page.
 
 Example (macOS ARM64):
 
-```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_darwin_arm64
+```bash
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.3/roc_v3.2.3_darwin_arm64
 chmod a+x ./roc
+xattr -d com.apple.quarantine ./roc
 ./roc --help
 ```
 
 Example (Linux AMD64):
 
-```
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.2/roc_v3.2.2_linux_amd64
+```bash
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.3/roc_v3.2.3_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -336,7 +360,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.2.2  # Use the latest release tag
+    rev: v3.2.3  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
