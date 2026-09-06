@@ -200,6 +200,8 @@ Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:Ge
 
 With `--debug`, `roc logs` also reports the full resolver diagnostics before streaming logs.
 
+For slow public package downloads, use the [network diagnostics guide](docs/network-diagnostics.md) to collect bounded transfer timings and local counters before the ephemeral runner terminates, then correlate them with `roc logs --full`. The guide includes an optional Linux workflow probe; it does not add a CLI command or enable continuous network monitoring.
+
 ### `roc interrupt`
 
 Trigger a spot interruption on the instance running a specific job, simulating a spot instance interruption for testing purposes.
