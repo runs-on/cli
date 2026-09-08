@@ -33,6 +33,8 @@ type LogOptions struct {
 	NoColor       bool
 }
 
+const cloudWatchWatchReplayOverlap = time.Minute
+
 type cloudWatchLogsAPI interface {
 	FilterLogEvents(ctx context.Context, params *cloudwatchlogs.FilterLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.FilterLogEventsOutput, error)
 }
@@ -119,7 +121,16 @@ func (s *jobLogStreamer) Stream(ctx context.Context, jobID string, facts *jobFac
 			return s.collectConsoleLogs(ctx, facts, collector, opts)
 		})
 	}
-	session.startCloudWatchStream(ctx, "application", s.cwl, s.updateJobApplicationLogInput(jobID, facts, includeTypes, opts))
+	updateApplicationLogInput := s.updateJobApplicationLogInput(jobID, facts, opts)
+	if includeLogType(includeTypes, "run") {
+		session.startCloudWatchStream(ctx, "application", s.cwl, updateApplicationLogInput)
+	} else {
+		session.startFilteredCloudWatchStream(ctx, "application", s.cwl, updateApplicationLogInput, func(message string) bool {
+			return jobLogLineMatches(message, facts.jobURL(), jobID, facts.scalesetJobID(), facts.currentInstanceIDs())
+		}, func() string {
+			return jobLogCorrelationKey(facts.jobURL(), facts.scalesetJobID(), facts.currentInstanceIDs())
+		})
+	}
 
 	return session.drainAndWatch(ctx)
 }
@@ -164,23 +175,61 @@ func (s *applicationLogStreamer) ensureLogger() {
 	}
 }
 
-func jobApplicationFilterPattern(jobID string, facts *jobFactsProvider, includeTypes []string) (string, error) {
-	if includeLogType(includeTypes, "run") {
-		runID := facts.runID()
-		if runID == 0 {
-			return "", fmt.Errorf("workflow run ID for job %s not available yet", jobID)
+func jobApplicationFilterPattern(jobID string, facts *jobFactsProvider) (string, error) {
+	runID := facts.runID()
+	if runID == 0 {
+		return "", fmt.Errorf("workflow run ID for job %s not available yet", jobID)
+	}
+	return runFilterPattern(runID), nil
+}
+
+type jobLogFields struct {
+	JobURL        string          `json:"job_url"`
+	JobID         json.RawMessage `json:"job_id"`
+	WorkflowJobID json.RawMessage `json:"workflow_job_id"`
+	ScalesetJobID json.RawMessage `json:"scaleset_job_id"`
+	InstanceID    string          `json:"instance_id"`
+	Message       string          `json:"message"`
+}
+
+func jobLogLineMatches(line, jobURL, jobID, scalesetJobID string, instanceIDs []string) bool {
+	var fields jobLogFields
+	if err := json.Unmarshal([]byte(line), &fields); err != nil {
+		return (jobURL != "" && strings.Contains(line, jobURL)) || containsAny(line, instanceIDs)
+	}
+	if jobURL != "" && strings.EqualFold(strings.TrimSuffix(fields.JobURL, "/"), strings.TrimSuffix(jobURL, "/")) {
+		return true
+	}
+	for _, rawID := range []json.RawMessage{fields.JobID, fields.WorkflowJobID} {
+		if jobID != "" && strings.Trim(strings.TrimSpace(string(rawID)), `"`) == jobID {
+			return true
 		}
-		return fmt.Sprintf(`{ ( $.run_id = "%d" ) }`, runID), nil
 	}
-	terms := []string{
-		fmt.Sprintf(`( $.job_id = "%s" )`, jobID),
-		fmt.Sprintf(`( $.workflow_job_id = "%s" )`, jobID),
+	loggedScalesetJobID := strings.Trim(strings.TrimSpace(string(fields.ScalesetJobID)), `"`)
+	if loggedScalesetJobID != "" && (loggedScalesetJobID == scalesetJobID || loggedScalesetJobID == jobID) {
+		return true
 	}
-	instanceIDs := facts.currentInstanceIDs()
-	for _, attemptedInstanceID := range instanceIDs {
-		terms = append(terms, fmt.Sprintf(`( $.message = "*%s*" )`, attemptedInstanceID))
+	for _, instanceID := range instanceIDs {
+		if instanceID != "" && (fields.InstanceID == instanceID || strings.Contains(fields.Message, instanceID)) {
+			return true
+		}
 	}
-	return fmt.Sprintf("{ %s }", strings.Join(terms, " || ")), nil
+	return false
+}
+
+func containsAny(value string, candidates []string) bool {
+	for _, candidate := range candidates {
+		if candidate != "" && strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func jobLogCorrelationKey(jobURL, scalesetJobID string, instanceIDs []string) string {
+	identifiers := append([]string{jobURL, scalesetJobID}, instanceIDs...)
+	sort.Strings(identifiers)
+	return strings.Join(identifiers, "\x00")
 }
 
 func includeLogType(includeTypes []string, includeType string) bool {
@@ -294,14 +343,18 @@ func newStreamedLogSession(opts *LogOptions, logger *log.Logger) *streamedLogSes
 }
 
 func (s *streamedLogSession) startCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) {
-	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, true)
+	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, nil, nil, 0, true)
+}
+
+func (s *streamedLogSession) startFilteredCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string) {
+	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, accept, correlationKey, cloudWatchWatchReplayOverlap, true)
 }
 
 func (s *streamedLogSession) startLiveCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) {
-	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, false)
+	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, nil, nil, 0, false)
 }
 
-func (s *streamedLogSession) startCloudWatchStreamWithInitialWait(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, waitForFirstPass bool) {
+func (s *streamedLogSession) startCloudWatchStreamWithInitialWait(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string, watchReplayOverlap time.Duration, waitForFirstPass bool) {
 	if waitForFirstPass {
 		s.collector.wg.Add(1)
 	}
@@ -311,7 +364,7 @@ func (s *streamedLogSession) startCloudWatchStreamWithInitialWait(ctx context.Co
 		}
 	})
 	go func() {
-		if err := s.streamCloudWatchLogs(ctx, prefix, cwl, updateInput, markPastEventsCollected); err != nil {
+		if err := s.streamCloudWatchLogs(ctx, prefix, cwl, updateInput, accept, correlationKey, watchReplayOverlap, markPastEventsCollected); err != nil {
 			s.logger.Printf("Error streaming %s logs: %v", prefix, err)
 		}
 	}()
@@ -325,13 +378,26 @@ func (s *streamedLogSession) startOnce(prefix string, collect func(*logCollector
 	})
 }
 
-func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, markPastEventsCollected func()) error {
+func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string, watchReplayOverlap time.Duration, markPastEventsCollected func()) error {
 	input := &cloudwatchlogs.FilterLogEventsInput{}
+	lastCorrelationKey := ""
+	if correlationKey != nil {
+		lastCorrelationKey = correlationKey()
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
 			markPastEventsCollected()
 			return err
+		}
+		if correlationKey != nil {
+			currentCorrelationKey := correlationKey()
+			if currentCorrelationKey != lastCorrelationKey {
+				// Replay the original window when a queued Fleet job gains correlation
+				// identifiers. The collector suppresses events already shown.
+				input.StartTime = nil
+				lastCorrelationKey = currentCorrelationKey
+			}
 		}
 		if err := updateInput(input); err != nil {
 			s.logger.Printf("[%s]: Cannot stream logs: %v", prefix, err)
@@ -357,8 +423,15 @@ func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix st
 				}
 
 				for i, event := range output.Events {
+					message := aws.ToString(event.Message)
+					if event.Timestamp != nil && *event.Timestamp > lastTimestamp {
+						lastTimestamp = *event.Timestamp
+					}
+					if accept != nil && !accept(message) {
+						continue
+					}
 					s.collector.add(logEvent{
-						message:   aws.ToString(event.Message),
+						message:   message,
 						prefix:    prefix,
 						stream:    aws.ToString(event.LogStreamName),
 						timestamp: aws.ToInt64(event.Timestamp),
@@ -366,18 +439,24 @@ func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix st
 						noColor:   s.opts.NoColor,
 					})
 
-					if event.Timestamp != nil && *event.Timestamp > lastTimestamp {
-						lastTimestamp = *event.Timestamp
-					}
 					s.logger.Printf("[%s]: %d: Last timestamp: %d", prefix, i, lastTimestamp)
 				}
 				s.logger.Printf("[%s]: Done fetching page", prefix)
 			}
 
 			if lastTimestamp > 0 {
-				input.StartTime = aws.Int64(lastTimestamp + 1)
+				nextStartTime := lastTimestamp + 1
+				if s.opts.Watch && watchReplayOverlap > 0 {
+					nextStartTime = max(lastTimestamp-watchReplayOverlap.Milliseconds(), s.opts.StartTime)
+				}
+				input.StartTime = aws.Int64(nextStartTime)
 			} else {
-				input.StartTime = aws.Int64(time.Now().UnixMilli() - 1000)
+				lookback := time.Second
+				if s.opts.Watch && watchReplayOverlap > 0 {
+					lookback = watchReplayOverlap
+				}
+				nextStartTime := max(time.Now().UnixMilli()-lookback.Milliseconds(), s.opts.StartTime)
+				input.StartTime = aws.Int64(nextStartTime)
 			}
 			s.logger.Printf("[%s]: Updated start time: %d", prefix, *input.StartTime)
 		}
@@ -557,10 +636,10 @@ func (s *jobLogStreamer) collectConsoleLogs(ctx context.Context, facts *jobFacts
 	return nil
 }
 
-func (s *jobLogStreamer) updateJobApplicationLogInput(jobID string, facts *jobFactsProvider, includeTypes []string, opts *LogOptions) func(*cloudwatchlogs.FilterLogEventsInput) error {
+func (s *jobLogStreamer) updateJobApplicationLogInput(jobID string, facts *jobFactsProvider, opts *LogOptions) func(*cloudwatchlogs.FilterLogEventsInput) error {
 	return updateApplicationLogInput(s.outputs, func(input *cloudwatchlogs.FilterLogEventsInput) error {
 		applyLogTimeBounds(input, opts)
-		filterPattern, err := jobApplicationFilterPattern(jobID, facts, includeTypes)
+		filterPattern, err := jobApplicationFilterPattern(jobID, facts)
 		if err != nil {
 			return err
 		}

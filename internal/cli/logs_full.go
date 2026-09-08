@@ -153,25 +153,37 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	}
 
 	jobLogsPath := fmt.Sprintf("server/job-%s.jsonl", parsedJobID)
-	if err := f.writeCloudWatchMessages(ctx, archive, jobLogsPath, cloudWatchLogRequest{
-		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
-		FilterPattern:      fullJobFilterPattern(parsedJobID, facts.RunID, instanceIDs),
-		StartTime:          window.Start,
-		EndTime:            window.End,
-	}); err != nil {
-		addArtifactError(jobLogsPath, err)
-	}
-
 	runLogsPath := fmt.Sprintf("server/run-%d.jsonl", facts.RunID)
 	if facts.RunID == 0 {
-		addArtifactError(runLogsPath, fmt.Errorf("workflow run ID for job %s is not available", parsedJobID))
-	} else if err := f.writeCloudWatchMessages(ctx, archive, runLogsPath, cloudWatchLogRequest{
-		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
-		FilterPattern:      runFilterPattern(facts.RunID),
-		StartTime:          window.Start,
-		EndTime:            window.End,
-	}); err != nil {
+		err := fmt.Errorf("workflow run ID for job %s is not available", parsedJobID)
 		addArtifactError(runLogsPath, err)
+		addArtifactError(jobLogsPath, err)
+	} else {
+		runLogs, err := f.fetchCloudWatchMessages(ctx, cloudWatchLogRequest{
+			LogGroupIdentifier: f.outputs.ServiceLogGroupName,
+			FilterPattern:      runFilterPattern(facts.RunID),
+			StartTime:          window.Start,
+			EndTime:            window.End,
+		})
+		if err != nil {
+			addArtifactError(runLogsPath, err)
+			addArtifactError(jobLogsPath, err)
+		} else {
+			if err := archive.writeBytes(runLogsPath, runLogs); err != nil {
+				addArtifactError(runLogsPath, err)
+			}
+			jobURL := strings.TrimSpace(diagnostics.Request.JobURL)
+			if diagnostics.GitHub.WorkflowJob != nil && strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL) != "" {
+				jobURL = strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL)
+			}
+			scalesetJobID := ""
+			if diagnostics.Local != nil {
+				scalesetJobID = strings.TrimSpace(diagnostics.Local.ScalesetJobID)
+			}
+			if err := archive.writeBytes(jobLogsPath, filterJobLogLines(runLogs, jobURL, parsedJobID, scalesetJobID, instanceIDs)); err != nil {
+				addArtifactError(jobLogsPath, err)
+			}
+		}
 	}
 
 	for _, instanceID := range instanceIDs {
@@ -405,22 +417,20 @@ func (f *fullLogExporter) resolveJobDiagnostics(ctx context.Context, jobID strin
 	return diagnostics, nil
 }
 
-func fullJobFilterPattern(jobID string, runID int64, instanceIDs []string) string {
-	terms := []string{
-		fmt.Sprintf(`( $.job_id = "%s" )`, jobID),
-		fmt.Sprintf(`( $.workflow_job_id = "%s" )`, jobID),
-	}
-	if runID != 0 {
-		terms = append(terms, fmt.Sprintf(`( $.run_id = "%d" )`, runID))
-	}
-	for _, instanceID := range instanceIDs {
-		terms = append(terms, fmt.Sprintf(`( $.message = "*%s*" )`, instanceID))
-	}
-	return fmt.Sprintf("{ %s }", strings.Join(terms, " || "))
+func runFilterPattern(runID int64) string {
+	return fmt.Sprintf(`{ ( $.run_id = %d ) || ( $.run_id = "%d" ) }`, runID, runID)
 }
 
-func runFilterPattern(runID int64) string {
-	return fmt.Sprintf(`{ ( $.run_id = "%d" ) }`, runID)
+func filterJobLogLines(data []byte, jobURL, jobID, scalesetJobID string, instanceIDs []string) []byte {
+	var filtered bytes.Buffer
+	for line := range bytes.SplitSeq(data, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 || !jobLogLineMatches(string(line), jobURL, jobID, scalesetJobID, instanceIDs) {
+			continue
+		}
+		filtered.Write(line)
+		filtered.WriteByte('\n')
+	}
+	return filtered.Bytes()
 }
 
 type cloudWatchLogRequest struct {
@@ -432,8 +442,16 @@ type cloudWatchLogRequest struct {
 }
 
 func (f *fullLogExporter) writeCloudWatchMessages(ctx context.Context, archive *archiveWriter, path string, request cloudWatchLogRequest) error {
+	data, err := f.fetchCloudWatchMessages(ctx, request)
+	if err != nil {
+		return err
+	}
+	return archive.writeBytes(path, data)
+}
+
+func (f *fullLogExporter) fetchCloudWatchMessages(ctx context.Context, request cloudWatchLogRequest) ([]byte, error) {
 	if strings.TrimSpace(request.LogGroupIdentifier) == "" {
-		return fmt.Errorf("CloudWatch log group is not configured")
+		return nil, fmt.Errorf("CloudWatch log group is not configured")
 	}
 
 	input := &cloudwatchlogs.FilterLogEventsInput{
@@ -453,7 +471,7 @@ func (f *fullLogExporter) writeCloudWatchMessages(ctx context.Context, archive *
 	for paginator.HasMorePages() {
 		output, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("fetch CloudWatch logs: %w", err)
+			return nil, fmt.Errorf("fetch CloudWatch logs: %w", err)
 		}
 		for _, event := range output.Events {
 			message := aws.ToString(event.Message)
@@ -467,7 +485,7 @@ func (f *fullLogExporter) writeCloudWatchMessages(ctx context.Context, archive *
 		}
 	}
 
-	return archive.writeBytes(path, buf.Bytes())
+	return buf.Bytes(), nil
 }
 
 func (f *fullLogExporter) writeCloudTrailEvents(ctx context.Context, archive *archiveWriter, path, instanceID string, start, end time.Time) error {
