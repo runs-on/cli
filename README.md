@@ -32,7 +32,7 @@ version for each stack so `roc` changes automatically when you enter its project
 directory:
 
 ```bash
-mise use --pin 'github:runs-on/cli[bin=roc]@3.2.3'
+mise use --pin 'github:runs-on/cli[bin=roc]@3.3.0'
 ```
 
 Install the latest stable CLI as your global default:
@@ -44,7 +44,7 @@ mise use --global 'github:runs-on/cli[bin=roc]@latest'
 Run an exact version once without changing your configuration:
 
 ```bash
-mise x 'github:runs-on/cli[bin=roc]@3.2.3' -- roc version
+mise x 'github:runs-on/cli[bin=roc]@3.3.0' -- roc version
 ```
 
 ### Download Binary
@@ -55,7 +55,7 @@ Download the exact CLI version that matches your stack from the
 Example (macOS ARM64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.3/roc_v3.2.3_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.3.0/roc_v3.3.0_darwin_arm64
 chmod a+x ./roc
 xattr -d com.apple.quarantine ./roc
 ./roc --help
@@ -64,7 +64,7 @@ xattr -d com.apple.quarantine ./roc
 Example (Linux AMD64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.2.3/roc_v3.2.3_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.3.0/roc_v3.3.0_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -192,7 +192,9 @@ AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/ru
 
 For Fleet stacks, if the resolver cannot fetch GitHub workflow job details and local claim data is ambiguous, `roc logs` tries the local GitHub CLI (`gh`) as a fallback. Install `gh` and run `gh auth login` with repository Actions read access to enable that fallback.
 
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, RunsOn server logs for the job ID and run ID, CloudTrail events for each attempted instance, EC2 console output for each attempted instance, agent logs for each attempted instance, and each instance's `metrics.jsonl` file when available. The time window starts five minutes before the job and ends ten minutes after it.
+`roc logs` fetches RunsOn server logs by workflow run ID. By default, it filters those lines locally to the selected job URL and its resolved job and instance identifiers. Use `--include=run` to show every server log line for the run.
+
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, all RunsOn server logs for the incident window in `server/ecs.jsonl`, run-scoped server logs in `server/run-<run_id>.jsonl`, and the client-filtered job subset in `server/job-<job_id>.jsonl`. It also contains CloudTrail events, EC2 console output, agent logs, and `metrics.jsonl` when available for each attempted instance. The time window starts five minutes before the job and ends ten minutes after it.
 
 Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error and makes the command exit nonzero after writing the archive.
 
@@ -360,7 +362,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.2.3  # Use the latest release tag
+    rev: v3.3.0  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```

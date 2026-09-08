@@ -28,20 +28,30 @@ type mockCloudWatchLogsClient struct {
 	mu      sync.Mutex
 	inputs  []*cloudwatchlogs.FilterLogEventsInput
 	onInput func(*cloudwatchlogs.FilterLogEventsInput)
+	output  func(*cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error)
 }
 
 func (m *mockCloudWatchLogsClient) FilterLogEvents(ctx context.Context, params *cloudwatchlogs.FilterLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.FilterLogEventsOutput, error) {
 	m.mu.Lock()
 	m.inputs = append(m.inputs, cloneFilterLogEventsInput(params))
 	onInput := m.onInput
+	output := m.output
 	m.mu.Unlock()
 
 	if onInput != nil {
 		onInput(params)
 	}
+	if output != nil {
+		return output(params)
+	}
 	message := "server"
 	if strings.Contains(aws.ToString(params.FilterPattern), "$.run_id") {
-		message = "run"
+		return &cloudwatchlogs.FilterLogEventsOutput{
+			Events: []cwltypes.FilteredLogEvent{
+				{Message: aws.String(`{"run_id":1234,"job_url":"https://github.com/runs-on/server/actions/runs/1234/job/42","job_id":42,"message":"target"}`), Timestamp: aws.Int64(123), EventId: aws.String("target-event"), LogStreamName: aws.String("run-stream")},
+				{Message: aws.String(`{"run_id":1234,"job_url":"https://github.com/runs-on/server/actions/runs/1234/job/43","job_id":43,"message":"other"}`), Timestamp: aws.Int64(124), EventId: aws.String("other-event"), LogStreamName: aws.String("run-stream")},
+			},
+		}, nil
 	}
 	if aws.ToString(params.LogStreamNamePrefix) != "" {
 		message = "agent"
@@ -187,14 +197,17 @@ func TestWorkflowJobAttemptedInstanceIDsPreservesAttemptOrder(t *testing.T) {
 }
 
 func TestFullLogFilterPatterns(t *testing.T) {
-	jobPattern := fullJobFilterPattern("42", 1234, []string{"i-1", "i-2"})
-	for _, want := range []string{`$.job_id = "42"`, `$.workflow_job_id = "42"`, `$.run_id = "1234"`, `$.message = "*i-1*"`, `$.message = "*i-2*"`} {
-		if !strings.Contains(jobPattern, want) {
-			t.Fatalf("expected job filter pattern %q to contain %q", jobPattern, want)
-		}
-	}
 	if got := runFilterPattern(1234); !strings.Contains(got, `$.run_id = "1234"`) {
 		t.Fatalf("expected run filter, got %q", got)
+	}
+}
+
+func TestFilterJobLogLinesKeepsFleetIdentityWithoutJobURL(t *testing.T) {
+	data := []byte("{\"run_id\":1234,\"scaleset_job_id\":\"fleet-job-opaque\",\"message\":\"Fleet job started\"}\n" +
+		"{\"run_id\":1234,\"scaleset_job_id\":\"43\",\"message\":\"Fleet job started\"}\n")
+	got := string(filterJobLogLines(data, "https://github.com/runs-on/server/actions/runs/1234/job/42", "42", "fleet-job-opaque", nil))
+	if !strings.Contains(got, `"scaleset_job_id":"fleet-job-opaque"`) || strings.Contains(got, `"scaleset_job_id":"43"`) {
+		t.Fatalf("unexpected Fleet job log subset: %q", got)
 	}
 }
 
@@ -305,12 +318,18 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	if files["instances/i-active/metrics.jsonl"] != "{\"cpu\":42}\n" {
 		t.Fatalf("unexpected metrics content: %q", files["instances/i-active/metrics.jsonl"])
 	}
+	if files["server/job-42.jsonl"] != "{\"run_id\":1234,\"job_url\":\"https://github.com/runs-on/server/actions/runs/1234/job/42\",\"job_id\":42,\"message\":\"target\"}\n" {
+		t.Fatalf("job logs unexpectedly contain run-wide logs: %q", files["server/job-42.jsonl"])
+	}
+	if !strings.Contains(files["server/run-1234.jsonl"], `"message":"target"`) || !strings.Contains(files["server/run-1234.jsonl"], `"message":"other"`) {
+		t.Fatalf("unexpected run logs: %q", files["server/run-1234.jsonl"])
+	}
 	if _, ok := files["instances/i-old/metrics.jsonl"]; ok {
 		t.Fatal("did not expect an archive entry when metrics are absent")
 	}
 
-	if len(cwl.inputs) != 6 {
-		t.Fatalf("expected ecs, job, run, and 3 agent CloudWatch fetches, got %d", len(cwl.inputs))
+	if len(cwl.inputs) != 5 {
+		t.Fatalf("expected ecs, run, and 3 agent CloudWatch fetches, got %d", len(cwl.inputs))
 	}
 	if got := aws.ToString(cwl.inputs[0].FilterPattern); got != "" {
 		t.Fatalf("expected ECS server logs to use empty filter pattern, got %q", got)
@@ -320,6 +339,9 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	}
 	if got := aws.ToInt64(cwl.inputs[0].EndTime); got != completedAt.Add(10*time.Minute).UnixMilli() {
 		t.Fatalf("expected derived CloudWatch end time, got %d", got)
+	}
+	if got := aws.ToString(cwl.inputs[1].FilterPattern); got != runFilterPattern(1234) {
+		t.Fatalf("expected the only scoped server fetch to use run ID, got %q", got)
 	}
 	if len(trail.inputs) != 3 {
 		t.Fatalf("expected CloudTrail lookup per instance, got %d", len(trail.inputs))

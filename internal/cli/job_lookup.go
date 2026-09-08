@@ -394,6 +394,25 @@ func (p *jobFactsProvider) currentInstanceIDs() []string {
 	return jobFactsInstanceIDs(facts)
 }
 
+func (p *jobFactsProvider) jobURL() string {
+	if diagnostics := p.currentDiagnostics(); diagnostics != nil {
+		if diagnostics.GitHub.WorkflowJob != nil && strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL) != "" {
+			return strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL)
+		}
+		if strings.TrimSpace(diagnostics.Request.JobURL) != "" {
+			return strings.TrimSpace(diagnostics.Request.JobURL)
+		}
+	}
+	return strings.TrimSpace(p.jobRef)
+}
+
+func (p *jobFactsProvider) scalesetJobID() string {
+	if diagnostics := p.currentDiagnostics(); diagnostics != nil && diagnostics.Local != nil {
+		return strings.TrimSpace(diagnostics.Local.ScalesetJobID)
+	}
+	return ""
+}
+
 func (p *jobFactsProvider) runID() int64 {
 	facts := p.current()
 	if facts != nil && facts.RunID != 0 {
