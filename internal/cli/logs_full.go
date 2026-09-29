@@ -49,16 +49,12 @@ type fullArtifactError struct {
 }
 
 type fullLogExporter struct {
-	cwl         cloudWatchLogsAPI
-	resolver    *jobDiagnosticsResolver
-	ec2         ec2ConsoleAPI
-	cloudtrail  cloudTrailLookupAPI
-	s3          metricsS3API
-	outputs     *StackOutputs
-	cacheBucket string
-	stackName   string
-	product     string
-	region      string
+	cwl        cloudWatchLogsAPI
+	resolver   *jobDiagnosticsResolver
+	ec2        ec2ConsoleAPI
+	cloudtrail cloudTrailLookupAPI
+	s3         metricsS3API
+	config     *RunsOnConfig
 }
 
 type cloudTrailLookupAPI interface {
@@ -72,48 +68,40 @@ type metricsS3API interface {
 
 func newFullLogExporter(config *RunsOnConfig) *fullLogExporter {
 	return &fullLogExporter{
-		cwl:         cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		resolver:    newJobDiagnosticsResolver(config),
-		ec2:         ec2.NewFromConfig(config.AWSConfig),
-		cloudtrail:  cloudtrail.NewFromConfig(config.AWSConfig),
-		s3:          s3.NewFromConfig(config.AWSConfig),
-		cacheBucket: config.CacheBucket,
-		stackName:   config.StackName,
-		product:     config.Product,
-		region:      config.AWSConfig.Region,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    config.ServiceLogGroupName,
-			EC2InstanceLogGroupArn: config.EC2InstanceLogGroupArn,
-		},
+		cwl:        cloudwatchlogs.NewFromConfig(config.AWSConfig),
+		resolver:   newJobDiagnosticsResolver(config),
+		ec2:        ec2.NewFromConfig(config.AWSConfig),
+		cloudtrail: cloudtrail.NewFromConfig(config.AWSConfig),
+		s3:         s3.NewFromConfig(config.AWSConfig),
+		config:     config,
 	}
 }
 
-func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, error) {
-	request, err := buildJobDiagnosticsRequest(jobID)
+func (f *fullLogExporter) Export(ctx context.Context, job parsedGitHubJobURL) (string, error) {
+	request := buildJobDiagnosticsRequest(job)
+	// Only the archive records webhook delivery metadata.
+	request.IncludeDeliveryMetadata = true
+	diagnostics, err := f.resolver.resolveRequest(ctx, request)
 	if err != nil {
 		return "", err
 	}
-	diagnostics, err := f.resolveJobDiagnostics(ctx, jobID)
-	if err != nil {
+	if err := diagnostics.validateStackProduct(f.config.Product, f.config.StackName, job.JobID); err != nil {
 		return "", err
 	}
-	if diagnostics.Local == nil && diagnostics.GitHub.WorkflowJob == nil {
-		return "", fmt.Errorf("job %s not found", jobID)
-	}
-	facts := diagnostics.workflowFacts(parsedJobIDOrZero(extractJobID(jobID)))
-	if facts == nil {
-		return "", fmt.Errorf("job %s not found", jobID)
+	facts := diagnostics.jobFacts(job)
+	if !facts.Found {
+		return "", fmt.Errorf("job %s not found", job.URL)
 	}
 	metricsRequest := canonicalMetricsRequest(diagnostics, request)
 
-	window, err := facts.fullLogWindow()
+	window, err := facts.fullLogWindow(job.JobID)
 	if err != nil {
 		return "", err
 	}
-	instanceIDs := facts.AttemptedInstanceIDs
-	parsedJobID := strconv.FormatInt(facts.JobID, 10)
+	instanceIDs := facts.InstanceIDs
+	jobID := strconv.FormatInt(job.JobID, 10)
 
-	zipPath := fmt.Sprintf("roc-logs-%s-%s.zip", parsedJobID, time.Now().Format("2006-01-02-15-04-05"))
+	zipPath := fmt.Sprintf("roc-logs-%s-%s.zip", jobID, time.Now().Format("2006-01-02-15-04-05"))
 
 	archive, err := newArchiveWriter(zipPath)
 	if err != nil {
@@ -130,11 +118,14 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 		_ = archive.writeJSON(errorPathFor(artifactPath), map[string]string{"error": err.Error()})
 	}
 
-	jobRecordPath := fmt.Sprintf("dynamodb/job-%s.ddb.json", parsedJobID)
-	if data, err := facts.rawDynamoDBItemJSON(); err != nil {
-		addArtifactError(jobRecordPath, err)
-	} else if err := archive.writeBytes(jobRecordPath, prettyJSON(data)); err != nil {
-		addArtifactError(jobRecordPath, err)
+	// The resolver's local job (Flex) or claim (Fleet) record.
+	localRecordPath := "diagnostics/local-record.json"
+	localRecord := []byte("{}")
+	if diagnostics.Local != nil && len(diagnostics.Local.Record) > 0 {
+		localRecord = diagnostics.Local.Record
+	}
+	if err := archive.writeBytes(localRecordPath, prettyJSON(localRecord)); err != nil {
+		addArtifactError(localRecordPath, err)
 	}
 
 	if len(diagnostics.raw) > 0 {
@@ -145,22 +136,22 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 
 	ecsLogsPath := "server/ecs.jsonl"
 	if err := f.writeCloudWatchMessages(ctx, archive, ecsLogsPath, cloudWatchLogRequest{
-		LogGroupIdentifier: f.outputs.ServiceLogGroupName,
+		LogGroupIdentifier: f.config.ServiceLogGroupName,
 		StartTime:          window.Start,
 		EndTime:            window.End,
 	}); err != nil {
 		addArtifactError(ecsLogsPath, err)
 	}
 
-	jobLogsPath := fmt.Sprintf("server/job-%s.jsonl", parsedJobID)
+	jobLogsPath := fmt.Sprintf("server/job-%s.jsonl", jobID)
 	runLogsPath := fmt.Sprintf("server/run-%d.jsonl", facts.RunID)
 	if facts.RunID == 0 {
-		err := fmt.Errorf("workflow run ID for job %s is not available", parsedJobID)
+		err := fmt.Errorf("workflow run ID for job %s is not available", jobID)
 		addArtifactError(runLogsPath, err)
 		addArtifactError(jobLogsPath, err)
 	} else {
 		runLogs, err := f.fetchCloudWatchMessages(ctx, cloudWatchLogRequest{
-			LogGroupIdentifier: f.outputs.ServiceLogGroupName,
+			LogGroupIdentifier: f.config.ServiceLogGroupName,
 			FilterPattern:      runFilterPattern(facts.RunID),
 			StartTime:          window.Start,
 			EndTime:            window.End,
@@ -172,15 +163,7 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 			if err := archive.writeBytes(runLogsPath, runLogs); err != nil {
 				addArtifactError(runLogsPath, err)
 			}
-			jobURL := strings.TrimSpace(diagnostics.Request.JobURL)
-			if diagnostics.GitHub.WorkflowJob != nil && strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL) != "" {
-				jobURL = strings.TrimSpace(diagnostics.GitHub.WorkflowJob.HTMLURL)
-			}
-			scalesetJobID := ""
-			if diagnostics.Local != nil {
-				scalesetJobID = strings.TrimSpace(diagnostics.Local.ScalesetJobID)
-			}
-			if err := archive.writeBytes(jobLogsPath, filterJobLogLines(runLogs, jobURL, parsedJobID, scalesetJobID, instanceIDs)); err != nil {
+			if err := archive.writeBytes(jobLogsPath, filterJobLogLines(runLogs, facts.JobURL, jobID, facts.ScalesetJobID, instanceIDs)); err != nil {
 				addArtifactError(jobLogsPath, err)
 			}
 		}
@@ -200,7 +183,7 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 
 		agentPath := path.Join(instanceDir, "agent.jsonl")
 		if err := f.writeCloudWatchMessages(ctx, archive, agentPath, cloudWatchLogRequest{
-			LogGroupIdentifier:  f.outputs.EC2InstanceLogGroupArn,
+			LogGroupIdentifier:  f.config.EC2InstanceLogGroupArn,
 			LogStreamNamePrefix: fmt.Sprintf("%s/", instanceID),
 			StartTime:           window.Start,
 			EndTime:             window.End,
@@ -214,9 +197,9 @@ func (f *fullLogExporter) Export(ctx context.Context, jobID string) (string, err
 	}
 
 	manifest := fullLogManifest{
-		StackName:          f.stackName,
-		Region:             f.region,
-		JobID:              facts.JobID,
+		StackName:          f.config.StackName,
+		Region:             f.config.AWSConfig.Region,
+		JobID:              job.JobID,
 		RunID:              facts.RunID,
 		JobStart:           window.JobStart.UTC(),
 		JobEnd:             window.JobEnd.UTC(),
@@ -302,13 +285,13 @@ func repositoryFromGitHubURL(input string) (string, string, bool) {
 }
 
 func (f *fullLogExporter) writeMetricsFiles(ctx context.Context, archive *archiveWriter, request jobDiagnosticsRequest, runID int64, instanceIDs []string) []fullArtifactError {
-	if f.s3 == nil || strings.TrimSpace(f.cacheBucket) == "" || strings.TrimSpace(request.Owner) == "" || strings.TrimSpace(request.Repo) == "" || runID == 0 || len(instanceIDs) == 0 {
+	if f.s3 == nil || strings.TrimSpace(f.config.CacheBucket) == "" || strings.TrimSpace(request.Owner) == "" || strings.TrimSpace(request.Repo) == "" || runID == 0 || len(instanceIDs) == 0 {
 		return nil
 	}
 
 	prefix := fmt.Sprintf("cache/metrics/v1/%s/%s/%d/", request.Owner, request.Repo, runID)
 	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(f.cacheBucket),
+		Bucket: aws.String(f.config.CacheBucket),
 		Prefix: aws.String(prefix),
 	}
 	paginator := s3.NewListObjectsV2Paginator(f.s3, input)
@@ -347,7 +330,7 @@ func (f *fullLogExporter) writeMetricsFiles(ctx context.Context, archive *archiv
 		}
 		artifactPath := path.Join("instances", instanceID, "metrics.jsonl")
 		output, err := f.s3.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(f.cacheBucket),
+			Bucket: aws.String(f.config.CacheBucket),
 			Key:    aws.String(key),
 		})
 		if err != nil {
@@ -376,21 +359,17 @@ type fullLogWindow struct {
 	End            time.Time
 }
 
-func (f *workflowJobFacts) fullLogWindow() (fullLogWindow, error) {
-	createdAt, err := f.createdAtOrError()
-	if err != nil {
-		return fullLogWindow{}, err
+func (f *workflowJobFacts) fullLogWindow(jobID int64) (fullLogWindow, error) {
+	createdAt := f.CreatedAt
+	if createdAt.IsZero() {
+		return fullLogWindow{}, fmt.Errorf("workflow job %d has no usable created_at or created_at_unix timestamp", jobID)
 	}
 
 	jobEnd := f.CompletedAt
 	jobEndSource := f.CompletedAtSource
 	if jobEnd.IsZero() {
 		jobEnd = createdAt.Add(fullLogDefaultJobDuration)
-		jobEndSource = strings.TrimSpace(f.CreatedAtSource)
-		if jobEndSource == "" {
-			jobEndSource = "created_at"
-		}
-		jobEndSource += "+30m"
+		jobEndSource = f.CreatedAtSource + "+30m"
 	}
 
 	return fullLogWindow{
@@ -401,20 +380,6 @@ func (f *workflowJobFacts) fullLogWindow() (fullLogWindow, error) {
 		Start:          createdAt.Add(-fullLogWindowBefore).UTC(),
 		End:            jobEnd.Add(fullLogWindowAfter).UTC(),
 	}, nil
-}
-
-func (f *fullLogExporter) resolveJobDiagnostics(ctx context.Context, jobID string) (*jobDiagnosticsResponse, error) {
-	if f.resolver == nil {
-		return nil, fmt.Errorf("job diagnostics resolver is required")
-	}
-	diagnostics, err := f.resolver.Resolve(ctx, jobID)
-	if err != nil {
-		return nil, err
-	}
-	if err := diagnostics.validateStackProduct(f.product, f.stackName, parsedJobIDOrZero(extractJobID(jobID))); err != nil {
-		return nil, err
-	}
-	return diagnostics, nil
 }
 
 func runFilterPattern(runID int64) string {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,88 +56,54 @@ func writeRunsOnConfig(t *testing.T, dir, content string) string {
 	return path
 }
 
-func captureStdout(t *testing.T, fn func() error) (string, error) {
-	t.Helper()
-
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("Failed to capture stdout: %v", err)
-	}
-	os.Stdout = w
-
-	fnErr := fn()
-
-	if err := w.Close(); err != nil {
-		os.Stdout = oldStdout
-		t.Fatalf("Failed to close stdout writer: %v", err)
-	}
-	os.Stdout = oldStdout
-
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("Failed to close stdout reader: %v", err)
-	}
-
-	return buf.String(), fnErr
+// lintJSONReport decodes `--format json` output: a single file's report, or
+// (via Files) the all-files report. It is declared independently of the
+// production structs so a renamed output field fails the tests.
+type lintJSONReport struct {
+	Path        string `json:"path"`
+	Valid       bool   `json:"valid"`
+	Diagnostics []struct {
+		Message  string `json:"message"`
+		Severity string `json:"severity"`
+	} `json:"diagnostics"`
+	Files []lintJSONReport `json:"files"`
 }
 
-func withStdin(t *testing.T, input string, fn func() error) error {
-	t.Helper()
-
-	stdinFile := filepath.Join(t.TempDir(), "stdin.yml")
-	if err := os.WriteFile(stdinFile, []byte(input), 0644); err != nil {
-		t.Fatalf("Failed to write stdin fixture: %v", err)
-	}
-
-	f, err := os.Open(stdinFile)
-	if err != nil {
-		t.Fatalf("Failed to open stdin fixture: %v", err)
-	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			t.Fatalf("Failed to close stdin fixture: %v", err)
-		}
-	}()
-
-	oldStdin := os.Stdin
-	os.Stdin = f
-	defer func() {
-		os.Stdin = oldStdin
-	}()
-
-	return fn()
+// lintSARIFReport decodes the `--format sarif` fields the tests assert on.
+type lintSARIFReport struct {
+	Version string `json:"version"`
+	Runs    []struct {
+		Results []struct {
+			Level   string `json:"level"`
+			Message struct {
+				Text string `json:"text"`
+			} `json:"message"`
+			Locations []struct {
+				PhysicalLocation struct {
+					URI string `json:"uri"`
+				} `json:"physicalLocation"`
+			} `json:"locations"`
+		} `json:"results"`
+	} `json:"runs"`
 }
 
-func withWorkingDir(t *testing.T, dir string, fn func()) {
+func decodeLintOutput[T any](t *testing.T, output string) T {
 	t.Helper()
 
-	oldWd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Failed to get working directory: %v", err)
+	var report T
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("Failed to parse output %q: %v", output, err)
 	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Failed to change working directory: %v", err)
-	}
-	defer func() {
-		if err := os.Chdir(oldWd); err != nil {
-			t.Fatalf("Failed to restore working directory: %v", err)
-		}
-	}()
-
-	fn()
+	return report
 }
 
 func TestLintFile_ValidFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	validFile := writeRunsOnConfig(t, tmpDir, validLintYAML)
 
-	output, err := captureStdout(t, func() error {
-		return lintFile(context.Background(), validFile, "text")
-	})
+	var out bytes.Buffer
+	err := lintFile(context.Background(), &out, validFile, "text")
+	output := out.String()
 
 	if err != nil {
 		t.Errorf("lintFile returned error for valid file: %v", err)
@@ -151,9 +118,9 @@ func TestLintFile_InvalidFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	invalidFile := writeRunsOnConfig(t, tmpDir, invalidLintYAML)
 
-	output, err := captureStdout(t, func() error {
-		return lintFile(context.Background(), invalidFile, "text")
-	})
+	var out bytes.Buffer
+	err := lintFile(context.Background(), &out, invalidFile, "text")
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
@@ -169,7 +136,7 @@ func TestLintFile_InvalidFile(t *testing.T) {
 
 func TestLintFile_NonexistentFile(t *testing.T) {
 	ctx := context.Background()
-	err := lintFile(ctx, "/nonexistent/file.yml", "text")
+	err := lintFile(ctx, io.Discard, "/nonexistent/file.yml", "text")
 
 	if err == nil {
 		t.Error("Expected error for nonexistent file")
@@ -181,11 +148,9 @@ func TestLintFile_NonexistentFile(t *testing.T) {
 }
 
 func TestLintStdin_ValidInput(t *testing.T) {
-	output, err := captureStdout(t, func() error {
-		return withStdin(t, validLintYAML, func() error {
-			return lintStdin(context.Background(), "text")
-		})
-	})
+	var out bytes.Buffer
+	err := lintStdin(context.Background(), strings.NewReader(validLintYAML), &out, "text")
+	output := out.String()
 
 	if err != nil {
 		t.Errorf("lintStdin returned error for valid input: %v", err)
@@ -197,11 +162,9 @@ func TestLintStdin_ValidInput(t *testing.T) {
 }
 
 func TestLintStdin_InvalidInput(t *testing.T) {
-	output, err := captureStdout(t, func() error {
-		return withStdin(t, invalidLintYAML, func() error {
-			return lintStdin(context.Background(), "text")
-		})
-	})
+	var out bytes.Buffer
+	err := lintStdin(context.Background(), strings.NewReader(invalidLintYAML), &out, "text")
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
@@ -216,25 +179,18 @@ func TestLintCommand_InvalidFileReturnsError(t *testing.T) {
 	tmpDir := t.TempDir()
 	invalidFile := writeRunsOnConfig(t, tmpDir, invalidLintYAML)
 
-	output, err := captureStdout(t, func() error {
-		cmd := NewLintCmd()
-		cmd.SetArgs([]string{"--format", "json", invalidFile})
-		return cmd.Execute()
-	})
+	var out bytes.Buffer
+	cmd := NewLintCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--format", "json", invalidFile})
+	err := cmd.Execute()
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error from Cobra command execution, got: %v", err)
 	}
 
-	var result struct {
-		Valid       bool `json:"valid"`
-		Diagnostics []struct {
-			Severity string `json:"severity"`
-		} `json:"diagnostics"`
-	}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Fatalf("Failed to parse JSON output: %v", err)
-	}
+	result := decodeLintOutput[lintJSONReport](t, output)
 	if result.Valid {
 		t.Error("Expected valid=false for invalid command execution")
 	}
@@ -247,15 +203,11 @@ func TestLintCommand_InvalidFileReturnsError(t *testing.T) {
 }
 
 func TestLintAllFiles_NoFiles(t *testing.T) {
-	tmpDir := t.TempDir()
+	t.Chdir(t.TempDir())
 
-	var output string
-	var err error
-	withWorkingDir(t, tmpDir, func() {
-		output, err = captureStdout(t, func() error {
-			return lintAllFiles(context.Background(), "text")
-		})
-	})
+	var out bytes.Buffer
+	err := lintAllFiles(context.Background(), &out, io.Discard, "text")
+	output := out.String()
 
 	if err != nil {
 		t.Errorf("lintAllFiles returned error when no files found: %v", err)
@@ -281,13 +233,10 @@ func TestLintAllFiles_MultipleFiles(t *testing.T) {
 	writeRunsOnConfig(t, subDir1, validLintYAML)
 	writeRunsOnConfig(t, subDir2, invalidLintYAML)
 
-	var output string
-	var err error
-	withWorkingDir(t, tmpDir, func() {
-		output, err = captureStdout(t, func() error {
-			return lintAllFiles(context.Background(), "text")
-		})
-	})
+	t.Chdir(tmpDir)
+	var out bytes.Buffer
+	err := lintAllFiles(context.Background(), &out, io.Discard, "text")
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
@@ -301,65 +250,165 @@ func TestLintAllFiles_MultipleFiles(t *testing.T) {
 	}
 }
 
-func TestOutputLintResults_TextFormat(t *testing.T) {
-	diags := []validate.Diagnostic{
-		{
-			Path:     "test.yml",
-			Line:     5,
-			Column:   10,
-			Message:  "Deprecated field",
-			Severity: validate.SeverityWarning,
-		},
+func TestLintAllFiles_SkipsGitAndNodeModules(t *testing.T) {
+	tmpDir := t.TempDir()
+	for dir, content := range map[string]string{
+		".github":                            validLintYAML,
+		".git":                               invalidLintYAML,
+		filepath.Join("node_modules", "pkg"): invalidLintYAML,
+	} {
+		path := filepath.Join(tmpDir, dir)
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatalf("Failed to create %s: %v", path, err)
+		}
+		writeRunsOnConfig(t, path, content)
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := outputLintResults(diags, "test.yml", "text")
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	t.Chdir(tmpDir)
+	var out bytes.Buffer
+	err := lintAllFiles(context.Background(), &out, io.Discard, "json")
+	output := out.String()
 	if err != nil {
-		t.Errorf("outputLintResults returned error: %v", err)
+		t.Fatalf("lintAllFiles returned error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-	output := buf.String()
-
-	// Should contain warning information
-	if !strings.Contains(output, "warning") && !strings.Contains(output, "⚠️") {
-		t.Errorf("Expected warning output, got: %s", output)
+	result := decodeLintOutput[lintJSONReport](t, output)
+	if len(result.Files) != 1 || result.Files[0].Path != filepath.Join(".github", "runs-on.yml") {
+		t.Fatalf("Expected only .github/runs-on.yml to be linted, got %+v", result.Files)
 	}
 }
 
-func TestOutputLintResults_TextFormatWithErrors(t *testing.T) {
-	diags := []validate.Diagnostic{
+var (
+	lintTestError        = validate.Diagnostic{Line: 5, Column: 10, Message: "Invalid value", Severity: validate.SeverityError}
+	lintTestErrorNoLine  = validate.Diagnostic{Message: "Missing runner", Severity: validate.SeverityError}
+	lintTestWarning      = validate.Diagnostic{Line: 7, Column: 3, Message: "Deprecated field", Severity: validate.SeverityWarning}
+	lintTestWarnNoLine   = validate.Diagnostic{Message: "Unknown key", Severity: validate.SeverityWarning}
+	lintTestFixErrorsTip = "\nPlease fix the errors above and run the validation again.\n"
+)
+
+func TestOutputLintResults_TextFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		diags   []validate.Diagnostic
+		want    string
+		wantErr error
+	}{
 		{
-			Path:     "test.yml",
-			Line:     5,
-			Column:   10,
-			Message:  "Invalid value",
-			Severity: validate.SeverityError,
+			name:   "valid",
+			source: "test.yml",
+			want:   "✅ Configuration file 'test.yml' is valid!\n",
+		},
+		{
+			name:   "valid stdin",
+			source: "<stdin>",
+			diags:  []validate.Diagnostic{},
+			want:   "✅ Configuration file '<stdin>' is valid!\n",
+		},
+		{
+			name:   "warnings only",
+			source: "test.yml",
+			diags:  []validate.Diagnostic{lintTestWarning, lintTestWarnNoLine},
+			want: "⚠️  Configuration file 'test.yml' is valid but has 2 warning(s):\n\n" +
+				"1. [Line 7, Column 3] warning: Deprecated field\n" +
+				"2. warning: Unknown key\n",
+		},
+		{
+			name:   "errors only",
+			source: "test.yml",
+			diags:  []validate.Diagnostic{lintTestError, lintTestErrorNoLine},
+			want: "❌ Configuration file 'test.yml' has 2 error(s):\n\n" +
+				"1. [Line 5, Column 10] error: Invalid value\n" +
+				"2. error: Missing runner\n" +
+				lintTestFixErrorsTip,
+			wantErr: errLintInvalid,
+		},
+		{
+			name:   "errors and warnings",
+			source: "<stdin>",
+			diags:  []validate.Diagnostic{lintTestWarning, lintTestError, lintTestWarnNoLine},
+			want: "❌ Configuration file '<stdin>' has 1 error(s) and 2 warning(s):\n\n" +
+				"1. [Line 5, Column 10] error: Invalid value\n" +
+				"\nWarnings:\n" +
+				"  1. [Line 7, Column 3] warning: Deprecated field\n" +
+				"  2. warning: Unknown key\n" +
+				lintTestFixErrorsTip,
+			wantErr: errLintInvalid,
 		},
 	}
 
-	output, err := captureStdout(t, func() error {
-		return outputLintResults(diags, "test.yml", "text")
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := outputLintResults(&out, tt.diags, tt.source, "text")
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
+			}
+			if out.String() != tt.want {
+				t.Errorf("unexpected output\ngot:\n%s\nwant:\n%s", out.String(), tt.want)
+			}
+		})
+	}
+}
 
-	if !errors.Is(err, errLintInvalid) {
-		t.Fatalf("Expected lint invalid error, got: %v", err)
+func TestOutputLintAllText(t *testing.T) {
+	tests := []struct {
+		name    string
+		results []fileResult
+		want    string
+		wantErr error
+	}{
+		{
+			name:    "all valid without warnings prints nothing",
+			results: []fileResult{{Path: "a.yml", Valid: true}},
+		},
+		{
+			name: "all valid with warnings",
+			results: []fileResult{
+				{Path: "a.yml", Valid: true, Diagnostics: []validate.Diagnostic{lintTestWarning}},
+				{Path: "b.yml", Valid: true},
+				{Path: "c.yml", Valid: true, Diagnostics: []validate.Diagnostic{lintTestWarnNoLine, lintTestWarning}},
+			},
+			want: "\nWarnings:\n" +
+				"\na.yml:\n" +
+				"  1. [Line 7, Column 3] warning: Deprecated field\n" +
+				"\nc.yml:\n" +
+				"  1. warning: Unknown key\n" +
+				"  2. [Line 7, Column 3] warning: Deprecated field\n",
+		},
+		{
+			name: "invalid files",
+			results: []fileResult{
+				{Path: "a.yml", Valid: false, Diagnostics: []validate.Diagnostic{lintTestWarning, lintTestError, lintTestErrorNoLine}},
+				{Path: "b.yml", Valid: true, Diagnostics: []validate.Diagnostic{lintTestWarning}},
+				{Path: "c.yml", Valid: true},
+				// A file the validator could not read has no diagnostics.
+				{Path: "d.yml", Valid: false, Diagnostics: []validate.Diagnostic{}},
+			},
+			want: "\nDetailed errors:\n" +
+				"\na.yml:\n" +
+				"  1. [Line 5, Column 10] error: Invalid value\n" +
+				"  2. error: Missing runner\n" +
+				"\n  Warnings:\n" +
+				"    1. [Line 7, Column 3] warning: Deprecated field\n" +
+				"⚠️  b.yml (1 warning(s))\n" +
+				"✅ c.yml\n" +
+				"\nd.yml:\n",
+			wantErr: errLintInvalid,
+		},
 	}
-	if !strings.Contains(output, "Configuration file 'test.yml' has 1 error(s)") {
-		t.Errorf("Expected text error summary, got: %s", output)
-	}
-	if !strings.Contains(output, "error: Invalid value") {
-		t.Errorf("Expected diagnostic message, got: %s", output)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := outputLintAllText(&out, tt.results)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, err)
+			}
+			if out.String() != tt.want {
+				t.Errorf("unexpected output\ngot:\n%s\nwant:\n%s", out.String(), tt.want)
+			}
+		})
 	}
 }
 
@@ -374,49 +423,21 @@ func TestOutputLintResults_JSONFormat(t *testing.T) {
 		},
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := outputLintResults(diags, "test.yml", "json")
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	var out bytes.Buffer
+	err := outputLintResults(&out, diags, "test.yml", "json")
+	output := out.String()
 	if err != nil {
 		t.Errorf("outputLintResults returned error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-
-	// Parse JSON to verify structure
-	var result struct {
-		Valid       bool `json:"valid"`
-		Diagnostics []struct {
-			Path     string `json:"path"`
-			Line     int    `json:"line"`
-			Column   int    `json:"column"`
-			Message  string `json:"message"`
-			Severity string `json:"severity"`
-		} `json:"diagnostics"`
-	}
-
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		t.Errorf("Failed to parse JSON output: %v", err)
-	}
-
+	result := decodeLintOutput[lintJSONReport](t, output)
 	// Warnings only should still be valid
 	if !result.Valid {
 		t.Error("Expected valid=true for warning-only diagnostics")
 	}
-
 	if len(result.Diagnostics) != 1 {
-		t.Errorf("Expected 1 diagnostic, got %d", len(result.Diagnostics))
+		t.Fatalf("Expected 1 diagnostic, got %d", len(result.Diagnostics))
 	}
-
 	if result.Diagnostics[0].Severity != "warning" {
 		t.Errorf("Expected warning severity, got %s", result.Diagnostics[0].Severity)
 	}
@@ -433,28 +454,15 @@ func TestOutputLintResults_JSONFormatWithErrors(t *testing.T) {
 		},
 	}
 
-	output, err := captureStdout(t, func() error {
-		return outputLintResults(diags, "test.yml", "json")
-	})
+	var out bytes.Buffer
+	err := outputLintResults(&out, diags, "test.yml", "json")
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	var result struct {
-		Valid       bool `json:"valid"`
-		Diagnostics []struct {
-			Path     string `json:"path"`
-			Line     int    `json:"line"`
-			Column   int    `json:"column"`
-			Message  string `json:"message"`
-			Severity string `json:"severity"`
-		} `json:"diagnostics"`
-	}
-
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Errorf("Failed to parse JSON output: %v", err)
-	}
+	result := decodeLintOutput[lintJSONReport](t, output)
 	if result.Valid {
 		t.Error("Expected valid=false for error diagnostics")
 	}
@@ -480,69 +488,23 @@ func TestOutputLintResults_SARIFFormat(t *testing.T) {
 		},
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := outputLintResults(diags, "test.yml", "sarif")
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	var out bytes.Buffer
+	err := outputLintResults(&out, diags, "test.yml", "sarif")
+	output := out.String()
 	if err != nil {
 		t.Errorf("outputLintResults returned error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-
-	// Parse SARIF JSON to verify structure
-	var result struct {
-		Version string `json:"version"`
-		Runs    []struct {
-			Tool struct {
-				Driver struct {
-					Name    string `json:"name"`
-					Version string `json:"version"`
-				} `json:"driver"`
-			} `json:"tool"`
-			Results []struct {
-				RuleID  string `json:"ruleId"`
-				Level   string `json:"level"`
-				Message struct {
-					Text string `json:"text"`
-				} `json:"message"`
-				Locations []struct {
-					PhysicalLocation struct {
-						URI    string `json:"uri"`
-						Region struct {
-							StartLine   int `json:"startLine"`
-							StartColumn int `json:"startColumn"`
-						} `json:"region"`
-					} `json:"physicalLocation"`
-				} `json:"locations"`
-			} `json:"results"`
-		} `json:"runs"`
-	}
-
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		t.Errorf("Failed to parse SARIF JSON output: %v", err)
-	}
-
+	result := decodeLintOutput[lintSARIFReport](t, output)
 	if result.Version != "2.1.0" {
 		t.Errorf("Expected SARIF version 2.1.0, got %s", result.Version)
 	}
-
 	if len(result.Runs) != 1 {
-		t.Errorf("Expected 1 run, got %d", len(result.Runs))
+		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
 	}
-
 	if len(result.Runs[0].Results) != 1 {
-		t.Errorf("Expected 1 result, got %d", len(result.Runs[0].Results))
+		t.Fatalf("Expected 1 result, got %d", len(result.Runs[0].Results))
 	}
-
 	if result.Runs[0].Results[0].Level != "warning" {
 		t.Errorf("Expected warning level, got %s", result.Runs[0].Results[0].Level)
 	}
@@ -559,34 +521,15 @@ func TestOutputLintResults_SARIFFormatWithErrors(t *testing.T) {
 		},
 	}
 
-	output, err := captureStdout(t, func() error {
-		return outputLintResults(diags, "test.yml", "sarif")
-	})
+	var out bytes.Buffer
+	err := outputLintResults(&out, diags, "test.yml", "sarif")
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	var result struct {
-		Version string `json:"version"`
-		Runs    []struct {
-			Results []struct {
-				Level   string `json:"level"`
-				Message struct {
-					Text string `json:"text"`
-				} `json:"message"`
-				Locations []struct {
-					PhysicalLocation struct {
-						URI string `json:"uri"`
-					} `json:"physicalLocation"`
-				} `json:"locations"`
-			} `json:"results"`
-		} `json:"runs"`
-	}
-
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Errorf("Failed to parse SARIF JSON output: %v", err)
-	}
+	result := decodeLintOutput[lintSARIFReport](t, output)
 	if len(result.Runs) != 1 {
 		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
 	}
@@ -608,7 +551,7 @@ func TestOutputLintResults_SARIFFormatWithErrors(t *testing.T) {
 func TestOutputLintResults_InvalidFormat(t *testing.T) {
 	diags := []validate.Diagnostic{}
 
-	err := outputLintResults(diags, "test.yml", "invalid")
+	err := outputLintResults(io.Discard, diags, "test.yml", "invalid")
 
 	if err == nil {
 		t.Error("Expected error for invalid format")
@@ -664,51 +607,6 @@ func TestIsValidDiagnostics(t *testing.T) {
 	}
 }
 
-func TestHasErrors(t *testing.T) {
-	tests := []struct {
-		name    string
-		diags   []validate.Diagnostic
-		wantHas bool
-	}{
-		{
-			name:    "empty diagnostics",
-			diags:   []validate.Diagnostic{},
-			wantHas: false,
-		},
-		{
-			name: "only warnings",
-			diags: []validate.Diagnostic{
-				{Severity: validate.SeverityWarning, Message: "warning"},
-			},
-			wantHas: false,
-		},
-		{
-			name: "has errors",
-			diags: []validate.Diagnostic{
-				{Severity: validate.SeverityError, Message: "error"},
-			},
-			wantHas: true,
-		},
-		{
-			name: "errors and warnings",
-			diags: []validate.Diagnostic{
-				{Severity: validate.SeverityError, Message: "error"},
-				{Severity: validate.SeverityWarning, Message: "warning"},
-			},
-			wantHas: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := hasErrors(tt.diags)
-			if got != tt.wantHas {
-				t.Errorf("hasErrors() = %v, want %v", got, tt.wantHas)
-			}
-		})
-	}
-}
-
 func TestOutputLintAllJSON(t *testing.T) {
 	results := []fileResult{
 		{
@@ -725,53 +623,24 @@ func TestOutputLintAllJSON(t *testing.T) {
 		},
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := outputLintAllJSON(results)
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	var out bytes.Buffer
+	err := outputLintAllJSON(&out, results)
+	output := out.String()
 	if err != nil {
 		t.Errorf("outputLintAllJSON returned error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-
-	var result struct {
-		Valid bool `json:"valid"`
-		Files []struct {
-			Path        string `json:"path"`
-			Valid       bool   `json:"valid"`
-			Diagnostics []struct {
-				Severity string `json:"severity"`
-				Message  string `json:"message"`
-			} `json:"diagnostics"`
-		} `json:"files"`
-	}
-
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		t.Errorf("Failed to parse JSON output: %v", err)
-	}
-
+	result := decodeLintOutput[lintJSONReport](t, output)
 	if !result.Valid {
 		t.Error("Expected valid=true when all files are valid")
 	}
-
 	if len(result.Files) != 2 {
-		t.Errorf("Expected 2 files, got %d", len(result.Files))
+		t.Fatalf("Expected 2 files, got %d", len(result.Files))
 	}
-
-	if result.Files[0].Valid != true {
+	if !result.Files[0].Valid {
 		t.Error("Expected file1 to be valid")
 	}
-
-	if result.Files[1].Valid != true {
+	if !result.Files[1].Valid {
 		t.Error("Expected file2 to be valid")
 	}
 }
@@ -787,30 +656,15 @@ func TestOutputLintAllJSON_InvalidResults(t *testing.T) {
 		},
 	}
 
-	output, err := captureStdout(t, func() error {
-		return outputLintAllJSON(results)
-	})
+	var out bytes.Buffer
+	err := outputLintAllJSON(&out, results)
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	var result struct {
-		Valid bool `json:"valid"`
-		Files []struct {
-			Path        string `json:"path"`
-			Valid       bool   `json:"valid"`
-			Diagnostics []struct {
-				Path     string `json:"path"`
-				Severity string `json:"severity"`
-				Message  string `json:"message"`
-			} `json:"diagnostics"`
-		} `json:"files"`
-	}
-
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Errorf("Failed to parse JSON output: %v", err)
-	}
+	result := decodeLintOutput[lintJSONReport](t, output)
 	if result.Valid {
 		t.Error("Expected valid=false when a file is invalid")
 	}
@@ -820,7 +674,7 @@ func TestOutputLintAllJSON_InvalidResults(t *testing.T) {
 	if result.Files[0].Valid {
 		t.Error("Expected file1 to be invalid")
 	}
-	if result.Files[0].Diagnostics[0].Message != "error" {
+	if len(result.Files[0].Diagnostics) != 1 || result.Files[0].Diagnostics[0].Message != "error" {
 		t.Errorf("Expected diagnostic message to be preserved, got %s", result.Files[0].Diagnostics[0].Message)
 	}
 }
@@ -842,48 +696,20 @@ func TestOutputLintAllSARIF(t *testing.T) {
 		},
 	}
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := outputLintAllSARIF(results)
-
-	w.Close()
-	os.Stdout = oldStdout
-
+	var out bytes.Buffer
+	err := outputLintAllSARIF(&out, results)
+	output := out.String()
 	if err != nil {
 		t.Errorf("outputLintAllSARIF returned error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-
-	var result struct {
-		Version string `json:"version"`
-		Runs    []struct {
-			Results []struct {
-				Level   string `json:"level"`
-				Message struct {
-					Text string `json:"text"`
-				} `json:"message"`
-			} `json:"results"`
-		} `json:"runs"`
-	}
-
-	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
-		t.Errorf("Failed to parse SARIF JSON output: %v", err)
-	}
-
+	result := decodeLintOutput[lintSARIFReport](t, output)
 	if len(result.Runs) != 1 {
-		t.Errorf("Expected 1 run, got %d", len(result.Runs))
+		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
 	}
-
 	if len(result.Runs[0].Results) != 1 {
-		t.Errorf("Expected 1 result, got %d", len(result.Runs[0].Results))
+		t.Fatalf("Expected 1 result, got %d", len(result.Runs[0].Results))
 	}
-
 	if result.Runs[0].Results[0].Level != "warning" {
 		t.Errorf("Expected warning level, got %s", result.Runs[0].Results[0].Level)
 	}
@@ -906,28 +732,15 @@ func TestOutputLintAllSARIF_InvalidResults(t *testing.T) {
 		},
 	}
 
-	output, err := captureStdout(t, func() error {
-		return outputLintAllSARIF(results)
-	})
+	var out bytes.Buffer
+	err := outputLintAllSARIF(&out, results)
+	output := out.String()
 
 	if !errors.Is(err, errLintInvalid) {
 		t.Fatalf("Expected lint invalid error, got: %v", err)
 	}
 
-	var result struct {
-		Runs []struct {
-			Results []struct {
-				Level   string `json:"level"`
-				Message struct {
-					Text string `json:"text"`
-				} `json:"message"`
-			} `json:"results"`
-		} `json:"runs"`
-	}
-
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		t.Errorf("Failed to parse SARIF JSON output: %v", err)
-	}
+	result := decodeLintOutput[lintSARIFReport](t, output)
 	if len(result.Runs) != 1 {
 		t.Fatalf("Expected 1 run, got %d", len(result.Runs))
 	}
@@ -939,37 +752,5 @@ func TestOutputLintAllSARIF_InvalidResults(t *testing.T) {
 	}
 	if result.Runs[0].Results[0].Message.Text != "file1.yml: Error message" {
 		t.Errorf("Expected SARIF message to be preserved, got %s", result.Runs[0].Results[0].Message.Text)
-	}
-}
-
-func TestLintTestDataFile(t *testing.T) {
-	// Test that validates the test/runs-on.yml file
-	testFile := filepath.Join("..", "..", "test", "runs-on.yml")
-
-	// Check if file exists
-	if _, err := os.Stat(testFile); os.IsNotExist(err) {
-		t.Skipf("Test data file %s does not exist", testFile)
-		return
-	}
-
-	ctx := context.Background()
-	diags, err := validate.ValidateFile(ctx, testFile)
-	if err != nil {
-		t.Fatalf("Failed to validate test file: %v", err)
-	}
-
-	// Log diagnostics for debugging
-	for _, d := range diags {
-		if d.Severity == validate.SeverityError {
-			t.Errorf("Validation error in %s:%d:%d: %s", d.Path, d.Line, d.Column, d.Message)
-		} else {
-			t.Logf("Validation warning in %s:%d:%d: %s", d.Path, d.Line, d.Column, d.Message)
-		}
-	}
-
-	// Test should pass even with warnings, but fail on errors
-	hasErrors := hasErrors(diags)
-	if hasErrors {
-		t.Error("Test data file has validation errors")
 	}
 }

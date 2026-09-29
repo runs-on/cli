@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -17,6 +18,7 @@ import (
 
 type stackConfigSecretAPI interface {
 	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+	ListSecrets(ctx context.Context, params *secretsmanager.ListSecretsInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error)
 }
 
 type taggedResourcesAPI interface {
@@ -24,7 +26,6 @@ type taggedResourcesAPI interface {
 }
 
 type stackConfigSecretValue struct {
-	WorkflowJobsTable                  string `json:"WorkflowJobsTable"`
 	JobDiagnosticsResolverFunctionName string `json:"JobDiagnosticsResolverFunctionName"`
 	IngressURL                         string `json:"IngressURL"`
 	ServiceLogGroupName                string `json:"ServiceLogGroupName"`
@@ -34,7 +35,6 @@ type stackConfigSecretValue struct {
 
 type fleetConfigSecretValue struct {
 	Infra struct {
-		ClaimTableName                     string `json:"claim_table_name"`
 		JobDiagnosticsResolverFunctionName string `json:"job_diagnostics_resolver_function_name"`
 		ServiceLogGroupName                string `json:"service_log_group_name"`
 		EC2InstanceLogGroup                string `json:"ec2_instance_log_group"`
@@ -50,6 +50,8 @@ func fleetConfigSecretID(stackName string) string {
 	return fmt.Sprintf("/runs-on/%s/fleet-config", strings.TrimSpace(stackName))
 }
 
+// discoverResources loads the stable stack metadata that roc needs from the
+// standard stack config secret for the selected stack.
 func (s *Stack) discoverResources(cmd *cobra.Command) (*RunsOnConfig, error) {
 	stackName := strings.TrimSpace(cmd.Flag("stack").Value.String())
 	client := secretsmanager.NewFromConfig(s.cfg)
@@ -71,9 +73,9 @@ func loadRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackNam
 	})
 	if err != nil {
 		if isSecretNotFound(err) {
-			return loadFleetRunsOnConfig(ctx, client, stackName, cfg, err)
+			return loadFleetRunsOnConfig(ctx, client, stackName, cfg)
 		}
-		return nil, formatStackConfigSecretLoadError(secretID, cfg, err)
+		return nil, fmt.Errorf("load stack config secret %s: %w", secretID, err)
 	}
 	if output.SecretString == nil || strings.TrimSpace(*output.SecretString) == "" {
 		return nil, fmt.Errorf("stack config secret %s is empty", secretID)
@@ -82,16 +84,64 @@ func loadRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackNam
 	return parseRunsOnConfig(stackName, cfg, *output.SecretString)
 }
 
-func formatStackConfigSecretLoadError(secretID string, cfg aws.Config, err error) error {
-	if isSecretNotFound(err) {
-		message := fmt.Sprintf("the stack config secret %s couldn't be found in AWS Secrets Manager", secretID)
-		if region := strings.TrimSpace(cfg.Region); region != "" {
-			message += fmt.Sprintf(" region %s", region)
-		}
-		return fmt.Errorf("%s. Make sure the selected stack name is correct and AWS_REGION points to the stack's AWS region", message)
+// formatMissingStackError explains that neither the Flex nor the Fleet config
+// secret exists, and lists the stacks that do, so a mistyped --stack or a wrong
+// region is obvious.
+func formatMissingStackError(ctx context.Context, client stackConfigSecretAPI, stackName string, cfg aws.Config) error {
+	where := "AWS Secrets Manager"
+	if region := strings.TrimSpace(cfg.Region); region != "" {
+		where += " region " + region
 	}
+	lines := []string{fmt.Sprintf("RunsOn stack %q not found in %s (no %s or %s secret).",
+		stackName, where, stackConfigSecretID(stackName), fleetConfigSecretID(stackName))}
 
-	return fmt.Errorf("load stack config secret %s: %w", secretID, err)
+	// Listing is a hint only: callers without secretsmanager:ListSecrets still
+	// get the rest of the message.
+	if stacks, err := listRunsOnStacks(ctx, client); err == nil {
+		switch len(stacks) {
+		case 0:
+			lines = append(lines, "No RunsOn stacks were found there.")
+		case 1:
+			lines = append(lines, fmt.Sprintf("Did you mean --stack %s?", stacks[0]))
+		default:
+			lines = append(lines, "Stacks found there: "+strings.Join(stacks, ", "))
+		}
+	}
+	lines = append(lines, "Make sure the selected stack name is correct and AWS_REGION points to the stack's AWS region.")
+	return errors.New(strings.Join(lines, "\n"))
+}
+
+// listRunsOnStacks returns the sorted names of the stacks that have a Flex or
+// Fleet config secret in the client's region.
+func listRunsOnStacks(ctx context.Context, client stackConfigSecretAPI) ([]string, error) {
+	const prefix = "/runs-on/"
+	paginator := secretsmanager.NewListSecretsPaginator(client, &secretsmanager.ListSecretsInput{
+		Filters: []secretstypes.Filter{{
+			Key:    secretstypes.FilterNameStringTypeName,
+			Values: []string{prefix},
+		}},
+	})
+
+	var stacks []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, secret := range page.SecretList {
+			// The name filter is a case-insensitive prefix match.
+			rest, ok := strings.CutPrefix(aws.ToString(secret.Name), prefix)
+			if !ok {
+				continue
+			}
+			stack, kind, ok := strings.Cut(rest, "/")
+			if ok && stack != "" && (kind == "stack-config" || kind == "fleet-config") {
+				stacks = append(stacks, stack)
+			}
+		}
+	}
+	slices.Sort(stacks)
+	return slices.Compact(stacks), nil
 }
 
 func isSecretNotFound(err error) bool {
@@ -99,14 +149,14 @@ func isSecretNotFound(err error) bool {
 	return errors.As(err, &notFound)
 }
 
-func loadFleetRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackName string, cfg aws.Config, stackErr error) (*RunsOnConfig, error) {
+func loadFleetRunsOnConfig(ctx context.Context, client stackConfigSecretAPI, stackName string, cfg aws.Config) (*RunsOnConfig, error) {
 	secretID := fleetConfigSecretID(stackName)
 	output, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretID),
 	})
 	if err != nil {
 		if isSecretNotFound(err) {
-			return nil, formatStackConfigSecretLoadError(stackConfigSecretID(stackName), cfg, stackErr)
+			return nil, formatMissingStackError(ctx, client, stackName, cfg)
 		}
 		return nil, fmt.Errorf("load fleet config secret %s: %w", secretID, err)
 	}
@@ -124,11 +174,10 @@ func parseRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*R
 
 	return &RunsOnConfig{
 		StackName:              strings.TrimSpace(stackName),
-		Product:                "flex",
+		Product:                productFlex,
 		IngressURL:             normalizeDoctorServiceURL(secret.IngressURL),
 		ServiceLogGroupName:    strings.TrimSpace(secret.ServiceLogGroupName),
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.EC2InstanceLogGroupArn),
-		WorkflowJobsTable:      strings.TrimSpace(secret.WorkflowJobsTable),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.JobDiagnosticsResolverFunctionName),
 		CacheBucket:            strings.TrimSpace(secret.BucketCache),
 		AWSConfig:              cfg,
@@ -143,10 +192,9 @@ func parseFleetRunsOnConfig(stackName string, cfg aws.Config, secretValue string
 
 	return &RunsOnConfig{
 		StackName:              strings.TrimSpace(stackName),
-		Product:                "fleet",
+		Product:                productFleet,
 		ServiceLogGroupName:    strings.TrimSpace(secret.Infra.ServiceLogGroupName),
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.Infra.EC2InstanceLogGroup),
-		ClaimTableName:         strings.TrimSpace(secret.Infra.ClaimTableName),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.Infra.JobDiagnosticsResolverFunctionName),
 		CacheBucket:            strings.TrimSpace(secret.Infra.BucketCache),
 		AWSConfig:              cfg,
@@ -209,18 +257,11 @@ func discoverTaggedECSServiceARN(ctx context.Context, client taggedResourcesAPI,
 	}
 }
 
+// Job lookups go through the stack's resolver Lambda, which ships with the
+// tables it reads, so roc never depends on their item layout.
 func (c *RunsOnConfig) validateJobLookup() error {
-	if c.Product == "fleet" {
-		if c.ClaimTableName == "" {
-			return fmt.Errorf("fleet claims table not found for stack %q", c.StackName)
-		}
-		if c.JobDiagnosticsResolver == "" {
-			return fmt.Errorf("job diagnostics resolver Lambda not found for stack %q; make sure the roc CLI version matches the deployed RunsOn stack version", c.StackName)
-		}
-		return nil
-	}
-	if c.WorkflowJobsTable == "" {
-		return fmt.Errorf("workflow jobs table not found for stack %q", c.StackName)
+	if c.JobDiagnosticsResolver == "" {
+		return fmt.Errorf("job diagnostics resolver Lambda not found for stack %q; make sure the roc CLI version matches the deployed RunsOn stack version", c.StackName)
 	}
 	return nil
 }
@@ -228,9 +269,6 @@ func (c *RunsOnConfig) validateJobLookup() error {
 func (c *RunsOnConfig) validateJobLogs() error {
 	if err := c.validateJobLookup(); err != nil {
 		return err
-	}
-	if c.JobDiagnosticsResolver == "" {
-		return fmt.Errorf("job diagnostics resolver Lambda not found for stack %q; make sure the roc CLI version matches the deployed RunsOn stack version", c.StackName)
 	}
 	if c.EC2InstanceLogGroupArn == "" {
 		return fmt.Errorf("EC2 instance log group not found for stack %q", c.StackName)

@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
+	"io/fs"
 	"path/filepath"
 
 	"roc/internal/version"
@@ -40,17 +41,18 @@ The validator supports YAML anchors and will automatically expand them during va
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := context.Background()
+			ctx := cmd.Context()
+			out := cmd.OutOrStdout()
 
 			var err error
 			if stdin {
-				err = lintStdin(ctx, format)
+				err = lintStdin(ctx, cmd.InOrStdin(), out, format)
 			} else if len(args) > 0 {
 				// Validate single file
-				err = lintFile(ctx, args[0], format)
+				err = lintFile(ctx, out, args[0], format)
 			} else {
 				// Find and validate all runs-on.yml files
-				err = lintAllFiles(ctx, format)
+				err = lintAllFiles(ctx, out, cmd.ErrOrStderr(), format)
 			}
 
 			if errors.Is(err, errLintInvalid) {
@@ -88,31 +90,40 @@ The validator supports YAML anchors and will automatically expand them during va
 
 var errLintInvalid = errors.New("lint found configuration errors")
 
-func lintStdin(ctx context.Context, format string) error {
-	diags, err := validate.ValidateReader(ctx, os.Stdin, "<stdin>")
+func lintStdin(ctx context.Context, in io.Reader, out io.Writer, format string) error {
+	diags, err := validate.ValidateReader(ctx, in, "<stdin>")
 	if err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	return outputLintResults(diags, "<stdin>", format)
+	return outputLintResults(out, diags, "<stdin>", format)
 }
 
-func lintFile(ctx context.Context, filePath string, format string) error {
+func lintFile(ctx context.Context, out io.Writer, filePath string, format string) error {
 	diags, err := validate.ValidateFile(ctx, filePath)
 	if err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	return outputLintResults(diags, filePath, format)
+	return outputLintResults(out, diags, filePath, format)
 }
 
-func lintAllFiles(ctx context.Context, format string) error {
+func lintAllFiles(ctx context.Context, out, errOut io.Writer, format string) error {
 	var files []string
-	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && info.Name() == "runs-on.yml" {
+		if entry.IsDir() {
+			// Other hidden directories stay in scope: .github/runs-on.yml is
+			// the canonical location.
+			switch entry.Name() {
+			case ".git", "node_modules":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if entry.Name() == "runs-on.yml" {
 			files = append(files, path)
 		}
 		return nil
@@ -123,7 +134,7 @@ func lintAllFiles(ctx context.Context, format string) error {
 	}
 
 	if len(files) == 0 {
-		fmt.Println("No runs-on.yml files found")
+		fmt.Fprintln(out, "No runs-on.yml files found")
 		return nil
 	}
 
@@ -132,7 +143,7 @@ func lintAllFiles(ctx context.Context, format string) error {
 	for _, file := range files {
 		diags, err := validate.ValidateFile(ctx, file)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error validating %s: %v\n", file, err)
+			fmt.Fprintf(errOut, "Error validating %s: %v\n", file, err)
 			allResults = append(allResults, fileResult{
 				Path:        file,
 				Valid:       false,
@@ -151,11 +162,11 @@ func lintAllFiles(ctx context.Context, format string) error {
 
 	switch format {
 	case "text":
-		return outputLintAllText(allResults)
+		return outputLintAllText(out, allResults)
 	case "json":
-		return outputLintAllJSON(allResults)
+		return outputLintAllJSON(out, allResults)
 	case "sarif":
-		return outputLintAllSARIF(allResults)
+		return outputLintAllSARIF(out, allResults)
 	default:
 		return fmt.Errorf("invalid format %q (valid: text, json, sarif)", format)
 	}
@@ -298,8 +309,8 @@ func lintSARIFOutput(results []sarifResult) sarifOutput {
 	}
 }
 
-func writeIndentedJSON(value any, formatName string) error {
-	encoder := json.NewEncoder(os.Stdout)
+func writeIndentedJSON(out io.Writer, value any, formatName string) error {
+	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(value); err != nil {
 		return fmt.Errorf("failed to encode %s: %w", formatName, err)
@@ -308,124 +319,75 @@ func writeIndentedJSON(value any, formatName string) error {
 }
 
 func splitDiagnostics(diags []validate.Diagnostic) ([]validate.Diagnostic, []validate.Diagnostic) {
-	var errors []validate.Diagnostic
+	var errs []validate.Diagnostic
 	var warnings []validate.Diagnostic
 	for _, diag := range diags {
 		switch diag.Severity {
 		case validate.SeverityError:
-			errors = append(errors, diag)
+			errs = append(errs, diag)
 		case validate.SeverityWarning:
 			warnings = append(warnings, diag)
 		}
 	}
-	return errors, warnings
+	return errs, warnings
 }
 
-func outputLintAllText(results []fileResult) error {
-	allValid := true
-	for _, result := range results {
-		if !result.Valid {
-			allValid = false
-			break
-		}
-	}
+// isValidDiagnostics reports whether diags has no errors; warnings are OK.
+func isValidDiagnostics(diags []validate.Diagnostic) bool {
+	errs, _ := splitDiagnostics(diags)
+	return len(errs) == 0
+}
 
-	if !allValid {
-		fmt.Println("\nDetailed errors:")
+// writeDiagnostics prints diags as a numbered list, each line prefixed by indent.
+func writeDiagnostics(out io.Writer, indent string, diags []validate.Diagnostic) {
+	for i, diag := range diags {
+		location := ""
+		if diag.Line > 0 {
+			location = fmt.Sprintf("[Line %d, Column %d] ", diag.Line, diag.Column)
+		}
+		fmt.Fprintf(out, "%s%d. %s%s: %s\n", indent, i+1, location, diag.Severity, diag.Message)
+	}
+}
+
+func outputLintAllText(out io.Writer, results []fileResult) error {
+	if !lintResultsValid(results) {
+		fmt.Fprintln(out, "\nDetailed errors:")
 		for _, result := range results {
-			if !result.Valid {
-				fmt.Printf("\n%s:\n", result.Path)
-				errors, warnings := splitDiagnostics(result.Diagnostics)
-				for i, diag := range errors {
-					fmt.Printf("  %d. ", i+1)
-					if diag.Line > 0 {
-						fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-					}
-					fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
-				}
+			errs, warnings := splitDiagnostics(result.Diagnostics)
+			switch {
+			case !result.Valid:
+				fmt.Fprintf(out, "\n%s:\n", result.Path)
+				writeDiagnostics(out, "  ", errs)
 				if len(warnings) > 0 {
-					fmt.Printf("\n  Warnings:\n")
-					for i, diag := range warnings {
-						fmt.Printf("    %d. ", i+1)
-						if diag.Line > 0 {
-							fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-						}
-						fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
-					}
+					fmt.Fprint(out, "\n  Warnings:\n")
+					writeDiagnostics(out, "    ", warnings)
 				}
-			} else {
-				// File is valid but might have warnings
-				var warnings []validate.Diagnostic
-				for _, diag := range result.Diagnostics {
-					if diag.Severity == validate.SeverityWarning {
-						warnings = append(warnings, diag)
-					}
-				}
-				if len(warnings) > 0 {
-					fmt.Printf("⚠️  %s (%d warning(s))\n", result.Path, len(warnings))
-				} else {
-					fmt.Printf("✅ %s\n", result.Path)
-				}
+			case len(warnings) > 0:
+				fmt.Fprintf(out, "⚠️  %s (%d warning(s))\n", result.Path, len(warnings))
+			default:
+				fmt.Fprintf(out, "✅ %s\n", result.Path)
 			}
 		}
 		return errLintInvalid
 	}
 
-	// All files are valid, but check for warnings
-	hasWarnings := false
+	printedHeader := false
 	for _, result := range results {
-		for _, diag := range result.Diagnostics {
-			if diag.Severity == validate.SeverityWarning {
-				hasWarnings = true
-				break
-			}
+		_, warnings := splitDiagnostics(result.Diagnostics)
+		if len(warnings) == 0 {
+			continue
 		}
-		if hasWarnings {
-			break
+		if !printedHeader {
+			fmt.Fprintln(out, "\nWarnings:")
+			printedHeader = true
 		}
+		fmt.Fprintf(out, "\n%s:\n", result.Path)
+		writeDiagnostics(out, "  ", warnings)
 	}
-
-	if hasWarnings {
-		fmt.Println("\nWarnings:")
-		for _, result := range results {
-			var warnings []validate.Diagnostic
-			for _, diag := range result.Diagnostics {
-				if diag.Severity == validate.SeverityWarning {
-					warnings = append(warnings, diag)
-				}
-			}
-			if len(warnings) > 0 {
-				fmt.Printf("\n%s:\n", result.Path)
-				for i, diag := range warnings {
-					fmt.Printf("  %d. ", i+1)
-					if diag.Line > 0 {
-						fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-					}
-					fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
-				}
-			}
-		}
-	}
-
 	return nil
 }
 
-// hasErrors checks if any diagnostics are errors (not warnings)
-func hasErrors(diags []validate.Diagnostic) bool {
-	for _, diag := range diags {
-		if diag.Severity == validate.SeverityError {
-			return true
-		}
-	}
-	return false
-}
-
-// isValidDiagnostics checks if diagnostics are valid (no errors; warnings are OK)
-func isValidDiagnostics(diags []validate.Diagnostic) bool {
-	return len(diags) == 0 || !hasErrors(diags)
-}
-
-func outputLintAllJSON(results []fileResult) error {
+func outputLintAllJSON(out io.Writer, results []fileResult) error {
 	allValid := lintResultsValid(results)
 	jsonResults := make([]lintJSONFileResult, len(results))
 	for i, result := range results {
@@ -441,7 +403,7 @@ func outputLintAllJSON(results []fileResult) error {
 		Files: jsonResults,
 	}
 
-	if err := writeIndentedJSON(output, "JSON"); err != nil {
+	if err := writeIndentedJSON(out, output, "JSON"); err != nil {
 		return err
 	}
 
@@ -452,7 +414,7 @@ func outputLintAllJSON(results []fileResult) error {
 	return nil
 }
 
-func outputLintAllSARIF(results []fileResult) error {
+func outputLintAllSARIF(out io.Writer, results []fileResult) error {
 	var allResults []sarifResult
 	for _, result := range results {
 		for _, diag := range result.Diagnostics {
@@ -460,7 +422,7 @@ func outputLintAllSARIF(results []fileResult) error {
 		}
 	}
 
-	if err := writeIndentedJSON(lintSARIFOutput(allResults), "SARIF"); err != nil {
+	if err := writeIndentedJSON(out, lintSARIFOutput(allResults), "SARIF"); err != nil {
 		return err
 	}
 
@@ -471,74 +433,51 @@ func outputLintAllSARIF(results []fileResult) error {
 	return nil
 }
 
-func outputLintResults(diags []validate.Diagnostic, sourceName string, format string) error {
+func outputLintResults(out io.Writer, diags []validate.Diagnostic, sourceName string, format string) error {
 	switch format {
 	case "text":
-		return outputLintText(diags, sourceName)
+		return outputLintText(out, diags, sourceName)
 	case "json":
-		return outputLintJSON(diags)
+		return outputLintJSON(out, diags)
 	case "sarif":
-		return outputLintSARIF(diags)
+		return outputLintSARIF(out, diags)
 	default:
 		return fmt.Errorf("invalid format %q (valid: text, json, sarif)", format)
 	}
 }
 
-func outputLintText(diags []validate.Diagnostic, sourceName string) error {
-	// Separate errors and warnings
-	errors, warnings := splitDiagnostics(diags)
-
-	if len(errors) == 0 && len(warnings) == 0 {
-		fmt.Printf("✅ Configuration file '%s' is valid!\n", sourceName)
-		return nil
-	}
-
-	if len(errors) > 0 {
-		fmt.Printf("❌ Configuration file '%s' has %d error(s)", sourceName, len(errors))
+func outputLintText(out io.Writer, diags []validate.Diagnostic, sourceName string) error {
+	errs, warnings := splitDiagnostics(diags)
+	switch {
+	case len(errs) > 0:
+		fmt.Fprintf(out, "❌ Configuration file '%s' has %d error(s)", sourceName, len(errs))
 		if len(warnings) > 0 {
-			fmt.Printf(" and %d warning(s)", len(warnings))
+			fmt.Fprintf(out, " and %d warning(s)", len(warnings))
 		}
-		fmt.Printf(":\n\n")
-		for i, diag := range errors {
-			fmt.Printf("%d. ", i+1)
-			if diag.Line > 0 {
-				fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-			}
-			fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
-		}
+		fmt.Fprint(out, ":\n\n")
+		writeDiagnostics(out, "", errs)
 		if len(warnings) > 0 {
-			fmt.Printf("\nWarnings:\n")
-			for i, diag := range warnings {
-				fmt.Printf("  %d. ", i+1)
-				if diag.Line > 0 {
-					fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-				}
-				fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
-			}
+			fmt.Fprint(out, "\nWarnings:\n")
+			writeDiagnostics(out, "  ", warnings)
 		}
-		fmt.Printf("\nPlease fix the errors above and run the validation again.\n")
+		fmt.Fprint(out, "\nPlease fix the errors above and run the validation again.\n")
 		return errLintInvalid
-	}
-
-	// Only warnings, no errors
-	fmt.Printf("⚠️  Configuration file '%s' is valid but has %d warning(s):\n\n", sourceName, len(warnings))
-	for i, diag := range warnings {
-		fmt.Printf("%d. ", i+1)
-		if diag.Line > 0 {
-			fmt.Printf("[Line %d, Column %d] ", diag.Line, diag.Column)
-		}
-		fmt.Printf("%s: %s\n", diag.Severity, diag.Message)
+	case len(warnings) > 0:
+		fmt.Fprintf(out, "⚠️  Configuration file '%s' is valid but has %d warning(s):\n\n", sourceName, len(warnings))
+		writeDiagnostics(out, "", warnings)
+	default:
+		fmt.Fprintf(out, "✅ Configuration file '%s' is valid!\n", sourceName)
 	}
 	return nil
 }
 
-func outputLintJSON(diags []validate.Diagnostic) error {
+func outputLintJSON(out io.Writer, diags []validate.Diagnostic) error {
 	output := lintSingleJSONOutput{
 		Valid:       isValidDiagnostics(diags),
 		Diagnostics: lintJSONDiagnostics(diags),
 	}
 
-	if err := writeIndentedJSON(output, "JSON"); err != nil {
+	if err := writeIndentedJSON(out, output, "JSON"); err != nil {
 		return err
 	}
 
@@ -549,13 +488,13 @@ func outputLintJSON(diags []validate.Diagnostic) error {
 	return nil
 }
 
-func outputLintSARIF(diags []validate.Diagnostic) error {
+func outputLintSARIF(out io.Writer, diags []validate.Diagnostic) error {
 	results := make([]sarifResult, len(diags))
 	for i, diag := range diags {
 		results[i] = lintSARIFResult(diag, diag.Path, diag.Message)
 	}
 
-	if err := writeIndentedJSON(lintSARIFOutput(results), "SARIF"); err != nil {
+	if err := writeIndentedJSON(out, lintSARIFOutput(results), "SARIF"); err != nil {
 		return err
 	}
 

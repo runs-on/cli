@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
-	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +42,11 @@ type jobDiagnosticsRequest struct {
 	WorkflowRunID           int64  `json:"workflow_run_id,omitempty"`
 	WorkflowJobID           int64  `json:"workflow_job_id,omitempty"`
 	IncludeDeliveryMetadata bool   `json:"include_delivery_metadata"`
+	// GitHubCached marks a repeat poll from a caller that already holds the
+	// GitHub workflow job and run, so the resolver can skip GitHub. RunnerName
+	// is the cached job's runner, which Fleet still needs to match claims.
+	GitHubCached bool   `json:"github_cached,omitempty"`
+	RunnerName   string `json:"runner_name,omitempty"`
 }
 
 type jobDiagnosticsResponse struct {
@@ -130,16 +138,12 @@ func newJobDiagnosticsResolver(config *RunsOnConfig) *jobDiagnosticsResolver {
 	}
 }
 
-func (r *jobDiagnosticsResolver) Resolve(ctx context.Context, jobRef string) (*jobDiagnosticsResponse, error) {
+func (r *jobDiagnosticsResolver) resolveRequest(ctx context.Context, request jobDiagnosticsRequest) (*jobDiagnosticsResponse, error) {
 	if r == nil || r.client == nil {
 		return nil, fmt.Errorf("job diagnostics resolver client is required")
 	}
 	if r.functionName == "" {
 		return nil, fmt.Errorf("job diagnostics resolver Lambda is not configured")
-	}
-	request, err := buildJobDiagnosticsRequest(jobRef)
-	if err != nil {
-		return nil, err
 	}
 	payload, err := json.Marshal(request)
 	if err != nil {
@@ -166,31 +170,19 @@ func (r *jobDiagnosticsResolver) Resolve(ctx context.Context, jobRef string) (*j
 	return &response, nil
 }
 
-func buildJobDiagnosticsRequest(jobRef string) (jobDiagnosticsRequest, error) {
-	parsed, err := requireGitHubJobURL(jobRef)
-	if err != nil {
-		return jobDiagnosticsRequest{}, err
+func buildJobDiagnosticsRequest(job parsedGitHubJobURL) jobDiagnosticsRequest {
+	return jobDiagnosticsRequest{
+		JobURL:        job.URL,
+		GitHubHost:    job.Host,
+		Owner:         job.Owner,
+		Repo:          job.Repo,
+		WorkflowRunID: job.RunID,
+		WorkflowJobID: job.JobID,
 	}
-	request := jobDiagnosticsRequest{
-		JobURL:                  strings.TrimSpace(jobRef),
-		GitHubHost:              parsed.Host,
-		Owner:                   parsed.Owner,
-		Repo:                    parsed.Repo,
-		WorkflowRunID:           parsed.RunID,
-		WorkflowJobID:           parsed.JobID,
-		IncludeDeliveryMetadata: true,
-	}
-	return request, nil
-}
-
-func requireGitHubJobURL(input string) (parsedGitHubJobURL, error) {
-	if parsed, ok := parseGitHubJobURL(input); ok {
-		return parsed, nil
-	}
-	return parsedGitHubJobURL{}, fmt.Errorf("GitHub Actions job URL is required (expected https://<github-host>/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>)")
 }
 
 type parsedGitHubJobURL struct {
+	URL   string // the trimmed input, sent to the resolver as job_url
 	Host  string
 	Owner string
 	Repo  string
@@ -198,49 +190,43 @@ type parsedGitHubJobURL struct {
 	JobID int64
 }
 
-func parseGitHubJobURL(input string) (parsedGitHubJobURL, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(input))
+var errNotGitHubJobURL = errors.New("GitHub Actions job URL is required (expected https://<github-host>/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>)")
+
+func parseGitHubJobURL(input string) (parsedGitHubJobURL, error) {
+	input = strings.TrimSpace(input)
+	parsed, err := url.Parse(input)
 	if err != nil || parsed.Scheme != "https" {
-		return parsedGitHubJobURL{}, false
+		return parsedGitHubJobURL{}, errNotGitHubJobURL
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 	if len(parts) < 7 || parts[2] != "actions" || parts[3] != "runs" || parts[5] != "job" {
-		return parsedGitHubJobURL{}, false
+		return parsedGitHubJobURL{}, errNotGitHubJobURL
 	}
 	runID, runErr := strconv.ParseInt(parts[4], 10, 64)
 	jobID, jobErr := strconv.ParseInt(parts[6], 10, 64)
 	if runErr != nil || jobErr != nil {
-		return parsedGitHubJobURL{}, false
+		return parsedGitHubJobURL{}, errNotGitHubJobURL
 	}
 	return parsedGitHubJobURL{
+		URL:   input,
 		Host:  parsed.Host,
 		Owner: parts[0],
 		Repo:  parts[1],
 		RunID: runID,
 		JobID: jobID,
-	}, true
+	}, nil
 }
 
 func (ghCLIWorkflowJobFetcher) FetchWorkflowJob(ctx context.Context, request jobDiagnosticsRequest) (*jobDiagnosticsWorkflowJob, error) {
 	if strings.TrimSpace(request.Owner) == "" || strings.TrimSpace(request.Repo) == "" || request.WorkflowJobID == 0 {
 		return nil, fmt.Errorf("GitHub job URL is required for local gh fallback")
 	}
-	args := []string{"api"}
-	host := strings.TrimSpace(request.GitHubHost)
-	if host != "" && !strings.EqualFold(host, "github.com") {
-		args = append(args, "--hostname", host)
+	output, err := ghAPI(ctx, request.GitHubHost, fmt.Sprintf("repos/%s/%s/actions/jobs/%d", request.Owner, request.Repo, request.WorkflowJobID))
+	if errors.Is(err, errGHMissing) {
+		return nil, fmt.Errorf("GitHub CLI fallback requires gh; install GitHub CLI and run `gh auth login` with repository Actions read access")
 	}
-	args = append(args, fmt.Sprintf("repos/%s/%s/actions/jobs/%d", request.Owner, request.Repo, request.WorkflowJobID))
-	output, err := exec.CommandContext(ctx, "gh", args...).CombinedOutput()
 	if err != nil {
-		if _, lookupErr := exec.LookPath("gh"); lookupErr != nil {
-			return nil, fmt.Errorf("GitHub CLI fallback requires gh; install GitHub CLI and run `gh auth login` with repository Actions read access")
-		}
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
-		}
-		return nil, fmt.Errorf("GitHub CLI could not fetch workflow job; run `gh auth login` with repository Actions read access: %s", message)
+		return nil, fmt.Errorf("GitHub CLI could not fetch workflow job; run `gh auth login` with repository Actions read access: %s", err)
 	}
 	var job jobDiagnosticsWorkflowJob
 	if err := json.Unmarshal(output, &job); err != nil {
@@ -255,93 +241,78 @@ func (ghCLIWorkflowJobFetcher) FetchWorkflowJob(ctx context.Context, request job
 	return &job, nil
 }
 
-func (r *jobDiagnosticsResponse) workflowFacts(jobID int64) *workflowJobFacts {
-	if r == nil {
-		return nil
-	}
-	if r.Local == nil && r.GitHub.WorkflowJob == nil {
-		return nil
-	}
-	runID := int64(0)
-	if r.GitHub.WorkflowJob != nil && r.GitHub.WorkflowJob.RunID != 0 {
-		runID = r.GitHub.WorkflowJob.RunID
-	} else if r.GitHub.WorkflowRun != nil {
-		runID = r.GitHub.WorkflowRun.ID
-	} else if r.Local != nil {
-		runID = r.Local.WorkflowRunID
-	}
-	if runID == 0 {
-		runID = r.Request.WorkflowRunID
-	}
-
-	status := ""
-	schedulingState := ""
-	runnerName := ""
-	var instanceIDs []string
-	var createdAt time.Time
-	createdAtSource := ""
-	var completedAt time.Time
-	completedAtSource := ""
-	if r.Local != nil {
-		status = r.Local.Status
-		schedulingState = r.Local.SchedulingState
-		runnerName = r.Local.RunnerName
-		instanceIDs = append(instanceIDs, r.Local.InstanceIDs...)
-		createdAt, createdAtSource = parseDiagnosticsTime(r.Local.CreatedAt, "local.created_at")
-		completedAt, completedAtSource = parseDiagnosticsTime(r.Local.CompletedAt, "local.completed_at")
-	}
-	if r.GitHub.WorkflowJob != nil {
-		if status == "" {
-			status = r.GitHub.WorkflowJob.Status
-		}
-		if runnerName == "" {
-			runnerName = r.GitHub.WorkflowJob.RunnerName
-		}
-		if r.GitHub.WorkflowJob.ID != 0 {
-			jobID = r.GitHub.WorkflowJob.ID
-		}
-		if t, source := parseDiagnosticsTime(r.GitHub.WorkflowJob.CreatedAt, "github.workflow_job.created_at"); !t.IsZero() {
-			createdAt, createdAtSource = t, source
-		}
-		if t, source := parseDiagnosticsTime(r.GitHub.WorkflowJob.CompletedAt, "github.workflow_job.completed_at"); !t.IsZero() {
-			completedAt, completedAtSource = t, source
-		}
-	}
-	instanceIDs = append(instanceIDs, parseRunnerNameInstanceID(runnerName))
-	instanceIDs = dedupeStrings(instanceIDs)
-	currentInstanceID := ""
-	if len(instanceIDs) > 0 {
-		currentInstanceID = instanceIDs[0]
-	}
-	if r.Local != nil && len(r.Local.InstanceIDs) > 0 {
-		currentInstanceID = strings.TrimSpace(r.Local.InstanceIDs[0])
-	}
-	if strings.EqualFold(r.Product, "fleet") {
-		if instanceID := fleetClaimCurrentInstanceID(r.Local); instanceID != "" {
-			currentInstanceID = instanceID
-		}
-	}
-
-	return &workflowJobFacts{
-		JobID:                jobID,
-		RunID:                runID,
-		Status:               status,
-		SchedulingState:      schedulingState,
-		CurrentInstanceID:    currentInstanceID,
-		AttemptedInstanceIDs: instanceIDs,
-		CreatedAt:            createdAt,
-		CreatedAtSource:      createdAtSource,
-		CompletedAt:          completedAt,
-		CompletedAtSource:    completedAtSource,
-		rawJSON:              r.localRecordJSON(),
-	}
+// workflowJobFacts is what the job commands read from one resolver response.
+type workflowJobFacts struct {
+	Found             bool // the response has a local record or a GitHub workflow job
+	RunID             int64
+	JobURL            string
+	ScalesetJobID     string
+	Status            string
+	SchedulingState   string
+	CurrentInstanceID string
+	InstanceIDs       []string // every instance the job used, the current one included
+	CreatedAt         time.Time
+	CreatedAtSource   string
+	CompletedAt       time.Time
+	CompletedAtSource string
 }
 
-func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct, stackName string, jobID int64) error {
+// jobFacts derives the job's facts from the response. Every fallback between
+// GitHub, the local record and the request lives here.
+func (r *jobDiagnosticsResponse) jobFacts(job parsedGitHubJobURL) *workflowJobFacts {
+	local, github := r.Local, r.GitHub.WorkflowJob
+	facts := &workflowJobFacts{Found: local != nil || github != nil}
+	switch {
+	case github != nil && github.RunID != 0:
+		facts.RunID = github.RunID
+	case r.GitHub.WorkflowRun != nil:
+		facts.RunID = r.GitHub.WorkflowRun.ID
+	case local != nil:
+		facts.RunID = local.WorkflowRunID
+	}
+	facts.RunID = cmp.Or(facts.RunID, r.Request.WorkflowRunID)
+
+	var runnerName, htmlURL string
+	var localInstanceIDs []string
+	if local != nil {
+		facts.ScalesetJobID = strings.TrimSpace(local.ScalesetJobID)
+		facts.Status = local.Status
+		facts.SchedulingState = local.SchedulingState
+		runnerName = local.RunnerName
+		localInstanceIDs = local.InstanceIDs
+		facts.CreatedAt, facts.CreatedAtSource = parseDiagnosticsTime(local.CreatedAt, "local.created_at")
+		facts.CompletedAt, facts.CompletedAtSource = parseDiagnosticsTime(local.CompletedAt, "local.completed_at")
+	}
+	if github != nil {
+		facts.Status = cmp.Or(facts.Status, github.Status)
+		runnerName = cmp.Or(runnerName, github.RunnerName)
+		htmlURL = github.HTMLURL
+		if t, source := parseDiagnosticsTime(github.CreatedAt, "github.workflow_job.created_at"); !t.IsZero() {
+			facts.CreatedAt, facts.CreatedAtSource = t, source
+		}
+		if t, source := parseDiagnosticsTime(github.CompletedAt, "github.workflow_job.completed_at"); !t.IsZero() {
+			facts.CompletedAt, facts.CompletedAtSource = t, source
+		}
+	}
+	facts.JobURL = cmp.Or(strings.TrimSpace(htmlURL), strings.TrimSpace(r.Request.JobURL), job.URL)
+
+	facts.InstanceIDs = dedupeStrings(slices.Concat(localInstanceIDs, []string{parseRunnerNameInstanceID(runnerName)}))
+	if len(facts.InstanceIDs) > 0 {
+		facts.CurrentInstanceID = facts.InstanceIDs[0]
+	}
+	if parseProduct(r.Product) == productFleet {
+		if instanceID := fleetClaimCurrentInstanceID(local); instanceID != "" {
+			facts.CurrentInstanceID = instanceID
+			facts.InstanceIDs = dedupeStrings(append(facts.InstanceIDs, instanceID))
+		}
+	}
+	return facts
+}
+
+func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct runsOnProduct, stackName string, jobID int64) error {
 	if err := r.validateStackName(stackName, jobID); err != nil {
 		return err
 	}
-	stackProduct = normalizeJobProduct(stackProduct)
 	jobProduct := r.classifiedJobProduct()
 	if stackProduct == "" || jobProduct == "" || stackProduct == jobProduct {
 		return nil
@@ -349,7 +320,7 @@ func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct, stackName st
 	if jobID == 0 {
 		jobID = r.Request.WorkflowJobID
 	}
-	return fmt.Errorf("job %d is a %s job, but stack %q is a %s stack", jobID, displayJobProduct(jobProduct), strings.TrimSpace(stackName), displayJobProduct(stackProduct))
+	return fmt.Errorf("job %d is a %s job, but stack %q is a %s stack", jobID, jobProduct.display(), strings.TrimSpace(stackName), stackProduct.display())
 }
 
 func (r *jobDiagnosticsResponse) validateStackName(stackName string, jobID int64) error {
@@ -364,25 +335,22 @@ func (r *jobDiagnosticsResponse) validateStackName(stackName string, jobID int64
 	return fmt.Errorf("job %d diagnostics resolved stack %q, but CLI selected stack %q", jobID, actual, expected)
 }
 
-func (r *jobDiagnosticsResponse) classifiedJobProduct() string {
+func (r *jobDiagnosticsResponse) classifiedJobProduct() runsOnProduct {
 	if r == nil {
 		return ""
 	}
 	if r.Local != nil {
 		switch strings.TrimSpace(r.Local.Source) {
 		case "flex_workflow_jobs":
-			return "flex"
+			return productFlex
 		case "fleet_claims":
-			return "fleet"
+			return productFleet
 		}
 	}
-	if product := classifyJobProductFromLabels(r.GitHub.WorkflowJob); product != "" {
-		return product
-	}
-	return ""
+	return classifyJobProductFromLabels(r.GitHub.WorkflowJob)
 }
 
-func classifyJobProductFromLabels(job *jobDiagnosticsWorkflowJob) string {
+func classifyJobProductFromLabels(job *jobDiagnosticsWorkflowJob) runsOnProduct {
 	if job == nil {
 		return ""
 	}
@@ -408,35 +376,40 @@ func classifyJobProductFromLabels(job *jobDiagnosticsWorkflowJob) string {
 			}
 		}
 		if labelRunsOn && labelFleet {
-			return "fleet"
+			return productFleet
 		}
 	}
 	if sawRunsOn {
-		return "flex"
+		return productFlex
 	}
 	return ""
 }
 
-func normalizeJobProduct(product string) string {
-	switch strings.ToLower(strings.TrimSpace(product)) {
-	case "flex":
-		return "flex"
-	case "fleet":
-		return "fleet"
-	default:
-		return ""
+// runsOnProduct is the RunsOn product a stack or job belongs to.
+type runsOnProduct string
+
+const (
+	productFlex  runsOnProduct = "flex"
+	productFleet runsOnProduct = "fleet"
+)
+
+// parseProduct reads a product name case-insensitively; anything else is "".
+func parseProduct(name string) runsOnProduct {
+	switch product := runsOnProduct(strings.ToLower(strings.TrimSpace(name))); product {
+	case productFlex, productFleet:
+		return product
 	}
+	return ""
 }
 
-func displayJobProduct(product string) string {
-	switch normalizeJobProduct(product) {
-	case "flex":
+func (p runsOnProduct) display() string {
+	switch p {
+	case productFlex:
 		return "Flex"
-	case "fleet":
+	case productFleet:
 		return "Fleet"
-	default:
-		return strings.TrimSpace(product)
 	}
+	return string(p)
 }
 
 type fleetClaimCurrentRecord struct {
@@ -476,17 +449,19 @@ func fleetClaimCurrentInstanceID(local *jobDiagnosticsLocal) string {
 	return ""
 }
 
-func (r *jobDiagnosticsResponse) localRecordJSON() []byte {
-	if r == nil || r.Local == nil || len(r.Local.Record) == 0 {
-		return nil
+// reuseGitHub fills in the GitHub details that a cached poll skipped.
+func (r *jobDiagnosticsResponse) reuseGitHub(cached jobDiagnosticsGitHub) {
+	if r.GitHub.WorkflowJob == nil {
+		r.GitHub.WorkflowJob = cached.WorkflowJob
 	}
-	return append([]byte(nil), r.Local.Record...)
+	if r.GitHub.WorkflowRun == nil {
+		r.GitHub.WorkflowRun = cached.WorkflowRun
+	}
 }
 
+// writeSummary describes the resolver response itself, so it lists the GitHub
+// runner's instance even when the local record names another runner.
 func (r *jobDiagnosticsResponse) writeSummary(w io.Writer) {
-	if r == nil || w == nil {
-		return
-	}
 	instanceIDs := []string{}
 	runnerName := ""
 	source := "(none)"
@@ -521,10 +496,7 @@ func (r *jobDiagnosticsResponse) writeSummary(w io.Writer) {
 	}
 }
 
-func (r *jobDiagnosticsResponse) logDebug(logger debugLogger) {
-	if r == nil || logger == nil {
-		return
-	}
+func (r *jobDiagnosticsResponse) logDebug(logger *log.Logger) {
 	logger.Printf("Job diagnostics resolver status: product=%s status=%s", displayValue(r.Product), displayValue(r.Status))
 	for _, diagnostic := range r.Diagnostics {
 		logger.Printf("Job diagnostics %s %s: %s", displayValue(diagnostic.Level), displayValue(diagnostic.Code), displayValue(diagnostic.Message))
@@ -555,10 +527,6 @@ func (r *jobDiagnosticsResponse) compactDiagnostics() []jobDiagnosticsDiagnostic
 		diagnostics = append(diagnostics, diagnostic)
 	}
 	return diagnostics
-}
-
-type debugLogger interface {
-	Printf(format string, v ...any)
 }
 
 func parseDiagnosticsTime(value string, source string) (time.Time, string) {
