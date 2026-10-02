@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -21,10 +22,28 @@ func parseLogWatch(watchDuration string) (bool, time.Duration, error) {
 	return watch, watchInterval, nil
 }
 
+const noColorFlagUsage = "Disable color output for streamed logs (also off when stdout is not a terminal or NO_COLOR is set)"
+
+// logColorDisabled reports whether streamed logs print without ANSI color:
+// when --no-color is passed, when NO_COLOR is non-empty (https://no-color.org),
+// or when stdout is not a terminal.
+func logColorDisabled(noColorFlag bool, noColorEnv string, stdoutIsTerminal bool) bool {
+	return noColorFlag || noColorEnv != "" || !stdoutIsTerminal
+}
+
+// streamedLogColorDisabled treats a stdout that is not a file as no terminal.
+func streamedLogColorDisabled(stdout io.Writer, noColorFlag bool) bool {
+	stdoutIsTerminal := false
+	if file, ok := stdout.(*os.File); ok {
+		info, err := file.Stat()
+		stdoutIsTerminal = err == nil && info.Mode()&os.ModeCharDevice != 0
+	}
+	return logColorDisabled(noColorFlag, os.Getenv("NO_COLOR"), stdoutIsTerminal)
+}
+
 func NewLogsCmd(stack *Stack) *cobra.Command {
 	var (
 		watchDuration string
-		debug         bool
 		full          bool
 		noColor       bool
 		format        string
@@ -37,7 +56,8 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			if _, err := requireGitHubJobURL(args[0]); err != nil {
+			job, err := parseGitHubJobURL(args[0])
+			if err != nil {
 				return err
 			}
 
@@ -49,7 +69,7 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				return fmt.Errorf("--full cannot be used with --watch")
 			}
 
-			config, err := stack.getStackOutputs(cmd)
+			config, err := stack.discoverResources(cmd)
 			if err != nil {
 				return err
 			}
@@ -57,41 +77,35 @@ func NewLogsCmd(stack *Stack) *cobra.Command {
 				return err
 			}
 
-			jobRef := args[0]
-			jobID := extractJobID(jobRef)
 			if full {
 				exporter := newFullLogExporter(config)
-				zipPath, fullErr := exporter.Export(ctx, jobRef)
+				zipPath, fullErr := exporter.Export(ctx, job)
 				if zipPath != "" {
-					fmt.Printf("Full log archive exported to: %s\n", zipPath)
+					fmt.Fprintf(cmd.OutOrStdout(), "Full log archive exported to: %s\n", zipPath)
 				}
 				return fullErr
 			}
 
-			streamer := newJobLogStreamer(config)
-			if debug {
-				streamer.logger.SetOutput(os.Stderr)
-			}
+			streamer := newLogStreamer(cmd, config)
 
 			logOptions := &LogOptions{
 				Watch:         watch,
 				WatchInterval: watchInterval,
 				StartTime:     time.Now().Add(-2 * time.Hour).UnixMilli(),
 				Format:        format,
-				NoColor:       noColor,
+				NoColor:       streamedLogColorDisabled(cmd.OutOrStdout(), noColor),
 			}
 
-			facts := newJobFactsProvider(config, jobRef, streamer.logger)
-			return streamer.Stream(ctx, jobID, facts, includeFlags, logOptions)
+			facts := newJobFactsProvider(config, job, streamer.logger)
+			return streamer.StreamJob(ctx, facts, includeFlags, logOptions)
 		},
 	}
 
 	cmd.Flags().StringVarP(&watchDuration, "watch", "w", "", "Watch for new logs with optional interval (e.g. --watch 2s)")
 	cmd.Flags().Lookup("watch").NoOptDefVal = "5s"
-	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
 	cmd.Flags().BoolVar(&full, "full", false, "Export full diagnostic archive for the job")
 	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
-	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output for streamed logs")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, noColorFlagUsage)
 	cmd.Flags().StringSliceVar(&includeFlags, "include", []string{}, "Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)")
 
 	return cmd
@@ -101,7 +115,6 @@ func NewStackLogsCmd(stack *Stack) *cobra.Command {
 	var (
 		watchDuration string
 		since         string
-		debug         bool
 		noColor       bool
 		format        string
 	)
@@ -115,7 +128,7 @@ This command streams all application logs from the RunsOn service, not filtered
 by specific jobs. Use this to monitor overall service activity and troubleshoot
 system-wide issues.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			config, err := stack.getStackOutputs(cmd)
+			config, err := stack.discoverResources(cmd)
 			if err != nil {
 				return err
 			}
@@ -139,29 +152,23 @@ system-wide issues.`,
 				return err
 			}
 
-			streamer := newApplicationLogStreamer(config)
-			if debug {
-				streamer.logger.SetOutput(os.Stderr)
-			}
-
 			logOptions := &LogOptions{
 				Watch:         watch,
 				WatchInterval: watchInterval,
 				StartTime:     startTime.UnixMilli(),
 				Format:        format,
-				NoColor:       noColor,
+				NoColor:       streamedLogColorDisabled(cmd.OutOrStdout(), noColor),
 			}
 
-			return streamer.Stream(ctx, logOptions)
+			return newLogStreamer(cmd, config).StreamStack(ctx, logOptions)
 		},
 	}
 
 	cmd.Flags().StringVarP(&watchDuration, "watch", "w", "", "Watch for new logs with optional interval (e.g. --watch 2s)")
 	cmd.Flags().Lookup("watch").NoOptDefVal = "5s"
 	cmd.Flags().StringVarP(&since, "since", "s", "2h", "Show logs since duration (e.g. 30m, 2h)")
-	cmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug output")
 	cmd.Flags().StringVarP(&format, "format", "f", "long", "Output format: long (default) or short")
-	cmd.Flags().BoolVar(&noColor, "no-color", false, "Disable color output for streamed logs")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, noColorFlagUsage)
 
 	return cmd
 }

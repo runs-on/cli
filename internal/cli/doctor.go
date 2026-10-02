@@ -18,6 +18,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// DoctorCheck statuses as written to checks.json. Terminal output shows them
+// as emoji (see doctorStatusSymbol).
+const (
+	doctorCheckPass = "pass"
+	doctorCheckFail = "fail"
+	doctorCheckSkip = "skip"
+)
+
 type DoctorCheck struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
@@ -38,17 +46,17 @@ type doctorReadinessResponse struct {
 
 type StackDoctor struct {
 	cfg        aws.Config
-	cwl        *cloudwatchlogs.Client
+	cwl        cloudWatchLogsAPI
 	ecs        *ecs.Client
-	tagging    *resourcegroupstaggingapi.Client
+	tagging    taggedResourcesAPI
 	config     *RunsOnConfig
 	httpClient *http.Client
 	result     *DoctorResult
 	workDir    string
-	serviceARN string
+	out        io.Writer
 }
 
-func NewStackDoctor(config *RunsOnConfig) *StackDoctor {
+func NewStackDoctor(config *RunsOnConfig, out io.Writer) *StackDoctor {
 	return &StackDoctor{
 		cfg:     config.AWSConfig,
 		cwl:     cloudwatchlogs.NewFromConfig(config.AWSConfig),
@@ -63,6 +71,7 @@ func NewStackDoctor(config *RunsOnConfig) *StackDoctor {
 			StackName: config.StackName,
 			Checks:    []DoctorCheck{},
 		},
+		out: out,
 	}
 }
 
@@ -78,23 +87,58 @@ func (d *StackDoctor) addCheck(name, status, result string, err error) {
 	d.result.Checks = append(d.result.Checks, check)
 }
 
-func (d *StackDoctor) printCheckResult(status, details string) {
-	if details != "" {
-		fmt.Printf(" %s (%s)\n", status, details)
-	} else {
-		fmt.Printf(" %s\n", status)
+func doctorStatusSymbol(status string) string {
+	switch status {
+	case doctorCheckPass:
+		return "✅"
+	case doctorCheckFail:
+		return "❌"
+	case doctorCheckSkip:
+		return "⏭️"
+	default:
+		return status
 	}
 }
 
-func (d *StackDoctor) failCheck(name, message string, err error) error {
-	d.addCheck(name, "❌", message, err)
-	d.printCheckResult("❌", message)
-	return err
+func (d *StackDoctor) printCheckResult(status, details string) {
+	if details != "" {
+		fmt.Fprintf(d.out, " %s (%s)\n", doctorStatusSymbol(status), details)
+	} else {
+		fmt.Fprintf(d.out, " %s\n", doctorStatusSymbol(status))
+	}
 }
 
-func (d *StackDoctor) skipCheck(name, message string) {
-	d.addCheck(name, "⏭️", message, nil)
-	d.printCheckResult("⏭️", message)
+// check records a check and prints the same result text.
+func (d *StackDoctor) check(name, status, result string, err error) {
+	d.addCheck(name, status, result, err)
+	d.printCheckResult(status, result)
+}
+
+// failedChecksError names every failed check so the command exits non-zero.
+// Skipped checks are not failures.
+func (r *DoctorResult) failedChecksError() error {
+	var failed []string
+	for _, check := range r.Checks {
+		if check.Status == doctorCheckFail {
+			failed = append(failed, check.Name)
+		}
+	}
+	switch len(failed) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("1 check failed: %s", failed[0])
+	default:
+		return fmt.Errorf("%d checks failed: %s", len(failed), strings.Join(failed, ", "))
+	}
+}
+
+func (d *StackDoctor) get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return d.httpClient.Do(req)
 }
 
 func (d *StackDoctor) getServiceURL() (string, error) {
@@ -121,64 +165,50 @@ func doctorReadinessURL(serviceURL string) string {
 	return strings.TrimRight(serviceURL, "/") + "/readyz"
 }
 
-func (d *StackDoctor) discoverServiceARN(ctx context.Context) (string, error) {
-	if d.serviceARN != "" {
-		return d.serviceARN, nil
-	}
-
-	serviceARN, err := discoverTaggedECSServiceARN(ctx, d.tagging, d.config.StackName)
+func (d *StackDoctor) checkService(ctx context.Context) {
+	serviceArn, err := discoverTaggedECSServiceARN(ctx, d.tagging, d.config.StackName)
 	if err != nil {
-		return "", err
-	}
-	d.serviceARN = serviceARN
-	return serviceARN, nil
-}
-
-func (d *StackDoctor) checkService(ctx context.Context) error {
-	return d.checkECSService(ctx, "Service running")
-}
-
-func (d *StackDoctor) checkECSService(ctx context.Context, checkName string) error {
-	serviceArn, err := d.discoverServiceARN(ctx)
-	if err != nil {
-		fmt.Print("Checking service...")
-		return d.failCheck(checkName, "Service ARN not found", err)
+		fmt.Fprint(d.out, "Checking service...")
+		d.check("Service running", doctorCheckFail, "Service ARN not found", err)
+		return
 	}
 
 	clusterName, serviceName, ok := parseDoctorECSServiceARN(serviceArn)
 	if !ok {
-		fmt.Print("Checking service...")
-		return d.failCheck(checkName, "Invalid ECS service ARN", fmt.Errorf("parse ecs service ARN %q", serviceArn))
+		fmt.Fprint(d.out, "Checking service...")
+		d.check("Service running", doctorCheckFail, "Invalid ECS service ARN", fmt.Errorf("parse ecs service ARN %q", serviceArn))
+		return
 	}
 
 	consoleURL := fmt.Sprintf("https://%s.console.aws.amazon.com/ecs/v2/clusters/%s/services/%s/configuration/overview", d.cfg.Region, clusterName, serviceName)
-	fmt.Printf("Checking service (%s)...", consoleURL)
+	fmt.Fprintf(d.out, "Checking service (%s)...", consoleURL)
 
 	output, err := d.ecs.DescribeServices(ctx, &ecs.DescribeServicesInput{
 		Cluster:  aws.String(clusterName),
 		Services: []string{serviceName},
 	})
 	if err != nil {
-		return d.failCheck(checkName, "Failed to describe service", err)
+		d.check("Service running", doctorCheckFail, "Failed to describe service", err)
+		return
 	}
 	if len(output.Failures) > 0 {
-		return d.failCheck(checkName, "Failed to describe service", fmt.Errorf("%s", aws.ToString(output.Failures[0].Reason)))
+		d.check("Service running", doctorCheckFail, "Failed to describe service", fmt.Errorf("%s", aws.ToString(output.Failures[0].Reason)))
+		return
 	}
 	if len(output.Services) == 0 {
-		return d.failCheck(checkName, "Service not found in response", fmt.Errorf("DescribeServices returned no services"))
+		d.check("Service running", doctorCheckFail, "Service not found in response", fmt.Errorf("DescribeServices returned no services"))
+		return
 	}
 
 	service := output.Services[0]
-	status := aws.ToString(service.Status)
+	status, result := aws.ToString(service.Status), doctorCheckFail
 	if strings.EqualFold(status, "ACTIVE") && service.DesiredCount > 0 && service.RunningCount >= service.DesiredCount {
-		d.addCheck(checkName, "✅", fmt.Sprintf("Status: RUNNING (%d/%d tasks)", service.RunningCount, service.DesiredCount), nil)
-		d.printCheckResult("✅", fmt.Sprintf("status: RUNNING (%d/%d tasks)", service.RunningCount, service.DesiredCount))
-		return nil
+		status, result = "RUNNING", doctorCheckPass
 	}
-
-	d.addCheck(checkName, "❌", fmt.Sprintf("Status: %s (%d/%d tasks)", status, service.RunningCount, service.DesiredCount), nil)
-	d.printCheckResult("❌", fmt.Sprintf("status: %s (%d/%d tasks)", status, service.RunningCount, service.DesiredCount))
-	return fmt.Errorf("service is not healthy: %s (%d/%d tasks)", status, service.RunningCount, service.DesiredCount)
+	tasks := fmt.Sprintf("%s (%d/%d tasks)", status, service.RunningCount, service.DesiredCount)
+	// checks.json capitalizes "Status"; the terminal does not.
+	d.addCheck("Service running", result, "Status: "+tasks, nil)
+	d.printCheckResult(result, "status: "+tasks)
 }
 
 func parseDoctorECSServiceARN(arn string) (string, string, bool) {
@@ -193,87 +223,83 @@ func parseDoctorECSServiceARN(arn string) (string, string, bool) {
 	return resourceParts[len(resourceParts)-2], resourceParts[len(resourceParts)-1], true
 }
 
-func (d *StackDoctor) checkEndpointAccessibility() error {
+func (d *StackDoctor) checkEndpointAccessibility(ctx context.Context) {
 	entryPoint, err := d.getServiceURL()
 	if err != nil {
-		fmt.Print("Checking service endpoint...")
-		return d.failCheck("Service endpoint accessible", "Failed to get service URL", err)
+		fmt.Fprint(d.out, "Checking service endpoint...")
+		d.check("Service endpoint accessible", doctorCheckFail, "Failed to get service URL", err)
+		return
 	}
 
-	fmt.Printf("Checking service endpoint (%s)...", entryPoint)
+	fmt.Fprintf(d.out, "Checking service endpoint (%s)...", entryPoint)
 
-	// Check if endpoint is accessible
-	resp, err := d.httpClient.Get(entryPoint)
+	// checks.json names the endpoint; the terminal already printed it.
+	resp, err := d.get(ctx, entryPoint)
 	if err != nil {
-		d.addCheck("Service endpoint accessible", "❌", fmt.Sprintf("Failed to connect to %s", entryPoint), err)
-		d.printCheckResult("❌", "failed to connect")
-		return err
+		d.addCheck("Service endpoint accessible", doctorCheckFail, fmt.Sprintf("Failed to connect to %s", entryPoint), err)
+		d.printCheckResult(doctorCheckFail, "failed to connect")
+		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 200 {
-		d.addCheck("Service endpoint accessible", "✅", entryPoint, nil)
-		d.printCheckResult("✅", "")
-	} else {
-		d.addCheck("Service endpoint accessible", "❌", fmt.Sprintf("HTTP %d from %s", resp.StatusCode, entryPoint), nil)
-		d.printCheckResult("❌", fmt.Sprintf("HTTP %d", resp.StatusCode))
-		return fmt.Errorf("endpoint returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		d.addCheck("Service endpoint accessible", doctorCheckFail, fmt.Sprintf("HTTP %d from %s", resp.StatusCode, entryPoint), nil)
+		d.printCheckResult(doctorCheckFail, fmt.Sprintf("HTTP %d", resp.StatusCode))
+		return
 	}
-
-	return nil
+	d.addCheck("Service endpoint accessible", doctorCheckPass, entryPoint, nil)
+	d.printCheckResult(doctorCheckPass, "")
 }
 
-func (d *StackDoctor) checkReadiness() error {
-	fmt.Print("Checking service readiness...")
+func (d *StackDoctor) checkReadiness(ctx context.Context) {
+	fmt.Fprint(d.out, "Checking service readiness...")
 
 	serviceURL, err := d.getServiceURL()
 	if err != nil {
-		return d.failCheck("Service readiness", "Failed to get service URL", err)
+		d.check("Service readiness", doctorCheckFail, "Failed to get service URL", err)
+		return
 	}
 
-	resp, err := d.httpClient.Get(doctorReadinessURL(serviceURL))
+	resp, err := d.get(ctx, doctorReadinessURL(serviceURL))
 	if err != nil {
-		return d.failCheck("Service readiness", "Failed to connect", err)
+		d.check("Service readiness", doctorCheckFail, "Failed to connect", err)
+		return
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return d.failCheck("Service readiness", "Failed to read response", err)
+		d.check("Service readiness", doctorCheckFail, "Failed to read response", err)
+		return
 	}
 
 	var readiness doctorReadinessResponse
 	if err := json.Unmarshal(body, &readiness); err != nil {
-		return d.failCheck("Service readiness", "Failed to parse readiness response", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		d.addCheck("Service readiness", "❌", fmt.Sprintf("HTTP %d", resp.StatusCode), nil)
-		d.printCheckResult("❌", fmt.Sprintf("HTTP %d", resp.StatusCode))
-		return fmt.Errorf("readiness endpoint returned HTTP %d", resp.StatusCode)
-	}
-	if !readiness.GitHubAppConfigured {
-		d.addCheck("Service readiness", "❌", "GitHub app is not configured", nil)
-		d.printCheckResult("❌", "GitHub app is not configured")
-		return fmt.Errorf("github app is not configured")
-	}
-
-	d.addCheck("Service readiness", "✅", fmt.Sprintf("app_tag: %s", readiness.AppTag), nil)
-	d.printCheckResult("✅", fmt.Sprintf("app_tag: %s", readiness.AppTag))
-	return nil
-}
-
-func (d *StackDoctor) checkHTTPHealth() {
-	if strings.EqualFold(strings.TrimSpace(d.config.Product), "fleet") {
-		fmt.Print("Checking service endpoint...")
-		d.skipCheck("Service endpoint accessible", "Skipped - Fleet does not expose a public service endpoint")
-		fmt.Print("Checking service readiness...")
-		d.skipCheck("Service readiness", "Skipped - Fleet does not expose a public readiness endpoint")
+		d.check("Service readiness", doctorCheckFail, "Failed to parse readiness response", err)
 		return
 	}
 
-	_ = d.checkEndpointAccessibility()
-	_ = d.checkReadiness()
+	switch {
+	case resp.StatusCode != http.StatusOK:
+		d.check("Service readiness", doctorCheckFail, fmt.Sprintf("HTTP %d", resp.StatusCode), nil)
+	case !readiness.GitHubAppConfigured:
+		d.check("Service readiness", doctorCheckFail, "GitHub app is not configured", nil)
+	default:
+		d.check("Service readiness", doctorCheckPass, fmt.Sprintf("app_tag: %s", readiness.AppTag), nil)
+	}
+}
+
+func (d *StackDoctor) checkHTTPHealth(ctx context.Context) {
+	if d.config.Product == productFleet {
+		fmt.Fprint(d.out, "Checking service endpoint...")
+		d.check("Service endpoint accessible", doctorCheckSkip, "Skipped - Fleet does not expose a public service endpoint", nil)
+		fmt.Fprint(d.out, "Checking service readiness...")
+		d.check("Service readiness", doctorCheckSkip, "Skipped - Fleet does not expose a public readiness endpoint", nil)
+		return
+	}
+
+	d.checkEndpointAccessibility(ctx)
+	d.checkReadiness(ctx)
 }
 
 func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, logGroupIdentifier, outputName string, since time.Duration) (int, error) {
@@ -313,31 +339,28 @@ func (d *StackDoctor) fetchLogsFromGroup(ctx context.Context, logGroupIdentifier
 	return totalLines, nil
 }
 
-func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) (int, error) {
-	// Always create logs directory structure, even if we can't fetch logs
-	logsDir := filepath.Join(d.workDir, "logs")
-	err := os.MkdirAll(logsDir, 0755)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create logs directory: %w", err)
+func (d *StackDoctor) fetchLogs(ctx context.Context, since time.Duration) {
+	// Always create the logs directory, even if we can't fetch logs.
+	// createZipFile reports when it is missing.
+	if err := os.MkdirAll(filepath.Join(d.workDir, "logs"), 0755); err != nil {
+		return
 	}
 
 	serviceLogGroup := strings.TrimSpace(d.config.ServiceLogGroupName)
 	if serviceLogGroup == "" {
 		// Skip logs fetching for failed stacks or incomplete discoveries.
-		d.addCheck("Logs fetched", "⏭️", "Skipped - service not available", nil)
-		return 0, nil
+		d.addCheck("Logs fetched", doctorCheckSkip, "Skipped - service not available", nil)
+		return
 	}
 
-	fmt.Printf("Fetching application logs (since %s)...", since)
+	fmt.Fprintf(d.out, "Fetching application logs (since %s)...", since)
 	appLines, err := d.fetchLogsFromGroup(ctx, serviceLogGroup, "application", since)
 	if err != nil {
-		return 0, d.failCheck("Application logs fetched", "Failed to fetch application logs", err)
+		d.check("Application logs fetched", doctorCheckFail, "Failed to fetch application logs", err)
+		return
 	}
-	d.addCheck("Application logs fetched", "✅", fmt.Sprintf("%d lines", appLines), nil)
-	d.printCheckResult("✅", fmt.Sprintf("%d lines", appLines))
-
-	d.addCheck("Service logs fetched", "⏭️", "Skipped - ECS stacks use the application log group", nil)
-	return appLines, nil
+	d.check("Application logs fetched", doctorCheckPass, fmt.Sprintf("%d lines", appLines), nil)
+	d.addCheck("Service logs fetched", doctorCheckSkip, "Skipped - ECS stacks use the application log group", nil)
 }
 
 func (d *StackDoctor) saveResults() error {
@@ -411,10 +434,11 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 	}
 	defer d.cleanup()
 
-	// Run all checks, but continue on failures so doctor can export partial results.
-	_ = d.checkService(ctx)
-	d.checkHTTPHealth()
-	_, _ = d.fetchLogs(ctx, since)
+	// Run all checks, but continue on failures so doctor can export partial
+	// results. The failures are reported once the ZIP is written.
+	d.checkService(ctx)
+	d.checkHTTPHealth(ctx)
+	d.fetchLogs(ctx, since)
 
 	// Save results
 	err = d.saveResults()
@@ -434,9 +458,9 @@ func (d *StackDoctor) Run(ctx context.Context, since time.Duration) error {
 		absPath = zipFileName
 	}
 
-	fmt.Printf("\nFull results exported to: %s\n", absPath)
+	fmt.Fprintf(d.out, "\nFull results exported to: %s\n", absPath)
 
-	return nil
+	return d.result.failedChecksError()
 }
 
 func NewDoctorCmd(stack *Stack) *cobra.Command {
@@ -454,11 +478,12 @@ This command performs comprehensive health checks on your RunsOn stack:
 - Fetches application logs
 
 Results are exported as a timestamped ZIP file containing checks.json and logs.
+The command exits non-zero when any check fails, after exporting the ZIP file.
 
 The stack name can be overridden using the RUNS_ON_STACK_NAME or RUNS_ON_STACK environment variable.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			config, err := stack.getStackOutputs(cmd)
+			config, err := stack.discoverResources(cmd)
 			if err != nil {
 				return err
 			}
@@ -469,7 +494,7 @@ The stack name can be overridden using the RUNS_ON_STACK_NAME or RUNS_ON_STACK e
 				return fmt.Errorf("invalid --since value: %w", err)
 			}
 
-			doctor := NewStackDoctor(config)
+			doctor := NewStackDoctor(config, cmd.OutOrStdout())
 			return doctor.Run(cmd.Context(), duration)
 		},
 	}

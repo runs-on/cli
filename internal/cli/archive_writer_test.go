@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
+func TestArchiveWriterWritesJSONBytesAndFileEntries(t *testing.T) {
 	tmpDir := t.TempDir()
 	sourcePath := filepath.Join(tmpDir, "application.log")
 	if err := os.WriteFile(sourcePath, []byte("from disk\n"), 0644); err != nil {
@@ -28,11 +28,11 @@ func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
 	if err := archive.writeJSON("manifest.json", map[string]any{"ok": true}); err != nil {
 		t.Fatalf("writeJSON returned error: %v", err)
 	}
-	if err := archive.writeBytes("dynamodb\\job-42.ddb.json", []byte("{}\n")); err != nil {
+	if err := archive.writeBytes("diagnostics\\local-record.json", []byte("{}\n")); err != nil {
 		t.Fatalf("writeBytes returned error: %v", err)
 	}
-	if err := archive.writeText("server/job-42.jsonl", `{"message":"server"}`+"\n"); err != nil {
-		t.Fatalf("writeText returned error: %v", err)
+	if err := archive.writeBytes("server/job-42.jsonl", []byte(`{"message":"server"}`+"\n")); err != nil {
+		t.Fatalf("writeBytes returned error: %v", err)
 	}
 	if err := archive.writeReader("instances/i-123/metrics.jsonl", strings.NewReader(`{"cpu":42}`+"\n")); err != nil {
 		t.Fatalf("writeReader returned error: %v", err)
@@ -40,8 +40,8 @@ func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
 	if err := archive.writeFile("logs\\application.log", sourcePath); err != nil {
 		t.Fatalf("writeFile returned error: %v", err)
 	}
-	if err := archive.writeText("instances\\i-123\\console.log", "console line\n"); err != nil {
-		t.Fatalf("writeText returned error: %v", err)
+	if err := archive.writeBytes("instances\\i-123\\console.log", []byte("console line\n")); err != nil {
+		t.Fatalf("writeBytes returned error: %v", err)
 	}
 	if err := archive.Close(); err != nil {
 		t.Fatalf("Close returned error: %v", err)
@@ -51,7 +51,7 @@ func TestArchiveWriterWritesJSONBytesTextAndFileEntries(t *testing.T) {
 	gotNames := sortedArchiveWriterTestFileNames(files)
 	wantNames := []string{
 		"checks.json",
-		"dynamodb/job-42.ddb.json",
+		"diagnostics/local-record.json",
 		"instances/i-123/console.log",
 		"instances/i-123/metrics.jsonl",
 		"logs/application.log",

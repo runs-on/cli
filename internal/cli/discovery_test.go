@@ -15,10 +15,18 @@ import (
 
 type mockStackConfigSecretsClient struct {
 	getSecretValue func(context.Context, *secretsmanager.GetSecretValueInput, ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+	listSecrets    func(context.Context, *secretsmanager.ListSecretsInput, ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error)
 }
 
 func (m *mockStackConfigSecretsClient) GetSecretValue(ctx context.Context, input *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
 	return m.getSecretValue(ctx, input, optFns...)
+}
+
+func (m *mockStackConfigSecretsClient) ListSecrets(ctx context.Context, input *secretsmanager.ListSecretsInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error) {
+	if m.listSecrets == nil {
+		return nil, errors.New("AccessDeniedException: not authorized to perform secretsmanager:ListSecrets")
+	}
+	return m.listSecrets(ctx, input, optFns...)
 }
 
 type mockTaggedResourcesClient struct {
@@ -61,9 +69,6 @@ func TestLoadRunsOnConfigFromStackSecret(t *testing.T) {
 	if config.EC2InstanceLogGroupArn != "arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances" {
 		t.Fatalf("unexpected EC2 log group ARN %q", config.EC2InstanceLogGroupArn)
 	}
-	if config.WorkflowJobsTable != "workflow-jobs" {
-		t.Fatalf("unexpected workflow jobs table %q", config.WorkflowJobsTable)
-	}
 	if config.JobDiagnosticsResolver != "runs-on-preview-v3-job-diagnostics-resolver" {
 		t.Fatalf("unexpected diagnostics resolver %q", config.JobDiagnosticsResolver)
 	}
@@ -103,17 +108,11 @@ func TestLoadRunsOnConfigFromFleetSecret(t *testing.T) {
 	if config.Product != "fleet" {
 		t.Fatalf("unexpected product %q", config.Product)
 	}
-	if config.ClaimTableName != "runs-on-preview-v3-fleet-claims" {
-		t.Fatalf("claim table = %q", config.ClaimTableName)
-	}
 	if config.ServiceLogGroupName != "/aws/ecs/runs-on-preview-v3/fleetd" {
 		t.Fatalf("service log group = %q", config.ServiceLogGroupName)
 	}
 	if config.EC2InstanceLogGroupArn != "arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances" {
 		t.Fatalf("EC2 log group = %q", config.EC2InstanceLogGroupArn)
-	}
-	if config.WorkflowJobsTable != "" {
-		t.Fatalf("workflow jobs table = %q, want empty for Fleet", config.WorkflowJobsTable)
 	}
 	if config.JobDiagnosticsResolver != "runs-on-preview-v3-job-diagnostics-resolver" {
 		t.Fatalf("diagnostics resolver = %q", config.JobDiagnosticsResolver)
@@ -123,33 +122,34 @@ func TestLoadRunsOnConfigFromFleetSecret(t *testing.T) {
 	}
 }
 
-func TestValidateJobLogsRequiresDiagnosticsResolver(t *testing.T) {
+// Commands check the stack config before any AWS read; the log streams rely
+// on these checks.
+func TestRunsOnConfigValidation(t *testing.T) {
 	t.Parallel()
 
-	config := &RunsOnConfig{
-		StackName:              "runs-on-preview-v3",
-		Product:                "flex",
-		WorkflowJobsTable:      "workflow-jobs",
-		ServiceLogGroupName:    "/aws/ecs/runs-on-preview-v3/flexd",
-		EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances",
+	const (
+		noResolver = "CLI version matches the deployed RunsOn stack version"
+		noAppLogs  = `application log group not found for stack "runs-on-preview-v3"`
+	)
+	tests := []struct {
+		name     string
+		validate func(*RunsOnConfig) error
+		config   RunsOnConfig
+		want     string
+	}{
+		{name: "flex job lookup without resolver", validate: (*RunsOnConfig).validateJobLookup, config: RunsOnConfig{Product: productFlex}, want: noResolver},
+		{name: "fleet job lookup without resolver", validate: (*RunsOnConfig).validateJobLookup, config: RunsOnConfig{Product: productFleet}, want: noResolver},
+		{name: "job logs without application log group", validate: (*RunsOnConfig).validateJobLogs, config: RunsOnConfig{JobDiagnosticsResolver: "resolver", EC2InstanceLogGroupArn: "arn:ec2"}, want: noAppLogs},
+		{name: "stack logs without application log group", validate: (*RunsOnConfig).validateStackLogs, want: noAppLogs},
 	}
-	err := config.validateJobLogs()
-	if err == nil || !strings.Contains(err.Error(), "CLI version matches the deployed RunsOn stack version") {
-		t.Fatalf("expected version mismatch resolver error, got %v", err)
-	}
-}
-
-func TestValidateFleetJobLookupRequiresDiagnosticsResolver(t *testing.T) {
-	t.Parallel()
-
-	config := &RunsOnConfig{
-		StackName:      "runs-on-preview-v3",
-		Product:        "fleet",
-		ClaimTableName: "runs-on-preview-v3-fleet-claims",
-	}
-	err := config.validateJobLookup()
-	if err == nil || !strings.Contains(err.Error(), "CLI version matches the deployed RunsOn stack version") {
-		t.Fatalf("expected version mismatch resolver error, got %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.config.StackName = "runs-on-preview-v3"
+			if err := tt.validate(&tt.config); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -168,25 +168,69 @@ func TestLoadRunsOnConfigRejectsEmptySecret(t *testing.T) {
 	}
 }
 
-func TestLoadRunsOnConfigExplainsMissingStackSecret(t *testing.T) {
+func TestLoadRunsOnConfigExplainsMissingStack(t *testing.T) {
 	t.Parallel()
 
-	apiErr := &secretstypes.ResourceNotFoundException{
-		Message: aws.String("Secrets Manager can't find the specified secret."),
-	}
-	client := &mockStackConfigSecretsClient{
-		getSecretValue: func(context.Context, *secretsmanager.GetSecretValueInput, ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
-			return nil, apiErr
-		},
+	const header = `RunsOn stack "run-on-fleet-ue1" not found in AWS Secrets Manager region us-east-1 (no /runs-on/run-on-fleet-ue1/stack-config or /runs-on/run-on-fleet-ue1/fleet-config secret).`
+	const footer = "Make sure the selected stack name is correct and AWS_REGION points to the stack's AWS region."
+	listing := func(names ...string) func(context.Context, *secretsmanager.ListSecretsInput, ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error) {
+		return func(context.Context, *secretsmanager.ListSecretsInput, ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error) {
+			output := &secretsmanager.ListSecretsOutput{}
+			for _, name := range names {
+				output.SecretList = append(output.SecretList, secretstypes.SecretListEntry{Name: aws.String(name)})
+			}
+			return output, nil
+		}
 	}
 
-	_, err := loadRunsOnConfig(context.Background(), client, "runs-on-preview-v3", aws.Config{Region: "us-east-1"})
-	if err == nil {
-		t.Fatal("expected missing stack config secret error")
-	}
-	want := "the stack config secret /runs-on/runs-on-preview-v3/stack-config couldn't be found in AWS Secrets Manager region us-east-1. Make sure the selected stack name is correct and AWS_REGION points to the stack's AWS region"
-	if err.Error() != want {
-		t.Fatalf("unexpected error:\nwant: %s\n got: %s", want, err.Error())
+	for _, tc := range []struct {
+		name        string
+		listSecrets func(context.Context, *secretsmanager.ListSecretsInput, ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error)
+		hint        string
+	}{
+		{
+			name: "lists Flex and Fleet stacks",
+			listSecrets: listing(
+				"/runs-on/runs-on-fleet-ue1/fleet-config",
+				"/runs-on/runs-on-fleet-ue1/github-app",
+				"/RUNS-ON/other/stack-config",
+				"/runs-on/runs-on/stack-config",
+			),
+			hint: "Stacks found there: runs-on, runs-on-fleet-ue1\n",
+		},
+		{
+			name:        "names the only stack",
+			listSecrets: listing("/runs-on/runs-on-fleet-ue1/fleet-config", "/runs-on/runs-on-fleet-ue1/github-app"),
+			hint:        "Did you mean --stack runs-on-fleet-ue1?\n",
+		},
+		{
+			name:        "says when the region has no stacks",
+			listSecrets: listing("/runs-on/shared/github-app"),
+			hint:        "No RunsOn stacks were found there.\n",
+		},
+		{
+			name: "omits the hint when listing is denied",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := &mockStackConfigSecretsClient{
+				getSecretValue: func(context.Context, *secretsmanager.GetSecretValueInput, ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error) {
+					return nil, &secretstypes.ResourceNotFoundException{Message: aws.String("Secrets Manager can't find the specified secret.")}
+				},
+				listSecrets: tc.listSecrets,
+			}
+
+			_, err := loadRunsOnConfig(context.Background(), client, "run-on-fleet-ue1", aws.Config{Region: "us-east-1"})
+			if err == nil {
+				t.Fatal("expected missing stack error")
+			}
+			want := header + "\n" + tc.hint + footer
+			if err.Error() != want {
+				t.Fatalf("unexpected error:\nwant: %s\n got: %s", want, err.Error())
+			}
+		})
 	}
 }
 

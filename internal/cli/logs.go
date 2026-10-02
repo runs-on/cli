@@ -1,15 +1,17 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,12 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/spf13/cobra"
 )
-
-type StackOutputs struct {
-	ServiceLogGroupName    string
-	EC2InstanceLogGroupArn string
-}
 
 type LogOptions struct {
 	Watch         bool
@@ -43,107 +41,112 @@ type ec2ConsoleAPI interface {
 	GetConsoleOutput(ctx context.Context, params *ec2.GetConsoleOutputInput, optFns ...func(*ec2.Options)) (*ec2.GetConsoleOutputOutput, error)
 }
 
-type jobLogStreamer struct {
-	cwl     cloudWatchLogsAPI
-	ec2     ec2ConsoleAPI
-	outputs *StackOutputs
-	logger  *log.Logger
+// logStreamer prints a stack's or a job's logs.
+type logStreamer struct {
+	cwl    cloudWatchLogsAPI
+	ec2    ec2ConsoleAPI
+	config *RunsOnConfig
+	logger *log.Logger
+	stdout io.Writer
+	stderr io.Writer
 }
 
-func newJobLogStreamer(config *RunsOnConfig) *jobLogStreamer {
-	logger := log.New(io.Discard, "", 0)
-	return &jobLogStreamer{
-		cwl: cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		ec2: ec2.NewFromConfig(config.AWSConfig),
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    config.ServiceLogGroupName,
-			EC2InstanceLogGroupArn: config.EC2InstanceLogGroupArn,
-		},
-		logger: logger,
-	}
-}
-
-type applicationLogStreamer struct {
-	cwl     cloudWatchLogsAPI
-	outputs *StackOutputs
-	logger  *log.Logger
-}
-
-func newApplicationLogStreamer(config *RunsOnConfig) *applicationLogStreamer {
-	logger := log.New(io.Discard, "", 0)
-	return &applicationLogStreamer{
-		cwl: cloudwatchlogs.NewFromConfig(config.AWSConfig),
-		outputs: &StackOutputs{
-			ServiceLogGroupName: config.ServiceLogGroupName,
-		},
-		logger: logger,
+func newLogStreamer(cmd *cobra.Command, config *RunsOnConfig) *logStreamer {
+	return &logStreamer{
+		cwl:    cloudwatchlogs.NewFromConfig(config.AWSConfig),
+		ec2:    ec2.NewFromConfig(config.AWSConfig),
+		config: config,
+		logger: debugLogger(cmd),
+		stdout: cmd.OutOrStdout(),
+		stderr: cmd.ErrOrStderr(),
 	}
 }
 
-func (o *StackOutputs) applicationLogGroupIdentifier() (string, error) {
-	if o == nil {
-		return "", fmt.Errorf("application log group not found")
-	}
-	if o.ServiceLogGroupName != "" {
-		return o.ServiceLogGroupName, nil
-	}
-	return "", fmt.Errorf("application log group not found")
-}
-
-func (s *jobLogStreamer) Stream(ctx context.Context, jobID string, facts *jobFactsProvider, includeTypes []string, opts *LogOptions) error {
-	s.ensureLogger()
-	if facts == nil {
-		return fmt.Errorf("workflow job facts provider is required")
-	}
-	if opts == nil {
-		opts = &LogOptions{}
-	}
+func (s *logStreamer) StreamJob(ctx context.Context, facts *jobFactsProvider, includeTypes []string, opts *LogOptions) error {
+	jobID := strconv.FormatInt(facts.job.JobID, 10)
 	s.logger.Printf("Fetching logs for job ID: %s (include types: %v)", jobID, includeTypes)
 
 	if err := facts.refresh(ctx); err != nil {
 		return err
 	}
-	s.applyJobLogWindow(facts, opts)
+	s.applyJobLogWindow(facts.current(), facts.job.JobID, opts)
 	facts.logLookupSnapshot()
-	if diagnostics := facts.currentDiagnostics(); diagnostics != nil {
-		diagnostics.writeSummary(os.Stderr)
-	}
-	refreshCtx, cancelRefresh := context.WithCancel(ctx)
-	defer cancelRefresh()
-	if opts.Watch {
-		facts.startRefreshWithInterval(refreshCtx, opts.WatchInterval)
-	}
+	facts.currentDiagnostics().writeSummary(s.stderr)
 
-	session := newStreamedLogSession(opts, s.logger)
-	s.startInstanceCloudWatchStreams(ctx, session, jobID, facts, opts)
-	if includeLogType(includeTypes, "console") {
+	session := newStreamedLogSession(opts, s.logger, s.stdout, s.stderr)
+	if current := facts.current(); len(current.InstanceIDs) == 0 && current.Found {
+		fmt.Fprintf(s.stderr, "Instance logs are not available yet for job %s; streaming application logs.\n", jobID)
+	}
+	streamed := make(map[string]bool)
+	streamNewInstances := func() {
+		for _, instanceID := range facts.current().InstanceIDs {
+			if streamed[instanceID] {
+				continue
+			}
+			streamed[instanceID] = true
+			session.start(ctx, s.cwl, cloudWatchStream{prefix: "instance " + instanceID, update: func(input *cloudwatchlogs.FilterLogEventsInput) error {
+				input.LogGroupIdentifier = &s.config.EC2InstanceLogGroupArn
+				input.FilterPattern = aws.String("")
+				applyLogTimeBounds(input, opts)
+				input.LogStreamNamePrefix = aws.String(instanceID + "/")
+				s.logger.Printf("Streaming instance logs with arn: %s, prefix: %s", *input.LogGroupIdentifier, *input.LogStreamNamePrefix)
+				return nil
+			}})
+		}
+	}
+	streamNewInstances()
+	if opts.Watch {
+		go func() {
+			ticker := time.NewTicker(opts.WatchInterval)
+			defer ticker.Stop()
+			facts.refreshUntilCompleted(ctx, ticker.C, func() {
+				// A queued Fleet job can gain an instance after the initial
+				// drain; its stream then delivers through the live channel.
+				select {
+				case <-ctx.Done():
+				case <-session.drained:
+					streamNewInstances()
+				}
+			})
+		}()
+	}
+	if slices.Contains(includeTypes, "console") {
 		session.startOnce("console", func(collector *logCollector) error {
 			return s.collectConsoleLogs(ctx, facts, collector, opts)
 		})
 	}
-	updateApplicationLogInput := s.updateJobApplicationLogInput(jobID, facts, opts)
-	if includeLogType(includeTypes, "run") {
-		session.startCloudWatchStream(ctx, "application", s.cwl, updateApplicationLogInput)
-	} else {
-		session.startFilteredCloudWatchStream(ctx, "application", s.cwl, updateApplicationLogInput, func(message string) bool {
-			return jobLogLineMatches(message, facts.jobURL(), jobID, facts.scalesetJobID(), facts.currentInstanceIDs())
-		}, func() string {
-			return jobLogCorrelationKey(facts.jobURL(), facts.scalesetJobID(), facts.currentInstanceIDs())
-		})
+	application := cloudWatchStream{prefix: "application", update: func(input *cloudwatchlogs.FilterLogEventsInput) error {
+		input.LogGroupIdentifier = aws.String(s.config.ServiceLogGroupName)
+		applyLogTimeBounds(input, opts)
+		runID := facts.current().RunID
+		if runID == 0 {
+			return fmt.Errorf("workflow run ID for job %s not available yet", jobID)
+		}
+		input.FilterPattern = aws.String(runFilterPattern(runID))
+		s.logger.Printf("Filter pattern: %s", *input.FilterPattern)
+		return nil
+	}}
+	if !slices.Contains(includeTypes, "run") {
+		application.accept = func(message string) bool {
+			f := facts.current()
+			return jobLogLineMatches(message, f.JobURL, jobID, f.ScalesetJobID, f.InstanceIDs)
+		}
+		application.correlationKey = func() string {
+			f := facts.current()
+			return jobLogCorrelationKey(f.JobURL, f.ScalesetJobID, f.InstanceIDs)
+		}
 	}
-
+	session.start(ctx, s.cwl, application)
 	return session.drainAndWatch(ctx)
 }
 
-func (s *jobLogStreamer) applyJobLogWindow(facts *jobFactsProvider, opts *LogOptions) {
-	if facts == nil || opts == nil {
+// applyJobLogWindow bounds a job's logs by its timestamps; watch mode keeps
+// reading past the end.
+func (s *logStreamer) applyJobLogWindow(facts *workflowJobFacts, jobID int64, opts *LogOptions) {
+	if !facts.Found {
 		return
 	}
-	current := facts.current()
-	if current == nil {
-		return
-	}
-	window, err := current.fullLogWindow()
+	window, err := facts.fullLogWindow(jobID)
 	if err != nil {
 		s.logger.Printf("Job timestamps unavailable, using fallback log start time: %v", err)
 		return
@@ -156,31 +159,16 @@ func (s *jobLogStreamer) applyJobLogWindow(facts *jobFactsProvider, opts *LogOpt
 	opts.EndTime = window.End.UnixMilli()
 }
 
-func (s *applicationLogStreamer) Stream(ctx context.Context, opts *LogOptions) error {
-	s.ensureLogger()
-	session := newStreamedLogSession(opts, s.logger)
-	session.startCloudWatchStream(ctx, "application", s.cwl, s.updateAllApplicationLogInput(opts))
+// StreamStack streams all of the stack's application logs.
+func (s *logStreamer) StreamStack(ctx context.Context, opts *LogOptions) error {
+	session := newStreamedLogSession(opts, s.logger, s.stdout, s.stderr)
+	session.start(ctx, s.cwl, cloudWatchStream{prefix: "application", update: func(input *cloudwatchlogs.FilterLogEventsInput) error {
+		input.LogGroupIdentifier = aws.String(s.config.ServiceLogGroupName)
+		input.FilterPattern = aws.String("")
+		applyLogTimeBounds(input, opts)
+		return nil
+	}})
 	return session.drainAndWatch(ctx)
-}
-
-func (s *jobLogStreamer) ensureLogger() {
-	if s.logger == nil {
-		s.logger = log.New(io.Discard, "", 0)
-	}
-}
-
-func (s *applicationLogStreamer) ensureLogger() {
-	if s.logger == nil {
-		s.logger = log.New(io.Discard, "", 0)
-	}
-}
-
-func jobApplicationFilterPattern(jobID string, facts *jobFactsProvider) (string, error) {
-	runID := facts.runID()
-	if runID == 0 {
-		return "", fmt.Errorf("workflow run ID for job %s not available yet", jobID)
-	}
-	return runFilterPattern(runID), nil
 }
 
 type jobLogFields struct {
@@ -232,10 +220,6 @@ func jobLogCorrelationKey(jobURL, scalesetJobID string, instanceIDs []string) st
 	return strings.Join(identifiers, "\x00")
 }
 
-func includeLogType(includeTypes []string, includeType string) bool {
-	return slices.Contains(includeTypes, includeType)
-}
-
 type logEvent struct {
 	message   string
 	prefix    string
@@ -253,7 +237,7 @@ type applicationLogEvent struct {
 	Timestamp  time.Time `json:"time"`
 }
 
-func (e *logEvent) print(format string) {
+func (e *logEvent) print(w io.Writer, format string) {
 	message := e.message
 	localTime := time.UnixMilli(e.timestamp).Local().Format("2006-01-02T15:04:05.000Z07:00")
 
@@ -267,7 +251,7 @@ func (e *logEvent) print(format string) {
 	}
 
 	if e.noColor {
-		fmt.Printf("%s [%s] %s\n", localTime, e.stream, message)
+		fmt.Fprintf(w, "%s [%s] %s\n", localTime, e.stream, message)
 		return
 	}
 
@@ -283,7 +267,7 @@ func (e *logEvent) print(format string) {
 		color = "\033[35m" // magenta for console
 		stream = e.prefix
 	}
-	fmt.Printf("\033[90m%s\033[0m %s[%s]\033[0m %s\n", localTime, color, stream, message)
+	fmt.Fprintf(w, "\033[90m%s\033[0m %s[%s]\033[0m %s\n", localTime, color, stream, message)
 }
 
 type logCollector struct {
@@ -323,62 +307,114 @@ type streamedLogSession struct {
 	collector *logCollector
 	opts      *LogOptions
 	logger    *log.Logger
-	drained   chan struct{}
-	drainOnce sync.Once
+	stdout    io.Writer
+	stderr    io.Writer
+	drained   chan struct{} // closed once the past events are printed
+
+	failuresMu    sync.Mutex
+	failedSources map[string]struct{}
+	shownFailures map[string]struct{}
 }
 
-func newStreamedLogSession(opts *LogOptions, logger *log.Logger) *streamedLogSession {
-	if opts == nil {
-		opts = &LogOptions{}
-	}
-	if logger == nil {
-		logger = log.New(io.Discard, "", 0)
-	}
+func newStreamedLogSession(opts *LogOptions, logger *log.Logger, stdout, stderr io.Writer) *streamedLogSession {
 	return &streamedLogSession{
-		collector: newLogCollector(),
-		opts:      opts,
-		logger:    logger,
-		drained:   make(chan struct{}),
+		collector:     newLogCollector(),
+		opts:          opts,
+		logger:        logger,
+		stdout:        stdout,
+		stderr:        stderr,
+		drained:       make(chan struct{}),
+		failedSources: make(map[string]struct{}),
+		shownFailures: make(map[string]struct{}),
 	}
 }
 
-func (s *streamedLogSession) startCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) {
-	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, nil, nil, 0, true)
+// reportFailure warns that a log source could not be read. Watch mode
+// re-polls every interval, so each distinct error is shown once per source.
+func (s *streamedLogSession) reportFailure(source string, err error) {
+	s.logger.Printf("[%s]: Error fetching logs: %v", source, err)
+	key := source + "\x00" + logFailureKey(err)
+	s.failuresMu.Lock()
+	defer s.failuresMu.Unlock()
+	s.failedSources[source] = struct{}{}
+	if _, shown := s.shownFailures[key]; shown {
+		return
+	}
+	s.shownFailures[key] = struct{}{}
+	fmt.Fprintf(s.stderr, "Warning: cannot read %s logs: %v\n", source, err)
 }
 
-func (s *streamedLogSession) startFilteredCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string) {
-	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, accept, correlationKey, cloudWatchWatchReplayOverlap, true)
+// incompleteError reports whether any log source failed.
+func (s *streamedLogSession) incompleteError() error {
+	s.failuresMu.Lock()
+	defer s.failuresMu.Unlock()
+	switch failed := len(s.failedSources); failed {
+	case 0:
+		return nil
+	case 1:
+		return errors.New("1 log source failed; output is incomplete")
+	default:
+		return fmt.Errorf("%d log sources failed; output is incomplete", failed)
+	}
 }
 
-func (s *streamedLogSession) startLiveCloudWatchStream(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error) {
-	s.startCloudWatchStreamWithInitialWait(ctx, prefix, cwl, updateInput, nil, nil, 0, false)
+// logFailureKey identifies an error for de-duplication. AWS API errors carry a
+// per-request ID in their text, so they are identified by code and message.
+func logFailureKey(err error) string {
+	var apiErr interface {
+		ErrorCode() string
+		ErrorMessage() string
+	}
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() + ": " + apiErr.ErrorMessage()
+	}
+	return err.Error()
 }
 
-func (s *streamedLogSession) startCloudWatchStreamWithInitialWait(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string, watchReplayOverlap time.Duration, waitForFirstPass bool) {
-	if waitForFirstPass {
+// cloudWatchStream is one CloudWatch log source of a session.
+type cloudWatchStream struct {
+	prefix string // names the source in output and warnings
+	update func(*cloudwatchlogs.FilterLogEventsInput) error
+	// accept keeps only the events it matches. Watch mode then re-reads the
+	// last minute on every poll for late events, and replays the whole window
+	// when correlationKey changes.
+	accept         func(string) bool
+	correlationKey func() string
+}
+
+// start polls stream in the background. The initial drain waits for the first
+// pass of the streams started before it; later ones only add live events.
+func (s *streamedLogSession) start(ctx context.Context, cwl cloudWatchLogsAPI, stream cloudWatchStream) {
+	firstPassDone := func() {}
+	select {
+	case <-s.drained:
+	default:
 		s.collector.wg.Add(1)
+		firstPassDone = sync.OnceFunc(s.collector.wg.Done)
 	}
-	markPastEventsCollected := sync.OnceFunc(func() {
-		if waitForFirstPass {
-			s.collector.wg.Done()
-		}
-	})
 	go func() {
-		if err := s.streamCloudWatchLogs(ctx, prefix, cwl, updateInput, accept, correlationKey, watchReplayOverlap, markPastEventsCollected); err != nil {
-			s.logger.Printf("Error streaming %s logs: %v", prefix, err)
+		if err := s.streamCloudWatchLogs(ctx, cwl, stream, firstPassDone); err != nil {
+			s.logger.Printf("Error streaming %s logs: %v", stream.prefix, err)
 		}
 	}()
 }
 
 func (s *streamedLogSession) startOnce(prefix string, collect func(*logCollector) error) {
 	s.collector.wg.Go(func() {
-		if err := collect(s.collector); err != nil {
-			s.logger.Printf("Error streaming %s logs: %v", prefix, err)
+		if err := collect(s.collector); err != nil && !errors.Is(err, context.Canceled) {
+			s.reportFailure(prefix, err)
 		}
 	})
 }
 
-func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix string, cwl cloudWatchLogsAPI, updateInput func(*cloudwatchlogs.FilterLogEventsInput) error, accept func(string) bool, correlationKey func() string, watchReplayOverlap time.Duration, markPastEventsCollected func()) error {
+// streamCloudWatchLogs reports a failed fetch under the stream's prefix and
+// polls again on the next watch interval.
+func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, cwl cloudWatchLogsAPI, stream cloudWatchStream, firstPassDone func()) error {
+	prefix, accept, correlationKey := stream.prefix, stream.accept, stream.correlationKey
+	var overlap time.Duration
+	if s.opts.Watch && accept != nil {
+		overlap = cloudWatchWatchReplayOverlap
+	}
 	input := &cloudwatchlogs.FilterLogEventsInput{}
 	lastCorrelationKey := ""
 	if correlationKey != nil {
@@ -387,7 +423,7 @@ func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix st
 
 	for {
 		if err := ctx.Err(); err != nil {
-			markPastEventsCollected()
+			firstPassDone()
 			return err
 		}
 		if correlationKey != nil {
@@ -399,21 +435,25 @@ func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix st
 				lastCorrelationKey = currentCorrelationKey
 			}
 		}
-		if err := updateInput(input); err != nil {
+		if err := stream.update(input); err != nil {
 			s.logger.Printf("[%s]: Cannot stream logs: %v", prefix, err)
 		} else {
 			s.logger.Printf("[%s]: Streaming logs...", prefix)
 
 			paginator := cloudwatchlogs.NewFilterLogEventsPaginator(cwl, input)
 			var lastTimestamp int64
+			var fetchErr error
 
 			for paginator.HasMorePages() {
 				s.logger.Printf("[%s]: Fetching next page", prefix)
 				output, err := paginator.NextPage(ctx)
 				if err != nil {
-					s.logger.Printf("[%s]: Error fetching logs: %v", prefix, err)
-					markPastEventsCollected()
-					return fmt.Errorf("error fetching logs: %w", err)
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						firstPassDone()
+						return ctxErr
+					}
+					fetchErr = err
+					break
 				}
 
 				if output.NextToken != nil {
@@ -444,25 +484,24 @@ func (s *streamedLogSession) streamCloudWatchLogs(ctx context.Context, prefix st
 				s.logger.Printf("[%s]: Done fetching page", prefix)
 			}
 
-			if lastTimestamp > 0 {
+			if fetchErr != nil {
+				// Keep the cursor so the next poll retries the pages that failed.
+				s.reportFailure(prefix, fetchErr)
+			} else if lastTimestamp > 0 {
 				nextStartTime := lastTimestamp + 1
-				if s.opts.Watch && watchReplayOverlap > 0 {
-					nextStartTime = max(lastTimestamp-watchReplayOverlap.Milliseconds(), s.opts.StartTime)
+				if overlap > 0 {
+					nextStartTime = max(lastTimestamp-overlap.Milliseconds(), s.opts.StartTime)
 				}
 				input.StartTime = aws.Int64(nextStartTime)
 			} else {
-				lookback := time.Second
-				if s.opts.Watch && watchReplayOverlap > 0 {
-					lookback = watchReplayOverlap
-				}
-				nextStartTime := max(time.Now().UnixMilli()-lookback.Milliseconds(), s.opts.StartTime)
-				input.StartTime = aws.Int64(nextStartTime)
+				lookback := cmp.Or(overlap, time.Second)
+				input.StartTime = aws.Int64(max(time.Now().UnixMilli()-lookback.Milliseconds(), s.opts.StartTime))
 			}
-			s.logger.Printf("[%s]: Updated start time: %d", prefix, *input.StartTime)
+			s.logger.Printf("[%s]: Updated start time: %d", prefix, aws.ToInt64(input.StartTime))
 		}
 
 		s.logger.Printf("[%s]: Done streaming logs", prefix)
-		markPastEventsCollected()
+		firstPassDone()
 		if !s.opts.Watch {
 			break
 		}
@@ -484,115 +523,35 @@ func (s *streamedLogSession) drainAndWatch(ctx context.Context) error {
 	sort.Slice(s.collector.events, func(i, j int) bool {
 		return s.collector.events[i].timestamp < s.collector.events[j].timestamp
 	})
-	format := s.opts.Format
-	if format == "" {
-		format = "long"
-	}
 	for _, event := range s.collector.events {
-		event.print(format)
+		event.print(s.stdout, s.opts.Format)
 	}
 	s.collector.pastEventsCollected = true
-	s.drainOnce.Do(func() {
-		close(s.drained)
-	})
+	close(s.drained)
 	s.collector.mu.Unlock()
 
 	if !s.opts.Watch {
-		return nil
+		return s.incompleteError()
 	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case event := <-s.collector.eventCh:
-			event.print(format)
-		case <-time.After(10 * time.Second):
-			if !s.opts.Watch {
-				return nil
-			}
+			event.print(s.stdout, s.opts.Format)
 		}
 	}
 }
 
-func (s *jobLogStreamer) startInstanceCloudWatchStreams(ctx context.Context, session *streamedLogSession, jobID string, facts *jobFactsProvider, opts *LogOptions) {
-	seen := make(map[string]struct{})
-	start := func(instanceID string, waitForFirstPass bool) {
-		if _, ok := seen[instanceID]; ok {
-			return
-		}
-		seen[instanceID] = struct{}{}
-		if waitForFirstPass {
-			session.startCloudWatchStream(ctx, "instance", s.cwl, s.updateInstanceLogInput(instanceID, opts))
-			return
-		}
-		session.startLiveCloudWatchStream(ctx, "instance", s.cwl, s.updateInstanceLogInput(instanceID, opts))
-	}
-
-	instanceIDs := facts.currentInstanceIDs()
+func (s *logStreamer) collectConsoleLogs(ctx context.Context, facts *jobFactsProvider, collector *logCollector, opts *LogOptions) error {
+	instanceIDs := facts.current().InstanceIDs
 	if len(instanceIDs) == 0 {
-		if facts.current() != nil {
-			fmt.Fprintf(os.Stderr, "Instance logs are not available yet for job %s; streaming application logs.\n", jobID)
-		}
-	} else {
-		for _, instanceID := range instanceIDs {
-			start(instanceID, true)
-		}
-	}
-
-	if !opts.Watch {
-		return
-	}
-
-	go func() {
-		ticker := time.NewTicker(opts.WatchInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				for _, instanceID := range facts.currentInstanceIDs() {
-					if _, ok := seen[instanceID]; ok {
-						continue
-					}
-					// In watch mode a queued Fleet job can be assigned after the
-					// command starts; wait until the initial drain is complete so
-					// late instance streams deliver through the live event channel.
-					select {
-					case <-ctx.Done():
-						return
-					case <-session.drained:
-						start(instanceID, false)
-					}
-				}
-			}
-		}
-	}()
-}
-
-func (s *jobLogStreamer) updateInstanceLogInput(instanceID string, opts *LogOptions) func(*cloudwatchlogs.FilterLogEventsInput) error {
-	return func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		input.LogGroupIdentifier = &s.outputs.EC2InstanceLogGroupArn
-		input.FilterPattern = aws.String("")
-		applyLogTimeBounds(input, opts)
-		input.LogStreamNamePrefix = aws.String(fmt.Sprintf("%s/", instanceID))
-		s.logger.Printf("Streaming instance logs with arn: %s, prefix: %s", *input.LogGroupIdentifier, *input.LogStreamNamePrefix)
+		// A job without an instance yet has no console output to read.
+		s.logger.Printf("Console logs unavailable: %v", facts.instanceUnavailableError())
 		return nil
 	}
-}
 
-func (s *jobLogStreamer) collectConsoleLogs(ctx context.Context, facts *jobFactsProvider, collector *logCollector, opts *LogOptions) error {
-	instanceIDs := facts.currentInstanceIDs()
-	if len(instanceIDs) == 0 {
-		if instanceID := facts.currentInstanceID(); instanceID != "" {
-			instanceIDs = []string{instanceID}
-		}
-	}
-	if len(instanceIDs) == 0 {
-		return facts.instanceUnavailableError()
-	}
-
+	var errs []error
 	for _, instanceID := range instanceIDs {
 		input := &ec2.GetConsoleOutputInput{
 			InstanceId: aws.String(instanceID),
@@ -600,7 +559,8 @@ func (s *jobLogStreamer) collectConsoleLogs(ctx context.Context, facts *jobFacts
 
 		result, err := s.ec2.GetConsoleOutput(ctx, input)
 		if err != nil {
-			return fmt.Errorf("error fetching console logs: %w", err)
+			errs = append(errs, fmt.Errorf("instance %s: %w", instanceID, err))
+			continue
 		}
 
 		if result.Output != nil {
@@ -633,49 +593,14 @@ func (s *jobLogStreamer) collectConsoleLogs(ctx context.Context, facts *jobFacts
 		}
 	}
 
-	return nil
-}
-
-func (s *jobLogStreamer) updateJobApplicationLogInput(jobID string, facts *jobFactsProvider, opts *LogOptions) func(*cloudwatchlogs.FilterLogEventsInput) error {
-	return updateApplicationLogInput(s.outputs, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		applyLogTimeBounds(input, opts)
-		filterPattern, err := jobApplicationFilterPattern(jobID, facts)
-		if err != nil {
-			return err
-		}
-		input.FilterPattern = aws.String(filterPattern)
-		s.logger.Printf("Filter pattern: %s", *input.FilterPattern)
-		return nil
-	})
-}
-
-func (s *applicationLogStreamer) updateAllApplicationLogInput(opts *LogOptions) func(*cloudwatchlogs.FilterLogEventsInput) error {
-	return updateApplicationLogInput(s.outputs, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		input.FilterPattern = aws.String("")
-		applyLogTimeBounds(input, opts)
-		return nil
-	})
+	return errors.Join(errs...)
 }
 
 func applyLogTimeBounds(input *cloudwatchlogs.FilterLogEventsInput, opts *LogOptions) {
-	if opts == nil {
-		return
-	}
 	if input.StartTime == nil {
 		input.StartTime = aws.Int64(opts.StartTime)
 	}
 	if opts.EndTime > 0 {
 		input.EndTime = aws.Int64(opts.EndTime)
-	}
-}
-
-func updateApplicationLogInput(outputs *StackOutputs, update func(*cloudwatchlogs.FilterLogEventsInput) error) func(*cloudwatchlogs.FilterLogEventsInput) error {
-	return func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		logGroupArn, err := outputs.applicationLogGroupIdentifier()
-		if err != nil {
-			return err
-		}
-		input.LogGroupIdentifier = &logGroupArn
-		return update(input)
 	}
 }

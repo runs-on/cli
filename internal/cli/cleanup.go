@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,7 +29,8 @@ func NewCleanupCmd(stack *Stack) *cobra.Command {
 		Long: `Deletes everything the RunsOn stack cached for the ref a job ran on:
 
   - classic cache objects       (s3://<cache-bucket>/cache/v1/<org>/<repo>/<ref>/...)
-  - isolated cache objects      (s3://<cache-bucket>/scoped-cache/<ownerID>/<repoID>/<scope>/...)
+  - isolated cache objects      (s3://<cache-bucket>/scoped-cache/<ownerID>/<repoID>/<scope>/...,
+                                 or scoped-cache/0/<repoID>/<scope>/... on GHE.com)
   - sticky-disk snapshots       (EBS snapshots tagged for the repo and branch scope)
 
 Pull-request runs clean each associated pull request's refs/pull/N/merge
@@ -49,17 +49,17 @@ not scoped to a ref.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			jobRef, err := requireGitHubJobURL(args[0])
+			jobRef, err := parseGitHubJobURL(args[0])
 			if err != nil {
 				return err
 			}
-			config, err := stack.getStackOutputs(cmd)
+			config, err := stack.discoverResources(cmd)
 			if err != nil {
 				return err
 			}
 
 			ctx := cmd.Context()
-			diagnostics, err := newJobDiagnosticsResolver(config).Resolve(ctx, args[0])
+			diagnostics, err := newJobDiagnosticsResolver(config).resolveRequest(ctx, buildJobDiagnosticsRequest(jobRef))
 			if err != nil {
 				return err
 			}
@@ -117,40 +117,6 @@ func validateCleanupJob(diagnostics *jobDiagnosticsResponse, config *RunsOnConfi
 		return fmt.Errorf("selected stack returned workflow run %d while validating run %d", diagnostics.Local.WorkflowRunID, job.RunID)
 	}
 	return diagnostics.validateStackProduct(config.Product, config.StackName, job.JobID)
-}
-
-// ghAPIRunner fetches GitHub API paths; implemented by the gh CLI and faked
-// in tests. Missing resources return an error wrapping errGHNotFound so
-// callers can distinguish definitive absence from transient failures.
-type ghAPIRunner interface {
-	Get(ctx context.Context, host, path string) ([]byte, error)
-}
-
-var errGHNotFound = fmt.Errorf("not found")
-
-type ghCLIRunner struct{}
-
-func (ghCLIRunner) Get(ctx context.Context, host, path string) ([]byte, error) {
-	args := []string{"api"}
-	if host = strings.TrimSpace(host); host != "" && !strings.EqualFold(host, "github.com") {
-		args = append(args, "--hostname", host)
-	}
-	args = append(args, path)
-	output, err := exec.CommandContext(ctx, "gh", args...).CombinedOutput()
-	if err != nil {
-		if _, lookupErr := exec.LookPath("gh"); lookupErr != nil {
-			return nil, fmt.Errorf("cleanup requires the GitHub CLI; install gh and run `gh auth login` with repository read access")
-		}
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
-		}
-		if strings.Contains(message, "HTTP 404") {
-			return nil, fmt.Errorf("%s: %w", path, errGHNotFound)
-		}
-		return nil, fmt.Errorf("GitHub CLI could not fetch %s; run `gh auth login` with repository read access: %s", path, message)
-	}
-	return output, nil
 }
 
 // resolveCleanupTarget derives the refs to clean from the job's workflow run

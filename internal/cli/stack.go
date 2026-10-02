@@ -9,12 +9,6 @@ type Stack struct {
 	cfg aws.Config
 }
 
-// getStackOutputs loads the stable stack metadata that roc needs from the
-// standard stack config secret for the selected stack.
-func (s *Stack) getStackOutputs(cmd *cobra.Command) (*RunsOnConfig, error) {
-	return s.discoverResources(cmd)
-}
-
 func NewStack(cfg aws.Config) *Stack {
 	return &Stack{cfg: cfg}
 }
