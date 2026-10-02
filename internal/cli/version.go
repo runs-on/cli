@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 
 	"roc/internal/version"
 
@@ -14,7 +13,7 @@ func NewVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Display the version of roc",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Fprintf(os.Stdout, "%s\n", version.String())
+			fmt.Fprintln(cmd.OutOrStdout(), version.String())
 		},
 	}
 

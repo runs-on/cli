@@ -2,10 +2,13 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -91,15 +94,25 @@ func TestCleanupTargetPrefixes(t *testing.T) {
 	if got := target.v1CachePrefixes(); len(got) != 1 || got[0].Prefix != "cache/v1/acme/widgets/refs/heads/main/" || got[0].Ref != "refs/heads/main" {
 		t.Errorf("v1CachePrefixes = %v", got)
 	}
-	want := fmt.Sprintf("scoped-cache/101/202/%s/", cacheScopeSegment("refs/heads/main"))
-	if got := target.scopedCachePrefixes(); len(got) != 1 || got[0] != want {
-		t.Errorf("scopedCachePrefixes = %v, want [%s]", got, want)
+	segment := cacheScopeSegment("refs/heads/main")
+	// Tokens without repository_owner_id (GHE.com) write under owner 0, so
+	// both layouts are cleaned.
+	want := []string{
+		fmt.Sprintf("scoped-cache/101/202/%s/", segment),
+		fmt.Sprintf("scoped-cache/0/202/%s/", segment),
 	}
-	// Missing numeric IDs (e.g. gh output drift) must skip scoped prefixes
-	// rather than constructing a wrong path.
+	if got := target.scopedCachePrefixes(); !slices.Equal(got, want) {
+		t.Errorf("scopedCachePrefixes = %v, want %v", got, want)
+	}
 	target.OwnerID = 0
+	if got := target.scopedCachePrefixes(); !slices.Equal(got, want[1:]) {
+		t.Errorf("scopedCachePrefixes without owner ID = %v, want %v", got, want[1:])
+	}
+	// A missing repository ID (e.g. gh output drift) must skip scoped
+	// prefixes rather than constructing a wrong path.
+	target.RepoID = 0
 	if got := target.scopedCachePrefixes(); got != nil {
-		t.Errorf("expected no scoped prefixes without IDs, got %v", got)
+		t.Errorf("expected no scoped prefixes without a repository ID, got %v", got)
 	}
 }
 
@@ -116,241 +129,178 @@ func (f fakeGH) Get(_ context.Context, _, path string) ([]byte, error) {
 }
 
 func TestResolveCleanupTarget(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": [{"number": 42}]}`,
-	}}
+	t.Parallel()
+
+	const defaultRepo = `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`
+	tests := []struct {
+		name           string
+		repo           string // repository response; defaultRepo when empty
+		run            string // workflow run 77 response
+		extra          map[string]string
+		includeDefault bool
+		wantErr        string
+		wantCacheRefs  string
+		wantBranches   string
+		wantSlug       string // "acme/widgets" when empty
+		wantWarning    string // substring of the single warning; none when empty
+		wantNested     map[string]string
+	}{
+		{
+			name:           "pull request plus default branch opt-in",
+			run:            `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": [{"number": 42}]}`,
+			includeDefault: true,
+			wantCacheRefs:  "refs/pull/42/merge,refs/heads/main",
+			wantBranches:   "refs/pull/42/merge,main",
+		},
+		{
+			// Each associated PR's merge scope is re-creatable per-PR cache data.
+			name:          "run associated with several pull requests",
+			run:           `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": [{"number": 7}, {"number": 8}]}`,
+			wantCacheRefs: "refs/pull/7/merge,refs/pull/8/merge",
+			wantBranches:  "refs/pull/7/merge,refs/pull/8/merge",
+		},
+		{
+			// Fork PR runs report an empty pull_requests list: the PR numbers
+			// are recovered from the head commit, and the fork's head branch
+			// name must not leak into the refs.
+			name:          "fork pull request recovers PRs from head commit",
+			run:           `{"head_branch": "main", "head_sha": "abc123", "event": "pull_request", "pull_requests": []}`,
+			extra:         map[string]string{"repos/acme/widgets/commits/abc123/pulls": `[{"number": 7}, {"number": 8}]`},
+			wantCacheRefs: "refs/pull/7/merge,refs/pull/8/merge",
+			wantBranches:  "refs/pull/7/merge,refs/pull/8/merge",
+		},
+		{
+			name:           "pull request without a resolvable PR",
+			run:            `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": []}`,
+			extra:          map[string]string{"repos/acme/widgets/commits/abc/pulls": `[]`},
+			includeDefault: true,
+			wantErr:        "could not determine the pull request",
+		},
+		{
+			// pull_request_target caches under the default branch (the PR base
+			// branch before 2025-12-08), a shared lineage behind the opt-in.
+			name:    "pull_request_target refused without opt-in",
+			run:     `{"head_branch": "main", "head_sha": "abc", "event": "pull_request_target", "pull_requests": [{"number": 42}]}`,
+			wantErr: "--include-default-branch",
+		},
+		{
+			// With the opt-in, the run's Flex merge-ref sticky-disk scopes too.
+			name:           "pull_request_target with opt-in",
+			run:            `{"head_branch": "main", "head_sha": "abc", "event": "pull_request_target", "pull_requests": [{"number": 42}]}`,
+			includeDefault: true,
+			wantCacheRefs:  "refs/heads/main",
+			wantBranches:   "refs/pull/42/merge,main",
+		},
+		{
+			// workflow_run executes on the default branch regardless of the
+			// upstream branch.
+			name:    "workflow_run refused without opt-in",
+			run:     `{"head_branch": "feature/x", "head_sha": "abc", "event": "workflow_run", "pull_requests": []}`,
+			wantErr: "--include-default-branch",
+		},
+		{
+			// With the opt-in, the upstream head branch Flex uses as scope too.
+			name:           "workflow_run with opt-in",
+			run:            `{"head_branch": "feature/x", "head_sha": "abc", "event": "workflow_run", "pull_requests": []}`,
+			includeDefault: true,
+			wantCacheRefs:  "refs/heads/main",
+			wantBranches:   "feature/x,main",
+		},
+		{
+			// The runs API records only the short name, so non-PR runs clean
+			// it as both a branch and a tag (Flex: raw short name; Fleet:
+			// branch short name / full tag ref). A case-only slug difference
+			// uses the canonical spelling silently.
+			name:          "push cleans branch and tag under canonical slug",
+			repo:          `{"id": 202, "name": "Widgets", "owner": {"id": 101, "login": "Acme"}, "default_branch": "main"}`,
+			run:           `{"head_branch": "feature/x", "head_sha": "abc", "event": "push", "pull_requests": []}`,
+			wantCacheRefs: "refs/heads/feature/x,refs/tags/feature/x",
+			wantBranches:  "feature/x,refs/tags/feature/x",
+			wantSlug:      "Acme/Widgets",
+		},
+		{
+			// Historical data under the old slug is left to expire; the user
+			// is told so.
+			name:          "renamed repository warns",
+			repo:          `{"id": 202, "name": "gadgets", "owner": {"id": 101, "login": "acme"}, "default_branch": "main"}`,
+			run:           `{"head_branch": "feature/x", "head_sha": "abc", "event": "push", "pull_requests": []}`,
+			wantCacheRefs: "refs/heads/feature/x,refs/tags/feature/x",
+			wantBranches:  "feature/x,refs/tags/feature/x",
+			wantSlug:      "acme/gadgets",
+			wantWarning:   "renamed",
+		},
+		{
+			// A "#" in the ref is escaped before the nested-ref probe; only
+			// the escaped path answers, so an unescaped lookup loses the
+			// nested ref.
+			name: "ref with URL-reserved characters is escaped",
+			run:  `{"head_branch": "feature#123", "head_sha": "abc", "event": "push", "pull_requests": []}`,
+			extra: map[string]string{
+				"repos/acme/widgets/git/matching-refs/heads/feature%23123/": `[{"ref": "refs/heads/feature#123/sub"}]`,
+				"repos/acme/widgets/git/matching-refs/tags/feature%23123/":  `[]`,
+			},
+			wantCacheRefs: "refs/heads/feature#123,refs/tags/feature#123",
+			wantBranches:  "feature#123,refs/tags/feature#123",
+			wantNested:    map[string]string{"refs/heads/feature#123": "sub"},
+		},
+		{
+			// Live refs nested under a cleaned ref are enumerated so the
+			// planner can exclude their key spaces from the shared raw prefix.
+			name:          "nested refs are enumerated",
+			run:           `{"head_branch": "release", "head_sha": "abc", "event": "push", "pull_requests": []}`,
+			extra:         map[string]string{"repos/acme/widgets/git/matching-refs/heads/release/": `[{"ref": "refs/heads/release/2.x"}, {"ref": "refs/heads/release/3.x"}]`},
+			wantCacheRefs: "refs/heads/release,refs/tags/release",
+			wantBranches:  "release,refs/tags/release",
+			wantNested:    map[string]string{"refs/heads/release": "2.x,3.x"},
+		},
+	}
+
 	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			responses := map[string]string{
+				"repos/acme/widgets":                 cmp.Or(tt.repo, defaultRepo),
+				"repos/acme/widgets/actions/runs/77": tt.run,
+			}
+			maps.Copy(responses, tt.extra)
 
-	target, err := resolveCleanupTarget(context.Background(), github, job, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if target.OwnerID != 101 || target.RepoID != 202 {
-		t.Errorf("numeric IDs = %d/%d", target.OwnerID, target.RepoID)
-	}
-	wantRefs := "refs/pull/42/merge,refs/heads/main"
-	if got := strings.Join(target.CacheRefs, ","); got != wantRefs {
-		t.Errorf("CacheRefs = %s, want %s", got, wantRefs)
-	}
-	wantBranches := "refs/pull/42/merge,main"
-	if got := strings.Join(target.Branches, ","); got != wantBranches {
-		t.Errorf("Branches = %s, want %s", got, wantBranches)
-	}
-}
-
-// A run associated with several pull requests cleans every PR's merge scope:
-// each is re-creatable per-PR cache data.
-func TestResolveCleanupTargetMultiplePullRequests(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": [{"number": 7}, {"number": 8}]}`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/pull/7/merge,refs/pull/8/merge" {
-		t.Errorf("CacheRefs = %s, want both merge refs", got)
-	}
-}
-
-// Fork PR runs report an empty pull_requests list: the PR numbers are
-// recovered from the head commit instead, and the fork's head branch name
-// must not leak into the refs.
-func TestResolveCleanupTargetForkPullRequest(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                      `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77":      `{"head_branch": "main", "head_sha": "abc123", "event": "pull_request", "pull_requests": []}`,
-		"repos/acme/widgets/commits/abc123/pulls": `[{"number": 7}]`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/pull/7/merge" {
-		t.Errorf("CacheRefs = %s, want refs/pull/7/merge only", got)
-	}
-}
-
-// A fork head commit backing multiple PRs cleans all of their merge scopes.
-func TestResolveCleanupTargetForkMultiplePulls(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                      `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77":      `{"head_branch": "main", "head_sha": "abc123", "event": "pull_request", "pull_requests": []}`,
-		"repos/acme/widgets/commits/abc123/pulls": `[{"number": 7}, {"number": 8}]`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/pull/7/merge,refs/pull/8/merge" {
-		t.Errorf("CacheRefs = %s, want both merge refs", got)
-	}
-}
-
-func TestResolveCleanupTargetPullRequestRequiresPR(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                   `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77":   `{"head_branch": "feature/x", "head_sha": "abc", "event": "pull_request", "pull_requests": []}`,
-		"repos/acme/widgets/commits/abc/pulls": `[]`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	if _, err := resolveCleanupTarget(context.Background(), github, job, true); err == nil || !strings.Contains(err.Error(), "could not determine the pull request") {
-		t.Errorf("expected missing pull-request error, got %v", err)
-	}
-}
-
-// pull_request_target runs cache under the repository default branch (the PR
-// base branch before 2025-12-08), a shared lineage: refuse without the
-// explicit opt-in, and honor it when passed — including the run's Flex
-// merge-ref sticky-disk scopes.
-func TestResolveCleanupTargetPullRequestTarget(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "main", "head_sha": "abc", "event": "pull_request_target", "pull_requests": [{"number": 42}]}`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	if _, err := resolveCleanupTarget(context.Background(), github, job, false); err == nil || !strings.Contains(err.Error(), "--include-default-branch") {
-		t.Errorf("expected default-branch opt-in refusal, got %v", err)
-	}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/heads/main" {
-		t.Errorf("CacheRefs = %s, want the default branch ref", got)
-	}
-	if got := strings.Join(target.Branches, ","); got != "refs/pull/42/merge,main" {
-		t.Errorf("Branches = %s, want the PR merge scope + default branch", got)
-	}
-}
-
-// workflow_run executes on the repository default branch regardless of the
-// upstream branch: refuse without the opt-in, and honor it when passed —
-// including the upstream head branch that Flex uses as the snapshot scope.
-func TestResolveCleanupTargetWorkflowRun(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "feature/x", "head_sha": "abc", "event": "workflow_run", "pull_requests": []}`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	if _, err := resolveCleanupTarget(context.Background(), github, job, false); err == nil || !strings.Contains(err.Error(), "--include-default-branch") {
-		t.Errorf("expected default-branch opt-in refusal, got %v", err)
-	}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/heads/main" {
-		t.Errorf("CacheRefs = %s, want the default branch ref", got)
-	}
-	if got := strings.Join(target.Branches, ","); got != "feature/x,main" {
-		t.Errorf("Branches = %s, want the upstream Flex scope + default branch", got)
-	}
-}
-
-// Non-PR runs clean the head ref as BOTH a branch and a tag: the runs API
-// records only the short name, and over-deleting a same-named ref of the
-// other type only costs a cache rebuild. Both products' snapshot scopes are
-// covered (Flex: raw short name; Fleet: branch short name / full tag ref).
-// The repo casing comes from the canonical repository response, not the
-// pasted URL.
-func TestResolveCleanupTargetPush(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "name": "Widgets", "owner": {"id": 101, "login": "Acme"}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "feature/x", "head_sha": "abc", "event": "push", "pull_requests": []}`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/heads/feature/x,refs/tags/feature/x" {
-		t.Errorf("CacheRefs = %s, want both ref forms", got)
-	}
-	if got := strings.Join(target.Branches, ","); got != "feature/x,refs/tags/feature/x" {
-		t.Errorf("Branches = %s, want short name + full tag ref", got)
-	}
-	// Same slug up to casing: cleaned under the canonical spelling, silently.
-	if target.RepoSlug != "Acme/Widgets" {
-		t.Errorf("RepoSlug = %s, want Acme/Widgets", target.RepoSlug)
-	}
-	if len(target.Warnings) != 0 {
-		t.Errorf("Warnings = %v, want none for a case-only difference", target.Warnings)
-	}
-}
-
-// A repository renamed since the run keeps historical keys/tags under the old
-// slug; those are left to the bucket lifecycle and snapshot housekeeping, and
-// the user is told so.
-func TestResolveCleanupTargetRenamedRepoWarns(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                 `{"id": 202, "name": "gadgets", "owner": {"id": 101, "login": "acme"}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77": `{"head_branch": "feature/x", "head_sha": "abc", "event": "push", "pull_requests": []}`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if target.RepoSlug != "acme/gadgets" {
-		t.Errorf("RepoSlug = %s, want the canonical slug", target.RepoSlug)
-	}
-	if len(target.Warnings) != 1 || !strings.Contains(target.Warnings[0], "renamed") {
-		t.Errorf("Warnings = %v, want a rename warning", target.Warnings)
-	}
-}
-
-// Ref names containing URL-reserved characters are escaped before API
-// lookups, so a "#" cannot reroute the nested-ref probe.
-func TestResolveCleanupTargetEscapedRef(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                                        `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77":                        `{"head_branch": "feature#123", "head_sha": "abc", "event": "push", "pull_requests": []}`,
-		"repos/acme/widgets/git/matching-refs/heads/feature%23123/": `[]`,
-		"repos/acme/widgets/git/matching-refs/tags/feature%23123/":  `[]`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.CacheRefs, ","); got != "refs/heads/feature#123,refs/tags/feature#123" {
-		t.Errorf("CacheRefs = %s, want the raw ref name in refs", got)
-	}
-}
-
-// Live refs nested under a cleaned ref are enumerated so the planner can
-// exclude their key spaces from the shared raw prefix.
-func TestResolveCleanupTargetNestedRefs(t *testing.T) {
-	github := fakeGH{responses: map[string]string{
-		"repos/acme/widgets":                                  `{"id": 202, "owner": {"id": 101}, "default_branch": "main"}`,
-		"repos/acme/widgets/actions/runs/77":                  `{"head_branch": "release", "head_sha": "abc", "event": "push", "pull_requests": []}`,
-		"repos/acme/widgets/git/matching-refs/heads/release/": `[{"ref": "refs/heads/release/2.x"}, {"ref": "refs/heads/release/3.x"}]`,
-	}}
-	job := parsedGitHubJobURL{Host: "github.com", Owner: "acme", Repo: "widgets", RunID: 77, JobID: 88}
-
-	target, err := resolveCleanupTarget(context.Background(), github, job, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(target.NestedRefs["refs/heads/release"], ","); got != "2.x,3.x" {
-		t.Errorf("NestedRefs = %v, want the live nested suffixes", target.NestedRefs)
+			target, err := resolveCleanupTarget(context.Background(), fakeGH{responses: responses}, job, tt.includeDefault)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target.OwnerID != 101 || target.RepoID != 202 {
+				t.Errorf("numeric IDs = %d/%d, want 101/202", target.OwnerID, target.RepoID)
+			}
+			if got := strings.Join(target.CacheRefs, ","); got != tt.wantCacheRefs {
+				t.Errorf("CacheRefs = %s, want %s", got, tt.wantCacheRefs)
+			}
+			if got := strings.Join(target.Branches, ","); got != tt.wantBranches {
+				t.Errorf("Branches = %s, want %s", got, tt.wantBranches)
+			}
+			if want := cmp.Or(tt.wantSlug, "acme/widgets"); target.RepoSlug != want {
+				t.Errorf("RepoSlug = %s, want %s", target.RepoSlug, want)
+			}
+			if tt.wantWarning == "" && len(target.Warnings) != 0 {
+				t.Errorf("Warnings = %v, want none", target.Warnings)
+			}
+			if tt.wantWarning != "" && (len(target.Warnings) != 1 || !strings.Contains(target.Warnings[0], tt.wantWarning)) {
+				t.Errorf("Warnings = %v, want one containing %q", target.Warnings, tt.wantWarning)
+			}
+			gotNested := map[string]string{}
+			for ref, suffixes := range target.NestedRefs {
+				gotNested[ref] = strings.Join(suffixes, ",")
+			}
+			if !maps.Equal(gotNested, tt.wantNested) {
+				t.Errorf("NestedRefs = %v, want %v", target.NestedRefs, tt.wantNested)
+			}
+		})
 	}
 }
 

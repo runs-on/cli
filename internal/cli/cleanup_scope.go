@@ -64,7 +64,8 @@ type cleanupTarget struct {
 	// RepoSlug is the canonical "owner/repo" spelling whose keys/tags to
 	// clean (cache keys and snapshot tags are written with it).
 	RepoSlug string
-	// OwnerID is the numeric owner ID embedded in scoped-cache keys.
+	// OwnerID is the numeric owner ID embedded in scoped-cache keys when the
+	// job's runtime token asserts it.
 	OwnerID   int64
 	RepoID    int64
 	CacheRefs []string // GitHub cache scopes, e.g. refs/heads/main, refs/pull/5/merge
@@ -99,17 +100,30 @@ func (t cleanupTarget) snapshotRepoTagValue() string {
 	return sanitizeTagValue(t.RepoSlug)
 }
 
+// unassertedCacheOwnerID mirrors the broker Lambda's unassertedOwnerID: the
+// owner segment for runtime tokens without a repository_owner_id claim
+// (GHE.com data residency).
+const unassertedCacheOwnerID = 0
+
 // scopedCachePrefixes returns the isolated-cache object prefixes
 // (scoped-cache/<ownerID>/<repoID>/<sha256(ref)[:16]>/, matching the cache
-// credential broker Lambda's prefixesFor). Missing numeric IDs (e.g. gh
-// output drift) skip scoped prefixes rather than constructing a wrong path.
+// credential broker Lambda's prefixesFor). The CLI cannot tell which token
+// shape wrote the cache, so it covers both the owner-asserted and the
+// unasserted owner segment. Missing numeric IDs (e.g. gh output drift) skip
+// the affected prefixes rather than constructing a wrong path.
 func (t cleanupTarget) scopedCachePrefixes() []string {
-	if t.RepoID == 0 || t.OwnerID == 0 {
+	if t.RepoID == 0 {
 		return nil
 	}
-	prefixes := make([]string, 0, len(t.CacheRefs))
-	for _, ref := range t.CacheRefs {
-		prefixes = append(prefixes, fmt.Sprintf("scoped-cache/%d/%d/%s/", t.OwnerID, t.RepoID, cacheScopeSegment(ref)))
+	owners := []int64{unassertedCacheOwnerID}
+	if t.OwnerID != 0 {
+		owners = []int64{t.OwnerID, unassertedCacheOwnerID}
+	}
+	prefixes := make([]string, 0, len(owners)*len(t.CacheRefs))
+	for _, owner := range owners {
+		for _, ref := range t.CacheRefs {
+			prefixes = append(prefixes, fmt.Sprintf("scoped-cache/%d/%d/%s/", owner, t.RepoID, cacheScopeSegment(ref)))
+		}
 	}
 	return prefixes
 }

@@ -32,7 +32,7 @@ version for each stack so `roc` changes automatically when you enter its project
 directory:
 
 ```bash
-mise use --pin 'github:runs-on/cli[bin=roc]@3.3.2'
+mise use --pin 'github:runs-on/cli[bin=roc]@3.4.0'
 ```
 
 Install the latest stable CLI as your global default:
@@ -44,7 +44,7 @@ mise use --global 'github:runs-on/cli[bin=roc]@latest'
 Run an exact version once without changing your configuration:
 
 ```bash
-mise x 'github:runs-on/cli[bin=roc]@3.3.2' -- roc version
+mise x 'github:runs-on/cli[bin=roc]@3.4.0' -- roc version
 ```
 
 ### Download Binary
@@ -55,7 +55,7 @@ Download the exact CLI version that matches your stack from the
 Example (macOS ARM64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.3.2/roc_v3.3.2_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.4.0/roc_v3.4.0_darwin_arm64
 chmod a+x ./roc
 xattr -d com.apple.quarantine ./roc
 ./roc --help
@@ -64,7 +64,7 @@ xattr -d com.apple.quarantine ./roc
 Example (Linux AMD64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.3.2/roc_v3.3.2_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.4.0/roc_v3.4.0_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -105,13 +105,15 @@ jobs:
 
 The CLI loads stack metadata from the standard stack config secret at
 `/runs-on/<stack>/stack-config`. For Fleet stacks, it falls back to the Fleet
-config secret at `/runs-on/<stack>/fleet-config`.
+config secret at `/runs-on/<stack>/fleet-config`. If neither exists, the error
+lists the stacks that do have one in the current region (or suggests the only
+one), so a mistyped `--stack` or a wrong `AWS_REGION` is easy to spot. That
+hint needs `secretsmanager:ListSecrets`; without it, the error omits the list.
 
 That secret provides the stable identifiers needed by the core troubleshooting
 commands:
 
-- `WorkflowJobsTable`
-- Fleet claim table name
+- `JobDiagnosticsResolverFunctionName`
 - `IngressURL`
 - `ServiceLogGroupName`
 - `Ec2InstanceLogGroupArn`
@@ -127,18 +129,22 @@ AppRunner-era discovery fallback.
 
 Connect to the instance running a specific job via SSM, by pasting the GitHub Actions job URL.
 
-This feature requires the [AWS Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) to be installed on your local machine.
+This feature requires the AWS CLI and the [AWS Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) to be installed on your local machine. `roc connect` looks for `aws` and `session-manager-plugin` on your `PATH` before looking up the job, so it fails at once when either is missing, even with `--watch`.
+
+`roc connect` works on macOS, Linux and Windows. On Windows, it runs `aws ssm start-session` as a child process attached to the console, so Ctrl-C goes to the remote shell instead of ending `roc`.
+
+`roc connect` finds the job's instance through the stack's job diagnostics resolver Lambda, so your AWS credentials need `lambda:InvokeFunction` on it. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch.
 
 ```
 Usage:
   roc connect JOB_URL [flags]
 
 Flags:
-      --debug   Enable debug output
   -h, --help    help for connect
       --watch   Wait for instance ID if not found
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
@@ -157,15 +163,15 @@ Usage:
   roc logs JOB_URL [flags]
 
 Flags:
-  -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
       --full                  Export full diagnostic archive for the job
   -h, --help                  help for logs
       --include strings       Include additional log types: 'run' (all logs from entire run), 'console' (EC2 instance console logs)
-      --no-color              Disable color output for streamed logs
+      --no-color              Disable color output for streamed logs (also off when stdout is not a terminal or NO_COLOR is set)
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
@@ -188,15 +194,32 @@ AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/ru
 AWS_PROFILE=runs-on-admin roc logs https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --full
 ```
 
-`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, durable spot-interruption evidence, GitHub workflow job/run details, and delivery metadata when available.
+`roc logs` first invokes the stack's job diagnostics resolver Lambda. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch. The resolver returns the detected product (`flex` or `fleet`), local job/claim correlation, durable spot-interruption evidence, and GitHub workflow job/run details. `--full` also requests webhook delivery metadata when available.
+
+With `--watch`, `roc logs` refreshes the job's instances from the resolver every watch interval until the job's local record reports completion. Repeat polls reuse the GitHub details from the first response, so the resolver reads only the local job or claim record. Fleet is the exception: it asks GitHub for the job again until GitHub reports a runner, because it matches claims by runner.
 
 For Fleet stacks, if the resolver cannot fetch GitHub workflow job details and local claim data is ambiguous, `roc logs` tries the local GitHub CLI (`gh`) as a fallback. Install `gh` and run `gh auth login` with repository Actions read access to enable that fallback.
 
 `roc logs` fetches RunsOn server logs by workflow run ID. By default, it filters those lines locally to the selected job URL and its resolved job and instance identifiers. Use `--include=run` to show every server log line for the run.
 
-`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The archive contains the resolver response, local job/claim record details, all RunsOn server logs for the incident window in `server/ecs.jsonl`, run-scoped server logs in `server/run-<run_id>.jsonl`, and the client-filtered job subset in `server/job-<job_id>.jsonl`. It also contains CloudTrail events, EC2 console output, agent logs, and `metrics.jsonl` when available for each attempted instance. The time window starts five minutes before the job and ends ten minutes after it.
+Streamed logs are colored only when stdout is a terminal, so piped or redirected output is plain text. Color is also off when the [`NO_COLOR`](https://no-color.org) environment variable is set to a non-empty value, or with `--no-color`.
 
-Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error and makes the command exit nonzero after writing the archive.
+When a log source cannot be read, for example when `logs:FilterLogEvents` is denied or, with `--include=console`, `ec2:GetConsoleOutput` fails, `roc logs` prints `Warning: cannot read <source> logs: <error>` on stderr. `<source>` is `application`, `instance <instance-id>` or `console`; a console failure for one instance does not skip the job's other instances, and each such line starts with `instance <instance-id>:`. Each error is reported once per source, ignoring the per-request ID in AWS errors.
+
+Without `--watch`, the command still prints every line it collected, then exits with status 1 and an error such as `1 log source failed; output is incomplete`. With `--watch`, a failure only warns: a CloudWatch source (`application` or `instance <instance-id>`) is retried every interval, while console output is read once. A workflow run ID that is not known yet, or a job with no instance yet, is not a failure; `--debug` shows it.
+
+`--full` writes a `roc-logs-<job_id>-<timestamp>.zip` archive instead of streaming to stdout. The time window starts five minutes before the job and ends ten minutes after it. The archive contains:
+
+- `manifest.json`: the stack, job, run, time window, attempted instances and any artifact errors
+- `diagnostics/resolver.json`: the resolver response
+- `diagnostics/local-record.json`: the local job (Flex) or claim (Fleet) record
+- `server/ecs.jsonl`: all RunsOn server logs for the window
+- `server/run-<run_id>.jsonl` and `server/job-<job_id>.jsonl`: the run-scoped server logs and the client-filtered job subset
+- `instances/<instance_id>/`: `cloudtrail.json`, `console.log`, `agent.jsonl` and, when available, `metrics.jsonl` for each attempted instance
+
+An artifact that cannot be fetched is replaced by a `<name>.error.json` file next to where it would be, and the command exits nonzero after writing the archive.
+
+Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error.
 
 `--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
@@ -213,25 +236,27 @@ Usage:
   roc interrupt JOB_URL [flags]
 
 Flags:
-      --debug            Enable debug output
       --delay duration   Delay before interruption (e.g., 2m, 30s) (default 5s)
   -h, --help             help for interrupt
   -w, --wait             Wait for instance ID if not found
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
 **Requirements:**
 - The target instance must be a running spot instance
 - AWS FIS service must be available in your region
+- AWS credentials with `lambda:InvokeFunction` on the stack's job diagnostics resolver, which finds the job's instance. The CLI and stack versions must match.
+- AWS credentials with `fis:ListExperimentTemplates`, `fis:CreateExperimentTemplate`, `fis:StartExperiment`, `fis:GetExperiment`, `fis:DeleteExperimentTemplate`, `ec2:DescribeInstances`, and `iam:GetRole` and `iam:PassRole` on the `aws-fis-itn` role. The first run, while that role does not exist yet, also needs `iam:CreateRole` and `iam:PutRolePolicy`.
 
 **How it works:**
 1. Validates the instance is a running spot instance
 2. Creates an IAM role for FIS if it doesn't exist
 3. Creates and starts a FIS experiment to send the interruption
-4. Monitors the experiment progress
-5. Automatically cleans up the experiment template when complete
+4. Prints the experiment's progress until EC2 is due to interrupt the instance
+5. Deletes the experiment template when the command completes or is interrupted
 
 Example:
 
@@ -247,9 +272,26 @@ AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actio
 AWS_PROFILE=runs-on-admin roc interrupt https://github.com/runs-on/runs-on/actions/runs/12415485296/job/34661958899 --delay 30s
 ```
 
+Output (`--debug` adds pre-flight details):
+
+```
+Found instance i-0123456789abcdef0 for job 34661958899
+Triggering spot interruption on instance i-0123456789abcdef0 with 5s delay in region us-east-1...
+Started FIS experiment: EXPabcdef1234567890
+FIS experiment initiating
+Interruption notice due in 5s
+FIS experiment running
+Spot interruption notice sent
+Waiting 2m0s for the instance shutdown
+Spot instance shutdown sent
+Spot interruption completed for instance i-0123456789abcdef0
+```
+
+Once `roc` starts creating FIS resources, the first Ctrl-C (or SIGTERM) stops watching and deletes the experiment template; a second one ends `roc` at once. If the experiment has not started yet, nothing is started. If it is running but has not sent the notice yet, `roc` prints the `aws fis stop-experiment --id <id> --region <region>` command to stop it; once the notice is sent, stopping the experiment does not undo it, and `roc` prints about when EC2 interrupts the instance instead. Either way it exits with status 1.
+
 ### `roc cleanup`
 
-Delete everything the RunsOn stack cached for the ref a job ran on: classic cache objects (`cache/v1/<org>/<repo>/<ref>/...`), isolated cache objects (`scoped-cache/<ownerID>/<repoID>/<scope>/...`), and sticky-disk EBS snapshots (tagged for the repo and branch scope).
+Delete everything the RunsOn stack cached for the ref a job ran on: classic cache objects (`cache/v1/<org>/<repo>/<ref>/...`), isolated cache objects (`scoped-cache/<ownerID>/<repoID>/<scope>/...`, or `scoped-cache/0/<repoID>/<scope>/...` on GHE.com, whose runtime tokens carry no owner ID), and sticky-disk EBS snapshots (tagged for the repo and branch scope).
 
 The refs are resolved from the job's workflow run: pull-request runs clean each associated pull request's `refs/pull/N/merge` scope; other runs clean the head ref as both a branch and a tag (the runs API records only the short name, and everything deleted is re-creatable cache data — the plan is shown for confirmation first). Repo-wide user caches under `cache/repo/<org>/<repo>` are not touched (they are not scoped to a ref).
 
@@ -264,6 +306,7 @@ Flags:
       --yes                      skip the confirmation prompt
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
@@ -287,7 +330,7 @@ AWS_PROFILE=runs-on-admin roc cleanup https://github.com/acme/widgets/actions/ru
 
 Validate and lint runs-on.yml configuration files. This command validates your configuration files against the RunsOn schema, checking for syntax errors, invalid values, missing required fields, and schema violations.
 
-When no file path is provided, the command recursively searches for all `runs-on.yml` files in the current directory and subdirectories.
+When no file path is provided, the command recursively searches for all `runs-on.yml` files in the current directory and subdirectories. It skips `.git` and `node_modules` directories; other hidden directories such as `.github` are still searched.
 
 ```
 Usage:
@@ -299,6 +342,7 @@ Flags:
   -h, --help           help for lint
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
@@ -362,7 +406,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.3.2  # Use the latest release tag
+    rev: v3.4.0  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
@@ -387,7 +431,7 @@ This command performs comprehensive health checks on your RunsOn stack:
 - Validates service readiness for Flex stacks
 - Fetches application logs
 
-Results are exported as a timestamped ZIP file containing checks.json and logs.
+Results are exported as a timestamped ZIP file containing checks.json and logs. Each check's `status` in checks.json is `pass`, `fail` or `skip`; the terminal shows them as ✅, ❌ and ⏭️. The command exits non-zero when any check fails, after exporting the ZIP file, and prints the failed checks on stderr (for example `1 check failed: Service readiness`). Skipped checks, such as the endpoint and readiness checks on Fleet stacks, are not failures.
 
 ```
 Usage:
@@ -398,6 +442,7 @@ Flags:
       --since string   Fetch logs since duration (e.g. 30m, 2h, 24h) (default "24h")
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 
@@ -412,7 +457,7 @@ Output:
 ```
 Checking service (https://us-east-1.console.aws.amazon.com/ecs/v2/clusters/runs-on-preview-v3/services/flexd/configuration/overview)... ✅ (status: RUNNING (1/1 tasks))
 Checking service endpoint (https://example.execute-api.us-east-1.amazonaws.com/prod)... ✅
-Checking for 'Congrats' response... ✅
+Checking service readiness... ✅ (app_tag: v3.3.3)
 Fetching application logs (since 24h0m0s)... ✅ (5419 lines)
 
 Full results exported to: /Users/crohr/dev/runs-on/cli/roc-doctor-2025-06-20-12-40-29.zip
@@ -424,19 +469,21 @@ Stream all RunsOn application logs from CloudWatch log streams.
 
 This command streams all application logs from the RunsOn service, not filtered by specific jobs. Use this to monitor overall service activity and troubleshoot system-wide issues.
 
+Color and read failures work as for [`roc logs`](#roc-logs): output is colored only on a terminal without `NO_COLOR`, a log group that cannot be read prints `Warning: cannot read application logs: <error>` on stderr, and without `--watch` the command then exits with status 1.
+
 ```
 Usage:
   roc stack logs [flags]
 
 Flags:
-  -d, --debug                 Enable debug output
   -f, --format string         Output format: long (default) or short (default "long")
   -h, --help                  help for logs
-      --no-color              Disable color output for streamed logs
+      --no-color              Disable color output for streamed logs (also off when stdout is not a terminal or NO_COLOR is set)
   -s, --since string          Show logs since duration (e.g. 30m, 2h) (default "2h")
   -w, --watch string[="5s"]   Watch for new logs with optional interval (e.g. --watch 2s)
 
 Global Flags:
+  -d, --debug          Enable debug output
       --stack string   Stack name (default "runs-on")
 ```
 

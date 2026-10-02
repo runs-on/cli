@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
+	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,63 +18,6 @@ import (
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 )
-
-func TestApplicationFilterPatternUsesRunIDByDefault(t *testing.T) {
-	facts := &jobFactsProvider{}
-	facts.set(&workflowJobFacts{RunID: 1234, CurrentInstanceID: "i-123"})
-
-	filterPattern, err := jobApplicationFilterPattern("42", facts)
-	if err != nil {
-		t.Fatalf("applicationFilterPattern returned error: %v", err)
-	}
-	if filterPattern != runFilterPattern(1234) {
-		t.Fatalf("expected run ID filter, got %q", filterPattern)
-	}
-	if filterPattern != `{ ( $.run_id = 1234 ) || ( $.run_id = "1234" ) }` {
-		t.Fatalf("expected numeric and string run ID filter, got %q", filterPattern)
-	}
-}
-
-func TestApplicationFilterPatternUsesResolvedRunIDByDefault(t *testing.T) {
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "ambiguous",
-		Product: "fleet",
-		Request: jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
-	})
-	if err := facts.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh returned error: %v", err)
-	}
-
-	filterPattern, err := jobApplicationFilterPattern("42", facts)
-	if err != nil {
-		t.Fatalf("applicationFilterPattern returned error: %v", err)
-	}
-	if filterPattern != runFilterPattern(1234) {
-		t.Fatalf("expected run ID filter, got %q", filterPattern)
-	}
-}
-
-func TestApplicationFilterPatternOnlyUsesRunID(t *testing.T) {
-	facts := &jobFactsProvider{}
-	facts.set(&workflowJobFacts{
-		RunID:             1234,
-		CurrentInstanceID: "i-123",
-	})
-
-	filterPattern, err := jobApplicationFilterPattern("42", facts)
-	if err != nil {
-		t.Fatalf("applicationFilterPattern returned error: %v", err)
-	}
-	if !strings.Contains(filterPattern, `$.run_id = "1234"`) {
-		t.Fatalf("expected run ID filter, got %q", filterPattern)
-	}
-	if strings.Contains(filterPattern, `$.job_id = "42"`) {
-		t.Fatalf("did not expect job ID filter in run-scoped pattern, got %q", filterPattern)
-	}
-	if strings.Contains(filterPattern, `$.message = "*i-123*"`) {
-		t.Fatalf("did not expect instance ID message filter in run-scoped pattern, got %q", filterPattern)
-	}
-}
 
 func TestJobLogLineMatchesCanonicalAndFallbackIdentities(t *testing.T) {
 	jobURL := "https://github.com/runs-on/server/actions/runs/1234/job/42"
@@ -86,9 +31,15 @@ func TestJobLogLineMatchesCanonicalAndFallbackIdentities(t *testing.T) {
 		{name: "Flex job ID", line: `{"job_id":42}`, want: true},
 		{name: "workflow job ID string", line: `{"workflow_job_id":"42"}`, want: true},
 		{name: "Fleet scaleset job ID", line: `{"scaleset_job_id":"fleet-job-opaque"}`, want: true},
+		{name: "scaleset job ID naming the workflow job", line: `{"scaleset_job_id":"42"}`, want: true},
+		{name: "other scaleset job", line: `{"scaleset_job_id":"43"}`, want: false},
 		{name: "structured instance ID", line: `{"instance_id":"i-123"}`, want: true},
 		{name: "legacy instance message", line: `{"message":"launched i-123"}`, want: true},
 		{name: "other job", line: `{"job_url":"https://github.com/runs-on/server/actions/runs/1234/job/43","job_id":43}`, want: false},
+		{name: "job URL in another case with a trailing slash", line: `{"job_url":"HTTPS://GITHUB.COM/runs-on/server/actions/runs/1234/job/42/"}`, want: true},
+		{name: "plain text job URL", line: "started https://github.com/runs-on/server/actions/runs/1234/job/42", want: true},
+		{name: "plain text instance ID", line: "launched i-123", want: true},
+		{name: "plain text naming neither", line: "launched i-456", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -96,24 +47,6 @@ func TestJobLogLineMatchesCanonicalAndFallbackIdentities(t *testing.T) {
 				t.Fatalf("jobLogLineMatches() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestStreamCloudWatchLogsFiltersRunLinesLocally(t *testing.T) {
-	cwl := &mockCloudWatchLogsClient{}
-	session := newStreamedLogSession(&LogOptions{NoColor: true}, nil)
-	accept := func(line string) bool {
-		return jobLogLineMatches(line, "https://github.com/runs-on/server/actions/runs/1234/job/42", "42", "", nil)
-	}
-	err := session.streamCloudWatchLogs(context.Background(), "application", cwl, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		input.FilterPattern = aws.String(runFilterPattern(1234))
-		return nil
-	}, accept, nil, 0, func() {})
-	if err != nil {
-		t.Fatalf("streamCloudWatchLogs returned error: %v", err)
-	}
-	if len(session.collector.events) != 1 || !strings.Contains(session.collector.events[0].message, `"job_id":42`) {
-		t.Fatalf("expected only the selected job line, got %+v", session.collector.events)
 	}
 }
 
@@ -138,7 +71,7 @@ func TestStreamCloudWatchLogsReplaysAfterFleetIdentityResolves(t *testing.T) {
 			LogStreamName: aws.String("run-stream"),
 		}}}, nil
 	}
-	session := newStreamedLogSession(&LogOptions{StartTime: 100, Watch: true, WatchInterval: time.Millisecond, NoColor: true}, nil)
+	session := newStreamedLogSession(&LogOptions{StartTime: 100, Watch: true, WatchInterval: time.Millisecond, NoColor: true}, discardLogger, io.Discard, io.Discard)
 	accept := func(line string) bool {
 		matched := jobLogLineMatches(line, "", "42", scalesetJobID, nil)
 		if !matched {
@@ -146,12 +79,17 @@ func TestStreamCloudWatchLogsReplaysAfterFleetIdentityResolves(t *testing.T) {
 		}
 		return matched
 	}
-	err := session.streamCloudWatchLogs(ctx, "application", cwl, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		applyLogTimeBounds(input, session.opts)
-		return nil
-	}, accept, func() string {
-		return jobLogCorrelationKey("", scalesetJobID, nil)
-	}, cloudWatchWatchReplayOverlap, func() {})
+	err := session.streamCloudWatchLogs(ctx, cwl, cloudWatchStream{
+		prefix: "application",
+		update: func(input *cloudwatchlogs.FilterLogEventsInput) error {
+			applyLogTimeBounds(input, session.opts)
+			return nil
+		},
+		accept: accept,
+		correlationKey: func() string {
+			return jobLogCorrelationKey("", scalesetJobID, nil)
+		},
+	}, func() {})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("streamCloudWatchLogs returned %v, want context cancellation", err)
 	}
@@ -163,118 +101,132 @@ func TestStreamCloudWatchLogsReplaysAfterFleetIdentityResolves(t *testing.T) {
 	}
 }
 
-func TestStreamCloudWatchLogsOverlapsWatchCursorForLateEvents(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// A filtered watch stream re-reads the last minute for late events, even after
+// an empty poll, and keeps only its job's events. An unfiltered stream resumes
+// right after the last event.
+func TestStreamCloudWatchLogsWatchCursor(t *testing.T) {
+	event := func(id, message string, timestamp int64) cwltypes.FilteredLogEvent {
+		return cwltypes.FilteredLogEvent{EventId: aws.String(id), Message: aws.String(message), Timestamp: aws.Int64(timestamp)}
+	}
+	late := time.Now().Add(-30 * time.Second).UnixMilli()
+	tests := []struct {
+		name       string
+		filtered   bool
+		startTime  int64
+		polls      [2][]cwltypes.FilteredLogEvent
+		wantStarts [2]int64
+		wantEvent  string
+	}{
+		{
+			name:       "filtered: late event",
+			filtered:   true,
+			startTime:  100,
+			polls:      [2][]cwltypes.FilteredLogEvent{{event("other-event", `{"job_id":43}`, 120000)}, {event("target-event", `{"job_id":42}`, 119000)}},
+			wantStarts: [2]int64{100, 60000},
+			wantEvent:  "target-event",
+		},
+		{
+			name:       "filtered: late event after an empty poll",
+			filtered:   true,
+			startTime:  late - 10000,
+			polls:      [2][]cwltypes.FilteredLogEvent{nil, {event("target-event", `{"job_id":42}`, late)}},
+			wantStarts: [2]int64{late - 10000, late - 10000},
+			wantEvent:  "target-event",
+		},
+		{
+			name:       "unfiltered",
+			startTime:  100,
+			polls:      [2][]cwltypes.FilteredLogEvent{{event("stack-event", `{"message":"stack event"}`, 120000)}, nil},
+			wantStarts: [2]int64{100, 120001},
+			wantEvent:  "stack-event",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	calls := 0
-	startTimes := make([]int64, 0, 2)
-	cwl := &mockCloudWatchLogsClient{}
-	cwl.output = func(input *cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
-		calls++
-		startTimes = append(startTimes, aws.ToInt64(input.StartTime))
-		if calls == 1 {
-			return &cloudwatchlogs.FilterLogEventsOutput{Events: []cwltypes.FilteredLogEvent{{
-				Message:   aws.String(`{"job_id":43,"message":"other"}`),
-				Timestamp: aws.Int64(120000),
-				EventId:   aws.String("other-event"),
-			}}}, nil
-		}
-		cancel()
-		return &cloudwatchlogs.FilterLogEventsOutput{Events: []cwltypes.FilteredLogEvent{{
-			Message:   aws.String(`{"job_id":42,"message":"late target"}`),
-			Timestamp: aws.Int64(119000),
-			EventId:   aws.String("target-event"),
-		}}}, nil
-	}
-	session := newStreamedLogSession(&LogOptions{StartTime: 100, Watch: true, WatchInterval: time.Millisecond, NoColor: true}, nil)
-	err := session.streamCloudWatchLogs(ctx, "application", cwl, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		applyLogTimeBounds(input, session.opts)
-		return nil
-	}, func(line string) bool {
-		return jobLogLineMatches(line, "", "42", "", nil)
-	}, nil, cloudWatchWatchReplayOverlap, func() {})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("streamCloudWatchLogs returned %v, want context cancellation", err)
-	}
-	if len(startTimes) != 2 || startTimes[0] != 100 || startTimes[1] != 60000 {
-		t.Fatalf("expected one-minute watch overlap, got start times %v", startTimes)
-	}
-	if len(session.collector.events) != 1 || session.collector.events[0].eventId != "target-event" {
-		t.Fatalf("expected late target event from overlap, got %+v", session.collector.events)
+			var starts []int64
+			cwl := &mockCloudWatchLogsClient{}
+			cwl.output = func(input *cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
+				starts = append(starts, aws.ToInt64(input.StartTime))
+				if len(starts) == 2 {
+					cancel()
+				}
+				return &cloudwatchlogs.FilterLogEventsOutput{Events: tt.polls[len(starts)-1]}, nil
+			}
+			session := newStreamedLogSession(&LogOptions{StartTime: tt.startTime, Watch: true, WatchInterval: time.Millisecond, NoColor: true}, discardLogger, io.Discard, io.Discard)
+			stream := cloudWatchStream{prefix: "application", update: func(input *cloudwatchlogs.FilterLogEventsInput) error {
+				applyLogTimeBounds(input, session.opts)
+				return nil
+			}}
+			if tt.filtered {
+				stream.accept = func(line string) bool { return jobLogLineMatches(line, "", "42", "", nil) }
+			}
+
+			if err := session.streamCloudWatchLogs(ctx, cwl, stream, func() {}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("streamCloudWatchLogs returned %v, want context cancellation", err)
+			}
+			if len(starts) != 2 || [2]int64(starts) != tt.wantStarts {
+				t.Fatalf("start times = %v, want %v", starts, tt.wantStarts)
+			}
+			if len(session.collector.events) != 1 || session.collector.events[0].eventId != tt.wantEvent {
+				t.Fatalf("expected only %s, got %+v", tt.wantEvent, session.collector.events)
+			}
+		})
 	}
 }
 
-func TestStreamCloudWatchLogsOverlapsWatchCursorAfterEmptyPoll(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// requestScopedAPIError is shaped like an AWS API error, whose text carries a
+// different request ID on every call.
+type requestScopedAPIError struct{ requestID int }
 
-	targetTimestamp := time.Now().Add(-30 * time.Second).UnixMilli()
-	startTimes := make([]int64, 0, 2)
-	cwl := &mockCloudWatchLogsClient{}
-	cwl.output = func(input *cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
-		startTimes = append(startTimes, aws.ToInt64(input.StartTime))
-		if len(startTimes) == 1 {
-			return &cloudwatchlogs.FilterLogEventsOutput{}, nil
-		}
-		cancel()
-		return &cloudwatchlogs.FilterLogEventsOutput{Events: []cwltypes.FilteredLogEvent{{
-			Message:   aws.String(`{"job_id":42,"message":"late target"}`),
-			Timestamp: aws.Int64(targetTimestamp),
-			EventId:   aws.String("target-event"),
-		}}}, nil
-	}
-	session := newStreamedLogSession(&LogOptions{
-		StartTime:     targetTimestamp - 120000,
-		Watch:         true,
-		WatchInterval: time.Millisecond,
-		NoColor:       true,
-	}, nil)
-	err := session.streamCloudWatchLogs(ctx, "application", cwl, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		applyLogTimeBounds(input, session.opts)
-		return nil
-	}, func(line string) bool {
-		return jobLogLineMatches(line, "", "42", "", nil)
-	}, nil, cloudWatchWatchReplayOverlap, func() {})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("streamCloudWatchLogs returned %v, want context cancellation", err)
-	}
-	if len(startTimes) != 2 || startTimes[1] > targetTimestamp {
-		t.Fatalf("expected empty poll to retain watch overlap for timestamp %d, got %v", targetTimestamp, startTimes)
-	}
-	if len(session.collector.events) != 1 || session.collector.events[0].eventId != "target-event" {
-		t.Fatalf("expected late target event after empty poll, got %+v", session.collector.events)
-	}
+func (e requestScopedAPIError) Error() string {
+	return fmt.Sprintf("operation error CloudWatch Logs: FilterLogEvents, RequestID: %d, api error AccessDeniedException: not authorized", e.requestID)
 }
+func (requestScopedAPIError) ErrorCode() string    { return "AccessDeniedException" }
+func (requestScopedAPIError) ErrorMessage() string { return "not authorized" }
 
-func TestStreamCloudWatchLogsDoesNotOverlapOrdinaryWatchCursor(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestStreamedLogSessionReportsFailedSource(t *testing.T) {
+	for _, watch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watch=%t", watch), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-	startTimes := make([]int64, 0, 2)
-	cwl := &mockCloudWatchLogsClient{}
-	cwl.output = func(input *cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
-		startTimes = append(startTimes, aws.ToInt64(input.StartTime))
-		if len(startTimes) == 2 {
-			cancel()
-			return &cloudwatchlogs.FilterLogEventsOutput{}, nil
-		}
-		return &cloudwatchlogs.FilterLogEventsOutput{Events: []cwltypes.FilteredLogEvent{{
-			Message:   aws.String(`{"message":"stack event"}`),
-			Timestamp: aws.Int64(120000),
-			EventId:   aws.String("stack-event"),
-		}}}, nil
-	}
-	session := newStreamedLogSession(&LogOptions{StartTime: 100, Watch: true, WatchInterval: time.Millisecond, NoColor: true}, nil)
-	err := session.streamCloudWatchLogs(ctx, "application", cwl, func(input *cloudwatchlogs.FilterLogEventsInput) error {
-		applyLogTimeBounds(input, session.opts)
-		return nil
-	}, nil, nil, 0, func() {})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("streamCloudWatchLogs returned %v, want context cancellation", err)
-	}
-	if len(startTimes) != 2 || startTimes[0] != 100 || startTimes[1] != 120001 {
-		t.Fatalf("expected ordinary watch cursor to advance without overlap, got %v", startTimes)
+			calls := 0
+			denied := &mockCloudWatchLogsClient{}
+			denied.output = func(*cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
+				// Watch mode re-polls; stop after the same failure repeats.
+				calls++
+				if calls == 3 {
+					cancel()
+				}
+				return nil, requestScopedAPIError{requestID: calls}
+			}
+			var stdout, stderr bytes.Buffer
+			session := newStreamedLogSession(&LogOptions{StartTime: 1, Watch: watch, WatchInterval: time.Millisecond, NoColor: true}, discardLogger, &stdout, &stderr)
+			updateInput := func(input *cloudwatchlogs.FilterLogEventsInput) error {
+				applyLogTimeBounds(input, session.opts)
+				return nil
+			}
+			session.start(ctx, denied, cloudWatchStream{prefix: "instance i-denied", update: updateInput})
+			session.start(ctx, &mockCloudWatchLogsClient{events: runLogEvents()}, cloudWatchStream{prefix: "application", update: updateInput})
+
+			err := session.drainAndWatch(ctx)
+
+			if watch && !errors.Is(err, context.Canceled) {
+				t.Fatalf("drainAndWatch returned %v, want to keep watching until cancelled", err)
+			}
+			if !watch && (err == nil || errors.Is(err, context.Canceled)) {
+				t.Fatalf("drainAndWatch returned %v, want an incomplete-output error", err)
+			}
+			if warnings := stderr.String(); strings.Count(warnings, "\n") != 1 || !strings.Contains(warnings, "instance i-denied") {
+				t.Fatalf("expected one warning naming the failed source, got %q", warnings)
+			}
+			if !strings.Contains(stdout.String(), `"message":"target"`) {
+				t.Fatalf("expected the application events despite the failed source, got %q", stdout.String())
+			}
+		})
 	}
 }
 
@@ -298,12 +250,9 @@ func TestJobLogsIncludeRunWatchUsesOrdinaryCursor(t *testing.T) {
 			EventId:   aws.String("run-event"),
 		}}}, nil
 	}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName: "/aws/ecs/runs-on/flexd",
-		},
-	}
+	streamer := testLogStreamer(cwl, &RunsOnConfig{
+		ServiceLogGroupName: "/aws/ecs/runs-on/flexd",
+	})
 	facts := testJobFactsProvider(jobDiagnosticsResponse{
 		Status:  "found",
 		Product: "flex",
@@ -317,7 +266,7 @@ func TestJobLogsIncludeRunWatchUsesOrdinaryCursor(t *testing.T) {
 			CreatedAt:     createdAt.Format(time.RFC3339Nano),
 		},
 	})
-	err := streamer.Stream(ctx, "42", facts, []string{"run"}, &LogOptions{Watch: true, WatchInterval: time.Millisecond, NoColor: true})
+	err := streamer.StreamJob(ctx, facts, []string{"run"}, &LogOptions{Watch: true, WatchInterval: time.Millisecond, NoColor: true})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Stream returned %v, want context cancellation", err)
 	}
@@ -326,402 +275,123 @@ func TestJobLogsIncludeRunWatchUsesOrdinaryCursor(t *testing.T) {
 	}
 }
 
-func TestFleetStreamedLogSessionUsesGitHubRunnerWhenClaimMissing(t *testing.T) {
-	cwl := &mockCloudWatchLogsClient{}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "partial",
-		Product: "fleet",
-		Request: jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
-		GitHub: jobDiagnosticsGitHub{
-			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, RunnerName: "runs-on--i-github--job"},
-		},
-		Fleet: &jobDiagnosticsFleet{ClaimCount: 75, MatchBasis: "runner_not_found"},
-	})
-
-	if err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true}); err != nil {
-		t.Fatalf("Stream returned error: %v", err)
-	}
-
-	var sawInstance, sawApplication bool
-	for _, input := range cwl.inputs {
-		switch {
-		case aws.ToString(input.LogStreamNamePrefix) == "i-github/":
-			sawInstance = true
-		case aws.ToString(input.FilterPattern) == runFilterPattern(1234):
-			sawApplication = true
-		}
-	}
-	if !sawInstance || !sawApplication {
-		t.Fatalf("expected GitHub runner-derived instance and application filters, got %#v", cwl.inputs)
-	}
-}
-
-func TestStreamRejectsCrossProductDiagnosticsBeforeCloudWatch(t *testing.T) {
-	t.Parallel()
-
+// A job's logs stream every instance the job used and its run's application
+// logs, all within the job's window when it has timestamps.
+func TestJobLogsStreamInstanceAndRunLogs(t *testing.T) {
+	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	completedAt := createdAt.Add(30 * time.Minute)
 	tests := []struct {
-		name         string
-		stackProduct string
-		stackName    string
-		labels       []string
-		want         string
+		name          string
+		response      jobDiagnosticsResponse
+		wantInstances []string
+		wantWindow    [2]int64 // start and end of every CloudWatch read
 	}{
 		{
-			name:         "fleet stack flex job",
-			stackProduct: "fleet",
-			stackName:    "runs-on-fleet-dev-v3",
-			labels:       []string{"runs-on=123/runner=1cpu-linux-x64/env=dev"},
-			want:         `job 42 is a Flex job, but stack "runs-on-fleet-dev-v3" is a Fleet stack`,
+			name: "flex local record",
+			response: jobDiagnosticsResponse{
+				Status:  "found",
+				Product: "flex",
+				GitHub: jobDiagnosticsGitHub{WorkflowJob: &jobDiagnosticsWorkflowJob{
+					ID:          42,
+					RunID:       1234,
+					CreatedAt:   createdAt.Format(time.RFC3339),
+					CompletedAt: completedAt.Format(time.RFC3339),
+				}},
+				Local: &jobDiagnosticsLocal{Source: "flex_workflow_jobs", InstanceIDs: []string{"i-active"}, Status: "running", SchedulingState: "launched"},
+			},
+			wantInstances: []string{"i-active"},
+			wantWindow:    [2]int64{createdAt.Add(-fullLogWindowBefore).UnixMilli(), completedAt.Add(fullLogWindowAfter).UnixMilli()},
 		},
 		{
-			name:         "flex stack fleet job",
-			stackProduct: "flex",
-			stackName:    "runs-on-flex-dev-v3",
-			labels:       []string{"runs-on/fleet=linux-small/env=dev"},
-			want:         `job 42 is a Fleet job, but stack "runs-on-flex-dev-v3" is a Flex stack`,
+			name: "fleet claim missing, GitHub runner",
+			response: jobDiagnosticsResponse{
+				Status:  "partial",
+				Product: "fleet",
+				Request: jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
+				GitHub:  jobDiagnosticsGitHub{WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, RunnerName: "runs-on--i-github--job"}},
+				Fleet:   &jobDiagnosticsFleet{ClaimCount: 75, MatchBasis: "runner_not_found"},
+			},
+			wantInstances: []string{"i-github"},
+			wantWindow:    [2]int64{1, 0},
+		},
+		{
+			name: "fleet claim with attempted instances",
+			response: jobDiagnosticsResponse{
+				Status:  "found",
+				Product: "fleet",
+				GitHub:  jobDiagnosticsGitHub{WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, RunnerName: "runs-on--i-active--job"}},
+				Local:   &jobDiagnosticsLocal{Source: "fleet_claims", InstanceIDs: []string{"i-old", "i-active"}, Status: "job_claimed", SchedulingState: "job_claimed"},
+			},
+			wantInstances: []string{"i-old", "i-active"},
+			wantWindow:    [2]int64{1, 0},
 		},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 			cwl := &mockCloudWatchLogsClient{}
-			streamer := &jobLogStreamer{
-				cwl: cwl,
-				outputs: &StackOutputs{
-					ServiceLogGroupName:    "/aws/ecs/runs-on/flexd",
-					EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-				},
-			}
-			facts := testJobFactsProvider(jobDiagnosticsResponse{
-				Status:  "partial",
-				Product: tt.stackProduct,
-				Request: jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
-				GitHub: jobDiagnosticsGitHub{
-					WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, Labels: tt.labels},
-				},
+			streamer := testLogStreamer(cwl, &RunsOnConfig{
+				ServiceLogGroupName:    "/aws/ecs/runs-on/server",
+				EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
 			})
-			facts.product = tt.stackProduct
-			facts.stackName = tt.stackName
+			facts := testJobFactsProvider(tt.response)
 
-			err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true})
-			if err == nil || err.Error() != tt.want {
-				t.Fatalf("Stream error = %v, want %q", err, tt.want)
+			if err := streamer.StreamJob(context.Background(), facts, nil, &LogOptions{StartTime: 1, NoColor: true}); err != nil {
+				t.Fatalf("Stream returned error: %v", err)
 			}
-			if len(cwl.inputs) != 0 {
-				t.Fatalf("expected no CloudWatch fetches before product mismatch error, got %d", len(cwl.inputs))
+
+			var instances []string
+			sawApplication := false
+			for _, input := range cwl.inputs {
+				if window := [2]int64{aws.ToInt64(input.StartTime), aws.ToInt64(input.EndTime)}; window != tt.wantWindow {
+					t.Fatalf("read window = %v, want %v for input %#v", window, tt.wantWindow, input)
+				}
+				if prefix := aws.ToString(input.LogStreamNamePrefix); prefix != "" {
+					instances = append(instances, strings.TrimSuffix(prefix, "/"))
+				} else if aws.ToString(input.FilterPattern) == runFilterPattern(1234) {
+					sawApplication = true
+				}
+			}
+			slices.Sort(instances)
+			if want := slices.Sorted(slices.Values(tt.wantInstances)); !slices.Equal(instances, want) || !sawApplication {
+				t.Fatalf("streamed instances %v and application logs %t, want %v and true", instances, sawApplication, want)
 			}
 		})
 	}
 }
 
-func TestStreamRejectsWrongDiagnosticsStackBeforeCloudWatch(t *testing.T) {
-	t.Parallel()
-
-	cwl := &mockCloudWatchLogsClient{}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:    "found",
-		Product:   "fleet",
-		StackName: "runs-on-fleet-stage-v3",
-		Request:   jobDiagnosticsRequest{WorkflowRunID: 1234, WorkflowJobID: 42},
-		Local: &jobDiagnosticsLocal{
-			Source:        "fleet_claims",
-			WorkflowJobID: 42,
-			WorkflowRunID: 1234,
-			InstanceIDs:   []string{"i-fleet"},
-		},
-	})
-	facts.product = "fleet"
-	facts.stackName = "runs-on-fleet-preview-v3"
-
-	err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true})
-	want := `job 42 diagnostics resolved stack "runs-on-fleet-stage-v3", but CLI selected stack "runs-on-fleet-preview-v3"`
-	if err == nil || err.Error() != want {
-		t.Fatalf("Stream error = %v, want %q", err, want)
-	}
-	if len(cwl.inputs) != 0 {
-		t.Fatalf("expected no CloudWatch fetches before stack mismatch error, got %d", len(cwl.inputs))
-	}
-}
-
-func TestApplicationLogGroupIdentifierPrefersServiceLogGroup(t *testing.T) {
-	outputs := &StackOutputs{
-		ServiceLogGroupName: "/aws/ecs/runs-on-preview-v3/flexd",
-	}
-
-	logGroup, err := outputs.applicationLogGroupIdentifier()
-	if err != nil {
-		t.Fatalf("applicationLogGroupIdentifier returned error: %v", err)
-	}
-	if logGroup != outputs.ServiceLogGroupName {
-		t.Fatalf("expected service log group %q, got %q", outputs.ServiceLogGroupName, logGroup)
-	}
-}
-
-func TestApplicationLogGroupIdentifierRequiresServiceLogGroup(t *testing.T) {
-	if _, err := (&StackOutputs{}).applicationLogGroupIdentifier(); err == nil {
-		t.Fatal("expected applicationLogGroupIdentifier to fail without a service log group")
-	}
-}
-
 func TestRefreshJobLookupHandlesMissingRow(t *testing.T) {
 	facts := testJobFactsProvider(jobDiagnosticsResponse{Status: "not_found", Product: "flex"})
-	facts.facts = &workflowJobFacts{CurrentInstanceID: "i-existing", RunID: 1234}
+	facts.facts = &workflowJobFacts{Found: true, CurrentInstanceID: "i-existing", RunID: 1234}
 
 	if err := facts.refresh(context.Background()); err != nil {
 		t.Fatalf("refresh returned error: %v", err)
 	}
-	if got := facts.currentInstanceID(); got != "" {
-		t.Fatalf("expected empty instance ID, got %q", got)
-	}
-	if got := facts.runID(); got != 0 {
-		t.Fatalf("expected run ID to be cleared, got %d", got)
+	if got := facts.current(); got.Found || got.CurrentInstanceID != "" || got.RunID != 0 {
+		t.Fatalf("expected the missing row to clear the facts, got %+v", got)
 	}
 }
 
-func TestStreamedLogSessionUsesExpectedJobAndStackFilters(t *testing.T) {
-	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+func TestStackLogsStreamAllApplicationLogs(t *testing.T) {
 	cwl := &mockCloudWatchLogsClient{}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/flexd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "found",
-		Product: "flex",
-		GitHub: jobDiagnosticsGitHub{
-			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234},
-		},
-		Local: &jobDiagnosticsLocal{
-			Source:        "flex_workflow_jobs",
-			WorkflowJobID: 42,
-			WorkflowRunID: 1234,
-			InstanceIDs:   []string{"i-active"},
-			CreatedAt:     createdAt.Format(time.RFC3339),
-		},
-	})
-
-	if err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true}); err != nil {
-		t.Fatalf("Stream returned error: %v", err)
-	}
-
-	var sawInstance, sawApplication bool
-	for _, input := range cwl.inputs {
-		switch {
-		case aws.ToString(input.LogStreamNamePrefix) == "i-active/":
-			sawInstance = true
-		case aws.ToString(input.FilterPattern) == runFilterPattern(1234):
-			sawApplication = true
-		}
-	}
-	if !sawInstance || !sawApplication {
-		t.Fatalf("expected job stream to register instance and application filters, got %#v", cwl.inputs)
-	}
-
-	cwl.inputs = nil
-	applicationStreamer := &applicationLogStreamer{
-		cwl:     cwl,
-		outputs: streamer.outputs,
-	}
-	if err := applicationStreamer.Stream(context.Background(), &LogOptions{StartTime: 1, NoColor: true}); err != nil {
+	streamer := testLogStreamer(cwl, &RunsOnConfig{ServiceLogGroupName: "/aws/ecs/runs-on/flexd"})
+	if err := streamer.StreamStack(context.Background(), &LogOptions{StartTime: 1, NoColor: true}); err != nil {
 		t.Fatalf("application Stream returned error: %v", err)
 	}
-	if len(cwl.inputs) != 1 {
-		t.Fatalf("expected one stack application log fetch, got %d", len(cwl.inputs))
-	}
-	if got := aws.ToString(cwl.inputs[0].FilterPattern); got != "" {
-		t.Fatalf("expected stack application logs to use empty filter, got %q", got)
+	if len(cwl.inputs) != 1 || aws.ToString(cwl.inputs[0].FilterPattern) != "" {
+		t.Fatalf("expected one unfiltered stack application log fetch, got %#v", cwl.inputs)
 	}
 }
 
-func TestJobLogsUseDiagnosticsWindowForNonWatch(t *testing.T) {
+// Watch mode starts at the job's window but keeps reading past its end.
+func TestApplyJobLogWindowInWatchMode(t *testing.T) {
 	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
-	completedAt := createdAt.Add(30 * time.Minute)
-	cwl := &mockCloudWatchLogsClient{}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/flexd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "found",
-		Product: "flex",
-		GitHub: jobDiagnosticsGitHub{
-			WorkflowJob: &jobDiagnosticsWorkflowJob{
-				ID:          42,
-				RunID:       1234,
-				CreatedAt:   createdAt.Format(time.RFC3339),
-				CompletedAt: completedAt.Format(time.RFC3339),
-			},
-		},
-		Local: &jobDiagnosticsLocal{
-			Source:        "flex_workflow_jobs",
-			WorkflowJobID: 42,
-			WorkflowRunID: 1234,
-			InstanceIDs:   []string{"i-active"},
-		},
-	})
+	facts := &workflowJobFacts{Found: true, CreatedAt: createdAt, CreatedAtSource: "local.created_at", CompletedAt: createdAt.Add(30 * time.Minute)}
+	opts := &LogOptions{Watch: true, StartTime: 99, EndTime: 100}
 
-	if err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true}); err != nil {
-		t.Fatalf("Stream returned error: %v", err)
-	}
+	testLogStreamer(nil, nil).applyJobLogWindow(facts, 42, opts)
 
-	wantStart := createdAt.Add(-fullLogWindowBefore).UnixMilli()
-	wantEnd := completedAt.Add(fullLogWindowAfter).UnixMilli()
-	if len(cwl.inputs) == 0 {
-		t.Fatal("expected CloudWatch inputs")
-	}
-	for _, input := range cwl.inputs {
-		if got := aws.ToInt64(input.StartTime); got != wantStart {
-			t.Fatalf("StartTime = %d, want %d for input %#v", got, wantStart, input)
-		}
-		if got := aws.ToInt64(input.EndTime); got != wantEnd {
-			t.Fatalf("EndTime = %d, want %d for input %#v", got, wantEnd, input)
-		}
-	}
-}
-
-func TestJobLogsMissingDiagnosticsTimestampsPreserveFallbackWindow(t *testing.T) {
-	cwl := &mockCloudWatchLogsClient{}
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "found",
-		Product: "fleet",
-		GitHub: jobDiagnosticsGitHub{
-			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234},
-		},
-		Local: &jobDiagnosticsLocal{
-			Source:        "fleet_claims",
-			WorkflowJobID: 42,
-			WorkflowRunID: 1234,
-			InstanceIDs:   []string{"i-fleet"},
-		},
-	})
-
-	if err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 99, NoColor: true}); err != nil {
-		t.Fatalf("Stream returned error: %v", err)
-	}
-	if len(cwl.inputs) == 0 {
-		t.Fatal("expected CloudWatch inputs")
-	}
-	for _, input := range cwl.inputs {
-		if got := aws.ToInt64(input.StartTime); got != 99 {
-			t.Fatalf("StartTime = %d, want fallback 99 for input %#v", got, input)
-		}
-		if input.EndTime != nil {
-			t.Fatalf("EndTime = %d, want unset for input %#v", aws.ToInt64(input.EndTime), input)
-		}
-	}
-}
-
-func TestJobLogsWatchUsesDiagnosticsStartWithoutEndTime(t *testing.T) {
-	createdAt := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
-	completedAt := createdAt.Add(30 * time.Minute)
-	facts := &jobFactsProvider{}
-	facts.set(&workflowJobFacts{
-		JobID:       42,
-		CreatedAt:   createdAt,
-		CompletedAt: completedAt,
-	})
-	opts := &LogOptions{
-		Watch:     true,
-		StartTime: 99,
-		EndTime:   100,
-	}
-
-	(&jobLogStreamer{}).applyJobLogWindow(facts, opts)
-
-	if got := opts.StartTime; got != createdAt.Add(-fullLogWindowBefore).UnixMilli() {
-		t.Fatalf("StartTime = %d, want diagnostics start", got)
-	}
-	if opts.EndTime != 0 {
-		t.Fatalf("EndTime = %d, want unset for watch", opts.EndTime)
-	}
-}
-
-func TestFleetStreamedLogSessionUsesClaimFactsAndAttemptedInstances(t *testing.T) {
-	cwl := &mockCloudWatchLogsClient{}
-	var debug bytes.Buffer
-	logger := log.New(&debug, "", 0)
-	streamer := &jobLogStreamer{
-		cwl:    cwl,
-		logger: logger,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
-	facts := testJobFactsProvider(jobDiagnosticsResponse{
-		Status:  "found",
-		Product: "fleet",
-		GitHub: jobDiagnosticsGitHub{
-			WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, RunnerName: "runs-on--i-active--job"},
-		},
-		Local: &jobDiagnosticsLocal{
-			Source:          "fleet_claims",
-			WorkflowJobID:   42,
-			WorkflowRunID:   1234,
-			InstanceIDs:     []string{"i-old", "i-active"},
-			Status:          "job_claimed",
-			SchedulingState: "job_claimed",
-		},
-	})
-	facts.logger = logger
-
-	if err := streamer.Stream(context.Background(), "42", facts, nil, &LogOptions{StartTime: 1, NoColor: true}); err != nil {
-		t.Fatalf("Stream returned error: %v", err)
-	}
-
-	var sawOldInstance, sawActiveInstance, sawApplication bool
-	for _, input := range cwl.inputs {
-		switch {
-		case aws.ToString(input.LogStreamNamePrefix) == "i-old/":
-			sawOldInstance = true
-		case aws.ToString(input.LogStreamNamePrefix) == "i-active/":
-			sawActiveInstance = true
-		case aws.ToString(input.FilterPattern) == runFilterPattern(1234):
-			sawApplication = true
-		}
-	}
-	if !sawOldInstance || !sawActiveInstance || !sawApplication {
-		t.Fatalf("expected Fleet stream to register all attempted instance and application filters, got %#v", cwl.inputs)
-	}
-
-	debugOutput := debug.String()
-	for _, want := range []string{
-		"Stack product detected: fleet",
-		"Job lookup target: job diagnostics resolver Lambda job-diagnostics",
-		"Job 42 found in job diagnostics resolver Lambda job-diagnostics",
-		"state=job_claimed",
-	} {
-		if !strings.Contains(debugOutput, want) {
-			t.Fatalf("expected debug output to contain %q:\n%s", want, debugOutput)
-		}
+	if opts.StartTime != createdAt.Add(-fullLogWindowBefore).UnixMilli() || opts.EndTime != 0 {
+		t.Fatalf("window = %d..%d, want the job's start and no end", opts.StartTime, opts.EndTime)
 	}
 }
 
@@ -775,24 +445,21 @@ func TestWatchStartsInstanceStreamWhenFactsGainInstanceID(t *testing.T) {
 		return &lambda.InvokeOutput{Payload: payload}, nil
 	}
 
-	streamer := &jobLogStreamer{
-		cwl: cwl,
-		outputs: &StackOutputs{
-			ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
-			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
-		},
-	}
+	streamer := testLogStreamer(cwl, &RunsOnConfig{
+		ServiceLogGroupName:    "/aws/ecs/runs-on/fleetd",
+		EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
+	})
 	facts := &jobFactsProvider{
 		product: "fleet",
 		resolver: &jobDiagnosticsResolver{
 			client:       resolverClient,
 			functionName: "job-diagnostics",
 		},
-		jobID:  "42",
-		jobRef: "https://github.com/runs-on/server/actions/runs/1234/job/42",
+		job:    testJob,
+		logger: discardLogger,
 	}
 
-	err := streamer.Stream(ctx, "42", facts, nil, &LogOptions{
+	err := streamer.StreamJob(ctx, facts, nil, &LogOptions{
 		Watch:         true,
 		WatchInterval: 5 * time.Millisecond,
 		StartTime:     1,
@@ -822,6 +489,33 @@ func TestNoColorFlagIsLogCommandOnly(t *testing.T) {
 	stackLogsHelp := rootCommandHelp(t, "stack", "logs", "--help")
 	assertHelpContains(t, stackLogsHelp, "--no-color")
 	assertHelpContains(t, stackLogsHelp, "Disable color output for streamed logs")
+}
+
+func TestLogColorDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		flag     bool
+		env      string
+		terminal bool
+		want     bool
+	}{
+		{name: "terminal", terminal: true, want: false},
+		{name: "redirected stdout", terminal: false, want: true},
+		{name: "NO_COLOR set", env: "1", terminal: true, want: true},
+		{name: "--no-color", flag: true, terminal: true, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := logColorDisabled(tt.flag, tt.env, tt.terminal); got != tt.want {
+				t.Fatalf("logColorDisabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// testLogStreamer streams from cwl and discards its output.
+func testLogStreamer(cwl cloudWatchLogsAPI, config *RunsOnConfig) *logStreamer {
+	return &logStreamer{cwl: cwl, config: config, logger: discardLogger, stdout: io.Discard, stderr: io.Discard}
 }
 
 func rootCommandHelp(t *testing.T, args ...string) string {

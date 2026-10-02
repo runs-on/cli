@@ -37,10 +37,6 @@ func (a *archiveWriter) writeJSON(entryPath string, value any) error {
 	return a.writeBytes(entryPath, append(data, '\n'))
 }
 
-func (a *archiveWriter) writeText(entryPath, text string) error {
-	return a.writeBytes(entryPath, []byte(text))
-}
-
 func (a *archiveWriter) writeBytes(entryPath string, data []byte) error {
 	return a.writeReader(entryPath, bytes.NewReader(data))
 }
