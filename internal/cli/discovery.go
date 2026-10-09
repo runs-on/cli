@@ -31,6 +31,7 @@ type stackConfigSecretValue struct {
 	ServiceLogGroupName                string `json:"ServiceLogGroupName"`
 	EC2InstanceLogGroupArn             string `json:"Ec2InstanceLogGroupArn"`
 	BucketCache                        string `json:"BucketCache"`
+	InstanceRoleID                     string `json:"InstanceRoleId"`
 }
 
 type fleetConfigSecretValue struct {
@@ -39,6 +40,7 @@ type fleetConfigSecretValue struct {
 		ServiceLogGroupName                string `json:"service_log_group_name"`
 		EC2InstanceLogGroup                string `json:"ec2_instance_log_group"`
 		BucketCache                        string `json:"bucket_cache"`
+		InstanceRoleID                     string `json:"instance_role_id"`
 	} `json:"infra"`
 }
 
@@ -180,6 +182,7 @@ func parseRunsOnConfig(stackName string, cfg aws.Config, secretValue string) (*R
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.EC2InstanceLogGroupArn),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.JobDiagnosticsResolverFunctionName),
 		CacheBucket:            strings.TrimSpace(secret.BucketCache),
+		InstanceRoleID:         strings.TrimSpace(secret.InstanceRoleID),
 		AWSConfig:              cfg,
 	}, nil
 }
@@ -197,6 +200,7 @@ func parseFleetRunsOnConfig(stackName string, cfg aws.Config, secretValue string
 		EC2InstanceLogGroupArn: normalizeCloudWatchLogGroupIdentifier(secret.Infra.EC2InstanceLogGroup),
 		JobDiagnosticsResolver: strings.TrimSpace(secret.Infra.JobDiagnosticsResolverFunctionName),
 		CacheBucket:            strings.TrimSpace(secret.Infra.BucketCache),
+		InstanceRoleID:         strings.TrimSpace(secret.Infra.InstanceRoleID),
 		AWSConfig:              cfg,
 	}, nil
 }

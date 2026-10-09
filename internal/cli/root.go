@@ -17,7 +17,10 @@ type RunsOnConfig struct {
 	EC2InstanceLogGroupArn string
 	JobDiagnosticsResolver string
 	CacheBucket            string
-	AWSConfig              aws.Config
+	// InstanceRoleID is the runner instance role's unique ID, which names
+	// each instance's telemetry capture prefix.
+	InstanceRoleID string
+	AWSConfig      aws.Config
 }
 
 func NewRootCmd(stack *Stack) *cobra.Command {
@@ -47,6 +50,7 @@ func NewRootCmd(stack *Stack) *cobra.Command {
 
 	cmd.AddCommand(
 		NewLogsCmd(stack),
+		NewOtelCmd(stack),
 		NewConnectCmd(stack),
 		NewInterruptCmd(stack),
 		NewCleanupCmd(stack),

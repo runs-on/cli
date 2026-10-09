@@ -45,7 +45,7 @@ func TestLoadRunsOnConfigFromStackSecret(t *testing.T) {
 			if got := aws.ToString(input.SecretId); got != "/runs-on/runs-on-preview-v3/stack-config" {
 				t.Fatalf("unexpected secret ID %q", got)
 			}
-			secret := `{"WorkflowJobsTable":"workflow-jobs","JobDiagnosticsResolverFunctionName":"runs-on-preview-v3-job-diagnostics-resolver","IngressURL":"example.execute-api.us-east-1.amazonaws.com/prod","ServiceLogGroupName":"/aws/ecs/runs-on-preview-v3/flexd","Ec2InstanceLogGroupArn":"arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances:*"}`
+			secret := `{"WorkflowJobsTable":"workflow-jobs","JobDiagnosticsResolverFunctionName":"runs-on-preview-v3-job-diagnostics-resolver","IngressURL":"example.execute-api.us-east-1.amazonaws.com/prod","ServiceLogGroupName":"/aws/ecs/runs-on-preview-v3/flexd","Ec2InstanceLogGroupArn":"arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances:*","InstanceRoleId":"AROAFLEX"}`
 			return &secretsmanager.GetSecretValueOutput{SecretString: aws.String(secret)}, nil
 		},
 	}
@@ -72,6 +72,9 @@ func TestLoadRunsOnConfigFromStackSecret(t *testing.T) {
 	if config.JobDiagnosticsResolver != "runs-on-preview-v3-job-diagnostics-resolver" {
 		t.Fatalf("unexpected diagnostics resolver %q", config.JobDiagnosticsResolver)
 	}
+	if config.InstanceRoleID != "AROAFLEX" {
+		t.Fatalf("unexpected instance role ID %q", config.InstanceRoleID)
+	}
 }
 
 func TestLoadRunsOnConfigFromFleetSecret(t *testing.T) {
@@ -89,7 +92,7 @@ func TestLoadRunsOnConfigFromFleetSecret(t *testing.T) {
 			case "/runs-on/runs-on-preview-v3/stack-config":
 				return nil, notFound
 			case "/runs-on/runs-on-preview-v3/fleet-config":
-				secret := `{"infra":{"claim_table_name":"runs-on-preview-v3-fleet-claims","job_diagnostics_resolver_function_name":"runs-on-preview-v3-job-diagnostics-resolver","service_log_group_name":"/aws/ecs/runs-on-preview-v3/fleetd","ec2_instance_log_group":"arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances:*"}}`
+				secret := `{"infra":{"claim_table_name":"runs-on-preview-v3-fleet-claims","job_diagnostics_resolver_function_name":"runs-on-preview-v3-job-diagnostics-resolver","service_log_group_name":"/aws/ecs/runs-on-preview-v3/fleetd","ec2_instance_log_group":"arn:aws:logs:us-east-1:123456789012:log-group:runs-on-preview-v3/ec2/instances:*","instance_role_id":"AROAFLEET"}}`
 				return &secretsmanager.GetSecretValueOutput{SecretString: aws.String(secret)}, nil
 			default:
 				t.Fatalf("unexpected secret ID %q", secretID)
@@ -116,6 +119,9 @@ func TestLoadRunsOnConfigFromFleetSecret(t *testing.T) {
 	}
 	if config.JobDiagnosticsResolver != "runs-on-preview-v3-job-diagnostics-resolver" {
 		t.Fatalf("diagnostics resolver = %q", config.JobDiagnosticsResolver)
+	}
+	if config.InstanceRoleID != "AROAFLEET" {
+		t.Fatalf("instance role ID = %q", config.InstanceRoleID)
 	}
 	if err := config.validateStackLogs(); err != nil {
 		t.Fatalf("Fleet stack logs validation returned error: %v", err)
