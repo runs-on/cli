@@ -32,7 +32,7 @@ version for each stack so `roc` changes automatically when you enter its project
 directory:
 
 ```bash
-mise use --pin 'github:runs-on/cli[bin=roc]@3.4.0'
+mise use --pin 'github:runs-on/cli[bin=roc]@3.5.0'
 ```
 
 Install the latest stable CLI as your global default:
@@ -44,7 +44,7 @@ mise use --global 'github:runs-on/cli[bin=roc]@latest'
 Run an exact version once without changing your configuration:
 
 ```bash
-mise x 'github:runs-on/cli[bin=roc]@3.4.0' -- roc version
+mise x 'github:runs-on/cli[bin=roc]@3.5.0' -- roc version
 ```
 
 ### Download Binary
@@ -55,7 +55,7 @@ Download the exact CLI version that matches your stack from the
 Example (macOS ARM64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.4.0/roc_v3.4.0_darwin_arm64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.5.0/roc_v3.5.0_darwin_arm64
 chmod a+x ./roc
 xattr -d com.apple.quarantine ./roc
 ./roc --help
@@ -64,7 +64,7 @@ xattr -d com.apple.quarantine ./roc
 Example (Linux AMD64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.4.0/roc_v3.4.0_linux_amd64
+curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.5.0/roc_v3.5.0_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -216,10 +216,11 @@ Without `--watch`, the command still prints every line it collected, then exits 
 - `server/ecs.jsonl`: all RunsOn server logs for the window
 - `server/run-<run_id>.jsonl` and `server/job-<job_id>.jsonl`: the run-scoped server logs and the client-filtered job subset
 - `instances/<instance_id>/`: `cloudtrail.json`, `console.log`, `agent.jsonl` and, when available, `metrics.jsonl` for each attempted instance
+- `instances/<instance_id>/telemetry/`: the instance's telemetry capture (`traces.jsonl`, `logs.jsonl`, `metrics.jsonl` and any rotated segments), when the stack records its runner role ID
 
 An artifact that cannot be fetched is replaced by a `<name>.error.json` file next to where it would be, and the command exits nonzero after writing the archive.
 
-Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` prefix. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error.
+Fetching metrics requires `s3:ListBucket` on the stack's cache bucket and `s3:GetObject` on its `cache/metrics/v1/` and `telemetry/` prefixes. A missing metrics file is ignored, but an S3 lookup or download failure is recorded as an artifact error.
 
 `--full` cannot be combined with `--watch`. The job-specific `roc logs` command does not accept `--since`; use `roc stack logs --since ...` for stack-wide log streaming.
 
@@ -406,7 +407,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.4.0  # Use the latest release tag
+    rev: v3.5.0  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
