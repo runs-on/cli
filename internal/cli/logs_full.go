@@ -195,6 +195,9 @@ func (f *fullLogExporter) Export(ctx context.Context, job parsedGitHubJobURL) (s
 	for _, artifactErr := range f.writeMetricsFiles(ctx, archive, metricsRequest, facts.RunID, instanceIDs) {
 		addArtifactError(artifactErr.Path, errors.New(artifactErr.Error))
 	}
+	for _, artifactErr := range f.writeTelemetryFiles(ctx, archive, instanceIDs) {
+		addArtifactError(artifactErr.Path, errors.New(artifactErr.Error))
+	}
 
 	manifest := fullLogManifest{
 		StackName:          f.config.StackName,
@@ -519,4 +522,40 @@ func prettyJSON(data []byte) []byte {
 		return data
 	}
 	return append(pretty, '\n')
+}
+
+// writeTelemetryFiles adds each instance's telemetry capture to the archive,
+// as instances/<instance>/telemetry/<file>. A stack that does not record its
+// runner role ID has no capture.
+func (f *fullLogExporter) writeTelemetryFiles(ctx context.Context, archive *archiveWriter, instanceIDs []string) []fullArtifactError {
+	if f.s3 == nil || strings.TrimSpace(f.config.CacheBucket) == "" || strings.TrimSpace(f.config.InstanceRoleID) == "" || len(instanceIDs) == 0 {
+		return nil
+	}
+	objects, err := listTelemetryCapture(ctx, f.s3, f.config.CacheBucket, f.config.InstanceRoleID, instanceIDs)
+	if err != nil {
+		return []fullArtifactError{{Path: "instances/telemetry", Error: fmt.Sprintf("list telemetry capture: %v", err)}}
+	}
+
+	var artifactErrors []fullArtifactError
+	for _, object := range objects {
+		artifactPath := path.Join("instances", object.InstanceID, "telemetry", object.Name)
+		output, err := f.s3.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(f.config.CacheBucket),
+			Key:    aws.String(object.Key),
+		})
+		if err != nil {
+			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("fetch %s: %v", object.Name, err)})
+			continue
+		}
+		writeErr := archive.writeReader(artifactPath, output.Body)
+		closeErr := output.Body.Close()
+		if writeErr != nil {
+			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("write %s: %v", object.Name, writeErr)})
+			continue
+		}
+		if closeErr != nil {
+			artifactErrors = append(artifactErrors, fullArtifactError{Path: artifactPath, Error: fmt.Sprintf("close %s: %v", object.Name, closeErr)})
+		}
+	}
+	return artifactErrors
 }

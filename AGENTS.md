@@ -16,7 +16,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Build and Development
 - `make build` - Build the CLI binary to `dist/roc`
 - `make install` - Build and install to `/usr/local/bin/roc`
-- `go build -o dist/roc .` - Direct Go build command
 
 ### Release Process
 - `make sync-metadata` - Update release-facing version references in `README.md` and `action.yml`
@@ -36,13 +35,14 @@ The CLI uses the Cobra framework with commands organized under `internal/cli/`:
 - `doctor.go` - Stack health diagnostics and troubleshooting
 - `stack.go` - Parent command for stack management operations
 - `interrupt.go` - Trigger spot instance interruptions for testing
+- `cleanup.go` - Delete the caches and sticky-disk snapshots for a job's ref
 
 ### AWS Integration
 The CLI heavily integrates with AWS services:
 - CloudFormation - Stack management and output retrieval
 - SSM - Instance connections
 - CloudWatch Logs - Log streaming
-- AppRunner - Service health checks
+- ECS - Service health checks
 - S3 - Configuration storage
 
 ### Configuration
@@ -59,7 +59,7 @@ The CLI heavily integrates with AWS services:
 7. Lint command supports recursive file search, stdin input, and multiple output formats (text, json, sarif)
 
 ## Dependencies
-- Go 1.26.1
+- Go version: see `go.mod`
 - AWS SDK v2 for all AWS service interactions
 - Cobra for CLI framework
 - Google go-github for GitHub API integration
