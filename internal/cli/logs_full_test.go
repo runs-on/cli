@@ -145,6 +145,7 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	metricsClient := &mockMetricsS3Client{objects: map[string]string{
 		"cache/metrics/v1/runs-on/server/1234/unit-tests/i-active/metrics.jsonl":   "{\"cpu\":42}\n",
 		"cache/metrics/v1/runs-on/server/1234/other-job/i-unrelated/metrics.jsonl": "{\"cpu\":99}\n",
+		"telemetry/AROAEXAMPLE:i-active/traces.jsonl":                              "{\"resourceSpans\":[]}\n",
 	}}
 	resolverClient := &mockJobDiagnosticsLambda{
 		response: jobDiagnosticsResponse{
@@ -185,6 +186,7 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 			ServiceLogGroupName:    "/aws/ecs/runs-on/flexd",
 			EC2InstanceLogGroupArn: "arn:aws:logs:us-east-1:123456789012:log-group:runs-on/ec2/instances",
 			CacheBucket:            "runs-on-cache",
+			InstanceRoleID:         "AROAEXAMPLE",
 			AWSConfig:              aws.Config{Region: "us-east-1"},
 		},
 	}
@@ -214,6 +216,7 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 		"instances/i-active/console.log",
 		"instances/i-active/agent.jsonl",
 		"instances/i-active/metrics.jsonl",
+		"instances/i-active/telemetry/traces.jsonl",
 		"instances/i-old/cloudtrail.json",
 		"instances/i-runner/agent.jsonl",
 	} {
@@ -269,14 +272,15 @@ func TestFetchFullLogsCreatesArchive(t *testing.T) {
 	if len(ec2Client.inputs) != 3 {
 		t.Fatalf("expected console output per instance, got %d", len(ec2Client.inputs))
 	}
-	if len(metricsClient.listInputs) != 1 {
-		t.Fatalf("expected one S3 metrics listing, got %d", len(metricsClient.listInputs))
+	// One metrics listing for the run, then one capture listing per instance.
+	if len(metricsClient.listInputs) != 4 {
+		t.Fatalf("expected four S3 listings, got %d", len(metricsClient.listInputs))
 	}
 	if got := aws.ToString(metricsClient.listInputs[0].Prefix); got != "cache/metrics/v1/runs-on/server/1234/" {
 		t.Fatalf("unexpected metrics prefix %q", got)
 	}
-	if len(metricsClient.getInputs) != 1 {
-		t.Fatalf("expected one matching metrics download, got %d", len(metricsClient.getInputs))
+	if len(metricsClient.getInputs) != 2 {
+		t.Fatalf("expected the active instance's metrics and capture downloads, got %d", len(metricsClient.getInputs))
 	}
 }
 
