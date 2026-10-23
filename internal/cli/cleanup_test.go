@@ -30,9 +30,12 @@ func TestScopeTagValueMirrorsStickyDiskEncoding(t *testing.T) {
 	if got := scopeTagValue("refs/pull/151/merge"); got != "refs/pull/151/merge" {
 		t.Errorf("expected merge ref to be unchanged, got %q", got)
 	}
-	// Lossy sanitization appends -<sha256(raw)[:12]>.
+	// Lossy sanitization appends :<sha256(raw)>.
 	sum := sha256.Sum256([]byte("ma%in"))
-	want := "main-" + hex.EncodeToString(sum[:])[:12]
+	if scopeTagValue("ma%in") == scopeTagValue("main-"+hex.EncodeToString(sum[:])[:12]) {
+		t.Error("encoded scope collides with a literal branch name")
+	}
+	want := "main:" + hex.EncodeToString(sum[:])
 	if got := scopeTagValue("ma%in"); got != want {
 		t.Errorf("scopeTagValue(ma%%in) = %q, want %q", got, want)
 	}
