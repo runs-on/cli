@@ -135,6 +135,36 @@ if ! curl -fsSL "${CURL_RETRY_ARGS[@]}" -o "${TEMP_DIR}/${INSTALL_NAME}" "${DOWN
   exit 1
 fi
 
+# Check the binary against the release's checksums.txt (published since v0.1.8)
+CHECKSUMS_URL="https://github.com/runs-on/cli/releases/download/${VERSION}/checksums.txt"
+if ! curl -fsSL "${CURL_RETRY_ARGS[@]}" -o "${TEMP_DIR}/checksums.txt" "${CHECKSUMS_URL}"; then
+  echo "Error: Failed to download checksums from ${CHECKSUMS_URL}"
+  exit 1
+fi
+
+EXPECTED_SHA256=$(awk -v name="$BINARY_NAME" '$2 == name || $2 == "*" name { print $1; exit }' "${TEMP_DIR}/checksums.txt")
+if [ -z "$EXPECTED_SHA256" ]; then
+  echo "Error: ${BINARY_NAME} is not listed in ${CHECKSUMS_URL}"
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(sha256sum "${TEMP_DIR}/${INSTALL_NAME}" | awk '{ print $1 }')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(shasum -a 256 "${TEMP_DIR}/${INSTALL_NAME}" | awk '{ print $1 }')
+else
+  echo "Error: Neither sha256sum nor shasum is available to verify the download"
+  exit 1
+fi
+
+if [ "$(tr '[:upper:]' '[:lower:]' <<<"$ACTUAL_SHA256")" != "$(tr '[:upper:]' '[:lower:]' <<<"$EXPECTED_SHA256")" ]; then
+  echo "Error: Checksum mismatch for ${BINARY_NAME}"
+  echo "Expected: ${EXPECTED_SHA256}"
+  echo "Actual:   ${ACTUAL_SHA256}"
+  exit 1
+fi
+echo "Checksum verified: ${ACTUAL_SHA256}"
+
 # Make executable (for Unix systems)
 if [ "$OS" != "windows" ]; then
   chmod +x "${TEMP_DIR}/${INSTALL_NAME}"
