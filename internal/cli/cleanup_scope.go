@@ -36,15 +36,15 @@ func sanitizeTagValue(value string) string {
 }
 
 // scopeTagValue mirrors stickydisk.scopeTagValue: branch names are stored as
-// EC2 tag values, with a sha256 suffix appended whenever sanitization was
-// lossy so distinct branches can never collide on the same tag value.
+// EC2 tag values. Lossy sanitization adds a colon (invalid in git refs) and
+// the raw branch's SHA-256, separating encoded scopes from literal branches.
 func scopeTagValue(branch string) string {
 	sanitized := sanitizeTagValue(branch)
 	if sanitized == branch {
 		return sanitized
 	}
 	sum := sha256.Sum256([]byte(branch))
-	suffix := "-" + hex.EncodeToString(sum[:])[:12]
+	suffix := ":" + hex.EncodeToString(sum[:])
 	if len(sanitized)+len(suffix) > 256 {
 		sanitized = sanitized[:256-len(suffix)]
 	}
