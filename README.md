@@ -32,7 +32,7 @@ version for each stack so `roc` changes automatically when you enter its project
 directory:
 
 ```bash
-mise use --pin 'github:runs-on/cli[bin=roc]@3.6.0'
+mise use --pin 'github:runs-on/cli[bin=roc]@3.6.1'
 ```
 
 Install the latest stable CLI as your global default:
@@ -44,7 +44,7 @@ mise use --global 'github:runs-on/cli[bin=roc]@latest'
 Run an exact version once without changing your configuration:
 
 ```bash
-mise x 'github:runs-on/cli[bin=roc]@3.6.0' -- roc version
+mise x 'github:runs-on/cli[bin=roc]@3.6.1' -- roc version
 ```
 
 ### Download Binary
@@ -55,16 +55,16 @@ Download the exact CLI version that matches your stack from the
 Example (macOS ARM64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.6.0/roc_v3.6.0_darwin_arm64
+curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.1/roc_v3.6.1_darwin_arm64
 chmod a+x ./roc
-xattr -d com.apple.quarantine ./roc
+xattr -c ./roc  # clears the Gatekeeper quarantine flag, if any
 ./roc --help
 ```
 
 Example (Linux AMD64):
 
 ```bash
-curl -Lo ./roc https://github.com/runs-on/cli/releases/download/v3.6.0/roc_v3.6.0_linux_amd64
+curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.1/roc_v3.6.1_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -134,6 +134,10 @@ This feature requires the AWS CLI and the [AWS Session Manager plugin](https://d
 `roc connect` works on macOS, Linux and Windows. On Windows, it runs `aws ssm start-session` as a child process attached to the console, so Ctrl-C goes to the remote shell instead of ending `roc`.
 
 `roc connect` finds the job's instance through the stack's job diagnostics resolver Lambda, so your AWS credentials need `lambda:InvokeFunction` on it. The CLI and stack versions must match; if the resolver is missing from stack config, the command reports a version mismatch.
+
+`roc connect` and `roc interrupt` act only on an instance that the selected stack's own record of the job (its Flex job row or Fleet claim) names. When only GitHub's runner name points at an instance, for example a job that ran on another stack or a self-hosted runner the stack has no record of, they refuse it; with `roc connect --watch` or `roc interrupt --wait` they keep waiting for the stack's record. `roc interrupt` also checks the instance's `runs-on-stack-name` tag, and its `runs-on-repo-full-name` tag against the job's repository, because on Flex the stack's record copies the runner name from GitHub. `roc connect` relies on the stack's record alone.
+
+Every command that takes a job URL refuses a job that the stack recorded under another repository than the one in the URL, so a URL cannot pair one repository's path with another repository's job. If the repository was renamed after the job ran, pass the URL with the name it had then.
 
 ```
 Usage:
@@ -247,13 +251,13 @@ Global Flags:
 ```
 
 **Requirements:**
-- The target instance must be a running spot instance
+- The target instance must be a running spot instance launched by the selected stack (tagged `runs-on-stack-name` with the stack name)
 - AWS FIS service must be available in your region
 - AWS credentials with `lambda:InvokeFunction` on the stack's job diagnostics resolver, which finds the job's instance. The CLI and stack versions must match.
 - AWS credentials with `fis:ListExperimentTemplates`, `fis:CreateExperimentTemplate`, `fis:StartExperiment`, `fis:GetExperiment`, `fis:DeleteExperimentTemplate`, `ec2:DescribeInstances`, and `iam:GetRole` and `iam:PassRole` on the `aws-fis-itn` role. The first run, while that role does not exist yet, also needs `iam:CreateRole` and `iam:PutRolePolicy`.
 
 **How it works:**
-1. Validates the instance is a running spot instance
+1. Validates the instance is a running spot instance of the selected stack
 2. Creates an IAM role for FIS if it doesn't exist
 3. Creates and starts a FIS experiment to send the interruption
 4. Prints the experiment's progress until EC2 is due to interrupt the instance
@@ -407,7 +411,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.6.0  # Use the latest release tag
+    rev: v3.6.1  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
