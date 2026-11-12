@@ -180,7 +180,7 @@ func (r *captureReplayer) replayJob(ctx context.Context, resolver *jobDiagnostic
 	if err != nil {
 		return err
 	}
-	if err := diagnostics.validateStackProduct(config.Product, config.StackName, job.JobID); err != nil {
+	if err := diagnostics.validateStackProduct(config.Product, config.StackName, job); err != nil {
 		return err
 	}
 	facts := diagnostics.jobFacts(job)

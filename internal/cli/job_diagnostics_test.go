@@ -473,9 +473,10 @@ func TestJobDiagnosticsClassifiesJobProduct(t *testing.T) {
 	}
 }
 
-// A job resolved from another stack, or belonging to the other product, is
-// rejected before any CloudWatch read or archive write. `roc logs` goes
-// through the job facts provider shared with the other job commands.
+// A job resolved from another stack, recorded under another repository than
+// the URL's, or belonging to the other product, is rejected before any
+// CloudWatch read or archive write. `roc logs` goes through the job facts
+// provider shared with the other job commands.
 func TestJobCommandsRejectMismatchedStack(t *testing.T) {
 	t.Chdir(t.TempDir()) // `roc logs --full` writes its archive to the working dir
 
@@ -488,6 +489,7 @@ func TestJobCommandsRejectMismatchedStack(t *testing.T) {
 		stackName     string // stack selected by the CLI
 		resolvedStack string // stack the diagnostics resolver answered from
 		labels        []string
+		record        string // the stack's own record of the job, when it has one
 		want          string
 	}{
 		{
@@ -516,6 +518,24 @@ func TestJobCommandsRejectMismatchedStack(t *testing.T) {
 			want:          `job 42 diagnostics resolved stack "runs-on-fleet-stage-v3", but CLI selected stack "runs-on-fleet-preview-v3"`,
 		},
 		{
+			name:         "logs: flex job row of another repository",
+			command:      "logs",
+			stackProduct: "flex",
+			stackName:    "runs-on-flex-dev-v3",
+			labels:       flexLabels,
+			record:       `{"org_name":"runs-on","repo_name":"other"}`,
+			want:         `job 42 belongs to repository runs-on/other according to stack "runs-on-flex-dev-v3", but the URL names runs-on/server`,
+		},
+		{
+			name:         "logs --full: fleet claim of another repository",
+			command:      "logs --full",
+			stackProduct: "fleet",
+			stackName:    "runs-on-fleet-dev-v3",
+			labels:       fleetLabels,
+			record:       `{"owner_name":"other-org","repository_name":"server"}`,
+			want:         `job 42 belongs to repository other-org/server according to stack "runs-on-fleet-dev-v3", but the URL names runs-on/server`,
+		},
+		{
 			name:         "logs --full: fleet stack, flex job",
 			command:      "logs --full",
 			stackProduct: "fleet",
@@ -535,6 +555,9 @@ func TestJobCommandsRejectMismatchedStack(t *testing.T) {
 				GitHub: jobDiagnosticsGitHub{
 					WorkflowJob: &jobDiagnosticsWorkflowJob{ID: 42, RunID: 1234, Labels: tt.labels},
 				},
+			}
+			if tt.record != "" {
+				response.Local = &jobDiagnosticsLocal{WorkflowJobID: 42, WorkflowRunID: 1234, Record: json.RawMessage(tt.record)}
 			}
 			cwl := &mockCloudWatchLogsClient{}
 			var err error

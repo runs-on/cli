@@ -6,11 +6,13 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/fis"
 	"github.com/aws/aws-sdk-go-v2/service/fis/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -139,6 +141,66 @@ func (f *fakeFIS) PutRolePolicy(ctx context.Context, _ *iam.PutRolePolicyInput, 
 	}
 	f.roleWithoutPolicy = false
 	return &iam.PutRolePolicyOutput{}, nil
+}
+
+// roc interrupts only a running spot instance that the selected stack
+// launched for the job's repository, whatever instance the job lookup
+// returned.
+func TestCheckInterruptTarget(t *testing.T) {
+	withRepo := func(i ec2types.Instance, repo string) ec2types.Instance {
+		i.Tags = slices.DeleteFunc(slices.Clone(i.Tags), func(tag ec2types.Tag) bool { return aws.ToString(tag.Key) == "runs-on-repo-full-name" })
+		if repo != "" {
+			i.Tags = append(i.Tags, ec2types.Tag{Key: aws.String("runs-on-repo-full-name"), Value: aws.String(repo)})
+		}
+		return i
+	}
+	instance := func(stackTag string, lifecycle ec2types.InstanceLifecycleType, state ec2types.InstanceStateName) ec2types.Instance {
+		i := ec2types.Instance{
+			InstanceId:        aws.String("i-0abc"),
+			InstanceLifecycle: lifecycle,
+			State:             &ec2types.InstanceState{Name: state},
+			Tags:              []ec2types.Tag{{Key: aws.String("runs-on-role-id"), Value: aws.String("role")}},
+		}
+		if stackTag != "" {
+			i.Tags = append(i.Tags, ec2types.Tag{Key: aws.String("runs-on-stack-name"), Value: aws.String(stackTag)})
+		}
+		return withRepo(i, "acme/api")
+	}
+	running := instance("prod", ec2types.InstanceLifecycleTypeSpot, ec2types.InstanceStateNameRunning)
+	tests := []struct {
+		name     string
+		instance ec2types.Instance
+		wantErr  string
+	}{
+		{name: "running spot instance of the stack", instance: running},
+		{name: "repository in another case", instance: withRepo(running, "Acme/API")},
+		{name: "another repository's runner", instance: withRepo(running, "acme/web"),
+			wantErr: `instance i-0abc runs a job of repository "acme/web" (its runs-on-repo-full-name tag), not of acme/api`},
+		{name: "instance without a repository tag", instance: withRepo(running, ""),
+			wantErr: `instance i-0abc runs a job of repository ""`},
+		{name: "another stack's instance", instance: instance("staging", ec2types.InstanceLifecycleTypeSpot, ec2types.InstanceStateNameRunning),
+			wantErr: `instance i-0abc does not belong to the selected RunsOn stack "prod" (its runs-on-stack-name tag is "staging")`},
+		{name: "instance without a stack tag", instance: instance("", ec2types.InstanceLifecycleTypeSpot, ec2types.InstanceStateNameRunning),
+			wantErr: `instance i-0abc does not belong to the selected RunsOn stack "prod" (its runs-on-stack-name tag is "")`},
+		{name: "on-demand instance", instance: instance("prod", "", ec2types.InstanceStateNameRunning),
+			wantErr: "instance i-0abc is not a spot instance"},
+		{name: "stopped instance", instance: instance("prod", ec2types.InstanceLifecycleTypeSpot, ec2types.InstanceStateNameStopped),
+			wantErr: "instance i-0abc is not running"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkInterruptTarget(tt.instance, "prod", "acme/api", discardLogger)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkInterruptTarget returned error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestCreateSpotInterruptionCancelledTracksWhatFISCreated(t *testing.T) {

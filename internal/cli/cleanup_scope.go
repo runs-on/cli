@@ -21,6 +21,8 @@ const (
 	tagStickyDiskRepo  = "runs-on-stickydisk-repo"
 	tagStickyDiskScope = "runs-on-stickydisk-scope"
 	tagStackName       = "runs-on-stack-name"
+	// Runner instance tag (ec2meta.RUNS_ON_REPO_FULL_NAME_TAG).
+	tagRepoFullName = "runs-on-repo-full-name"
 )
 
 var tagValueSanitizer = regexp.MustCompile(`[^a-zA-Z0-9+=.,_:/@\s-]+`)

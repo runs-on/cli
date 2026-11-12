@@ -116,7 +116,7 @@ func validateCleanupJob(diagnostics *jobDiagnosticsResponse, config *RunsOnConfi
 	if diagnostics.Local.WorkflowRunID != 0 && diagnostics.Local.WorkflowRunID != job.RunID {
 		return fmt.Errorf("selected stack returned workflow run %d while validating run %d", diagnostics.Local.WorkflowRunID, job.RunID)
 	}
-	return diagnostics.validateStackProduct(config.Product, config.StackName, job.JobID)
+	return diagnostics.validateStackProduct(config.Product, config.StackName, job)
 }
 
 // resolveCleanupTarget derives the refs to clean from the job's workflow run

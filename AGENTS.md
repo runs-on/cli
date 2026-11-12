@@ -24,7 +24,8 @@ mirror; `../` paths and root `make` targets exist only there.
 - Users upgrade roc and stacks separately: treat new resolver fields and secret
   keys as optional, and skip the step or ask for a stack upgrade when missing.
 - Run `validateStackProduct` on the resolver response before a job-URL command
-  acts, so roc never acts on a job from another stack or product.
+  acts, so roc never acts on a job from another stack or product, or on one
+  the stack recorded under another repository than the URL's.
 - Keep `roc lint` and `roc version` free of AWS and stack access: the GitHub
   Action, the pre-commit hook, and CI run them without credentials.
 - roc ships for Windows: guard Unix-only calls by `runtime.GOOS`, as

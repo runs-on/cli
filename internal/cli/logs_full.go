@@ -85,7 +85,7 @@ func (f *fullLogExporter) Export(ctx context.Context, job parsedGitHubJobURL) (s
 	if err != nil {
 		return "", err
 	}
-	if err := diagnostics.validateStackProduct(f.config.Product, f.config.StackName, job.JobID); err != nil {
+	if err := diagnostics.validateStackProduct(f.config.Product, f.config.StackName, job); err != nil {
 		return "", err
 	}
 	facts := diagnostics.jobFacts(job)
@@ -245,22 +245,13 @@ func canonicalMetricsRequest(diagnostics *jobDiagnosticsResponse, fallback jobDi
 	}
 
 	var local struct {
-		JobHTMLURL     string `json:"job_html_url"`
-		OrgName        string `json:"org_name"`
-		RepoName       string `json:"repo_name"`
-		OwnerName      string `json:"owner_name"`
-		RepositoryName string `json:"repository_name"`
+		JobHTMLURL string `json:"job_html_url"`
 	}
 	if diagnostics.Local != nil && len(diagnostics.Local.Record) > 0 && json.Unmarshal(diagnostics.Local.Record, &local) == nil {
 		repositoryCandidates = append(repositoryCandidates, local.JobHTMLURL)
-		if strings.TrimSpace(local.OrgName) != "" && strings.TrimSpace(local.RepoName) != "" {
-			fallback.Owner = strings.TrimSpace(local.OrgName)
-			fallback.Repo = strings.TrimSpace(local.RepoName)
-		}
-		if strings.TrimSpace(local.OwnerName) != "" && strings.TrimSpace(local.RepositoryName) != "" {
-			fallback.Owner = strings.TrimSpace(local.OwnerName)
-			fallback.Repo = strings.TrimSpace(local.RepositoryName)
-		}
+	}
+	if owner, repo := diagnostics.recordRepository(); owner != "" {
+		fallback.Owner, fallback.Repo = owner, repo
 	}
 
 	for _, candidate := range repositoryCandidates {

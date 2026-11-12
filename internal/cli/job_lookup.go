@@ -75,7 +75,7 @@ func (p *jobFactsProvider) find(ctx context.Context) error {
 	p.mu.Lock()
 	p.diagnostics, p.facts = response, facts
 	p.mu.Unlock()
-	return response.validateStackProduct(p.product, p.stackName, p.job.JobID)
+	return response.validateStackProduct(p.product, p.stackName, p.job)
 }
 
 func (p *jobFactsProvider) shouldUseLocalGitHubFallback(response *jobDiagnosticsResponse) bool {
@@ -160,11 +160,19 @@ func (p *jobFactsProvider) logLookupSnapshot() {
 	}
 }
 
+// errInstanceNotRecorded marks a job whose GitHub runner names an instance
+// that the stack's record of the job does not.
+var errInstanceNotRecorded = errors.New("roc only acts on an instance the stack launched for the job")
+
 // instanceUnavailableError explains why the job has no current instance.
 func (p *jobFactsProvider) instanceUnavailableError() error {
 	facts := p.current()
 	if !facts.Found {
 		return fmt.Errorf("job %d not found in %s", p.job.JobID, p.lookupTarget())
+	}
+	if facts.CurrentInstanceID != "" {
+		return fmt.Errorf("job %d runs on instance %s according to GitHub, but the selected RunsOn stack %q has no record of that instance for the job; %w",
+			p.job.JobID, facts.CurrentInstanceID, p.stackName, errInstanceNotRecorded)
 	}
 	parts := []string{fmt.Sprintf("instance ID for job %d not available yet job_found_in=%q", p.job.JobID, p.lookupTarget())}
 	if facts.Status != "" {
@@ -180,20 +188,35 @@ func lookupWorkflowJobFacts(ctx context.Context, config *RunsOnConfig, job parse
 	return waitForJobFacts(ctx, newJobFactsProvider(config, job, logger), watch, 5*time.Second)
 }
 
-// waitForJobFacts refreshes the job's facts until it has a current instance,
-// or once when not watching.
+// waitForJobFacts refreshes the job's facts until the selected stack's own
+// record of the job names its current instance, or once when not watching.
+// A runner name from GitHub alone never selects the instance: anyone who can
+// name a self-hosted runner, or a job that ran on another stack, could point
+// it at an instance outside the stack.
 func waitForJobFacts(ctx context.Context, provider *jobFactsProvider, watch bool, interval time.Duration) (*workflowJobFacts, error) {
+	repolled := false
 	for {
 		if err := provider.refresh(ctx); err != nil {
 			return nil, err
 		}
-		if facts := provider.current(); facts.CurrentInstanceID != "" {
+		facts := provider.current()
+		if facts.InstanceRecorded {
 			return facts, nil
+		}
+		// A Fleet resolver matches the claim on the runner name of a cached
+		// poll, so a job roc fetched with the local gh needs one more poll.
+		if facts.CurrentInstanceID != "" && !repolled {
+			repolled = true
+			continue
 		}
 		if !watch {
 			return nil, provider.instanceUnavailableError()
 		}
-		provider.logger.Printf("Waiting for instance ID for job %d...\n", provider.job.JobID)
+		if facts.CurrentInstanceID != "" {
+			provider.logger.Printf("Waiting for stack %q to record instance %s, which GitHub names for job %d...\n", provider.stackName, facts.CurrentInstanceID, provider.job.JobID)
+		} else {
+			provider.logger.Printf("Waiting for instance ID for job %d...\n", provider.job.JobID)
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

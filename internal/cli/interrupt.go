@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/fis"
 	"github.com/aws/aws-sdk-go-v2/service/fis/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -105,7 +106,9 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			ec2Client := ec2.NewFromConfig(config.AWSConfig)
 			facts, err := lookupWorkflowJobFacts(ctx, config, job, wait, logger)
 			if err != nil {
-				if !wait {
+				// Waiting rarely helps when the stack has no record of
+				// GitHub's instance, so only suggest it when none is known.
+				if !wait && !errors.Is(err, errInstanceNotRecorded) {
 					return fmt.Errorf("%w. Use -w to wait for instance", err)
 				}
 				return err
@@ -161,17 +164,10 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 			}
 
 			instance := instanceResp.Reservations[0].Instances[0]
-			logger.Printf("Instance lifecycle: %v, state: %v\n", instance.InstanceLifecycle, instance.State.Name)
-
-			if instance.InstanceLifecycle != "spot" {
-				return fmt.Errorf("instance %s is not a spot instance (lifecycle: %v). Spot interruptions can only be triggered on spot instances", instanceID, instance.InstanceLifecycle)
+			if err := checkInterruptTarget(instance, config.StackName, job.Owner+"/"+job.Repo, logger); err != nil {
+				return err
 			}
-
-			if instance.State.Name != "running" {
-				return fmt.Errorf("instance %s is not running (state: %v). Instance must be running to trigger spot interruption", instanceID, instance.State.Name)
-			}
-
-			logger.Printf("✓ Instance %s is a running spot instance\n", instanceID)
+			logger.Printf("✓ Instance %s is a running spot instance of stack %s\n", instanceID, config.StackName)
 
 			// From here on roc creates FIS resources, so the first Ctrl-C (or
 			// SIGTERM) stops watching and cleans up instead of ending roc; a
@@ -218,6 +214,45 @@ func NewInterruptCmd(stack *Stack) *cobra.Command {
 	cmd.Flags().DurationVar(&delay, "delay", 5*time.Second, "Delay before interruption (e.g., 2m, 30s)")
 
 	return cmd
+}
+
+// checkInterruptTarget refuses an instance roc must not interrupt: one the
+// selected stack did not launch (Flex and Fleet tag every runner instance
+// with the stack name), one that runs another repository's job, one that is
+// not spot, or one that is not running. A Flex job row copies its runner
+// name from GitHub, and a repository's self-hosted runner can take any name,
+// so the instance's own repository tag (set at launch and again when its job
+// starts) must match the job's repository.
+func checkInterruptTarget(instance ec2types.Instance, stackName, repoFullName string, logger *log.Logger) error {
+	instanceID := aws.ToString(instance.InstanceId)
+	var state ec2types.InstanceStateName
+	if instance.State != nil {
+		state = instance.State.Name
+	}
+	logger.Printf("Instance lifecycle: %v, state: %v\n", instance.InstanceLifecycle, state)
+
+	instanceStack, instanceRepo := "", ""
+	for _, tag := range instance.Tags {
+		switch aws.ToString(tag.Key) {
+		case tagStackName:
+			instanceStack = aws.ToString(tag.Value)
+		case tagRepoFullName:
+			instanceRepo = aws.ToString(tag.Value)
+		}
+	}
+	if stackName = strings.TrimSpace(stackName); stackName == "" || instanceStack != stackName {
+		return fmt.Errorf("instance %s does not belong to the selected RunsOn stack %q (its %s tag is %q); roc only interrupts instances the stack launched", instanceID, stackName, tagStackName, instanceStack)
+	}
+	if repoFullName = sanitizeTagValue(repoFullName); instanceRepo == "" || !strings.EqualFold(instanceRepo, repoFullName) {
+		return fmt.Errorf("instance %s runs a job of repository %q (its %s tag), not of %s; roc only interrupts the job's own runner", instanceID, instanceRepo, tagRepoFullName, repoFullName)
+	}
+	if instance.InstanceLifecycle != ec2types.InstanceLifecycleTypeSpot {
+		return fmt.Errorf("instance %s is not a spot instance (lifecycle: %v). Spot interruptions can only be triggered on spot instances", instanceID, instance.InstanceLifecycle)
+	}
+	if state != ec2types.InstanceStateNameRunning {
+		return fmt.Errorf("instance %s is not running (state: %v). Instance must be running to trigger spot interruption", instanceID, state)
+	}
+	return nil
 }
 
 // interruptPermissionsHelp lists the permissions for the calls roc interrupt

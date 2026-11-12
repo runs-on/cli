@@ -250,6 +250,10 @@ type workflowJobFacts struct {
 	Status            string
 	SchedulingState   string
 	CurrentInstanceID string
+	// InstanceRecorded reports that the stack's own record of the job (Flex
+	// job row or Fleet claim) names CurrentInstanceID. A GitHub runner name can
+	// name any instance, so commands that act on an instance require this.
+	InstanceRecorded  bool
 	InstanceIDs       []string // every instance the job used, the current one included
 	CreatedAt         time.Time
 	CreatedAtSource   string
@@ -273,13 +277,13 @@ func (r *jobDiagnosticsResponse) jobFacts(job parsedGitHubJobURL) *workflowJobFa
 	facts.RunID = cmp.Or(facts.RunID, r.Request.WorkflowRunID)
 
 	var runnerName, htmlURL string
-	var localInstanceIDs []string
+	var recorded []string // the instances the stack's own record names
 	if local != nil {
 		facts.ScalesetJobID = strings.TrimSpace(local.ScalesetJobID)
 		facts.Status = local.Status
 		facts.SchedulingState = local.SchedulingState
 		runnerName = local.RunnerName
-		localInstanceIDs = local.InstanceIDs
+		recorded = dedupeStrings(append(slices.Clone(local.InstanceIDs), parseRunnerNameInstanceID(runnerName)))
 		facts.CreatedAt, facts.CreatedAtSource = parseDiagnosticsTime(local.CreatedAt, "local.created_at")
 		facts.CompletedAt, facts.CompletedAtSource = parseDiagnosticsTime(local.CompletedAt, "local.completed_at")
 	}
@@ -296,43 +300,64 @@ func (r *jobDiagnosticsResponse) jobFacts(job parsedGitHubJobURL) *workflowJobFa
 	}
 	facts.JobURL = cmp.Or(strings.TrimSpace(htmlURL), strings.TrimSpace(r.Request.JobURL), job.URL)
 
-	facts.InstanceIDs = dedupeStrings(slices.Concat(localInstanceIDs, []string{parseRunnerNameInstanceID(runnerName)}))
+	facts.InstanceIDs = dedupeStrings(append(slices.Clone(recorded), parseRunnerNameInstanceID(runnerName)))
 	if len(facts.InstanceIDs) > 0 {
 		facts.CurrentInstanceID = facts.InstanceIDs[0]
 	}
 	if parseProduct(r.Product) == productFleet {
 		if instanceID := fleetClaimCurrentInstanceID(local); instanceID != "" {
 			facts.CurrentInstanceID = instanceID
+			recorded = append(recorded, instanceID)
 			facts.InstanceIDs = dedupeStrings(append(facts.InstanceIDs, instanceID))
 		}
 	}
+	facts.InstanceRecorded = slices.Contains(recorded, facts.CurrentInstanceID)
 	return facts
 }
 
-func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct runsOnProduct, stackName string, jobID int64) error {
-	if err := r.validateStackName(stackName, jobID); err != nil {
-		return err
+// validateStackProduct refuses a response that is not about job as the
+// selected stack knows it: one answered by another stack, a record of another
+// repository than the URL's, or a job of the other product.
+func (r *jobDiagnosticsResponse) validateStackProduct(stackProduct runsOnProduct, stackName string, job parsedGitHubJobURL) error {
+	jobID := cmp.Or(job.JobID, r.Request.WorkflowJobID)
+	stackName = strings.TrimSpace(stackName)
+	if actual := strings.TrimSpace(r.StackName); stackName != "" && actual != "" && stackName != actual {
+		return fmt.Errorf("job %d diagnostics resolved stack %q, but CLI selected stack %q", jobID, actual, stackName)
+	}
+	// The resolver finds a Flex job row by job ID alone, and a Fleet claim by
+	// run ID and runner, so a URL can pair one repository's path with another
+	// repository's job. Every command trusts the URL's repository: for the
+	// GitHub lookups, the caches to clean, the runner roc interrupt accepts.
+	if owner, repo := r.recordRepository(); owner != "" && job.Owner != "" && !strings.EqualFold(owner+"/"+repo, job.Owner+"/"+job.Repo) {
+		return fmt.Errorf("job %d belongs to repository %s/%s according to stack %q, but the URL names %s/%s", jobID, owner, repo, stackName, job.Owner, job.Repo)
 	}
 	jobProduct := r.classifiedJobProduct()
 	if stackProduct == "" || jobProduct == "" || stackProduct == jobProduct {
 		return nil
 	}
-	if jobID == 0 {
-		jobID = r.Request.WorkflowJobID
-	}
-	return fmt.Errorf("job %d is a %s job, but stack %q is a %s stack", jobID, jobProduct.display(), strings.TrimSpace(stackName), stackProduct.display())
+	return fmt.Errorf("job %d is a %s job, but stack %q is a %s stack", jobID, jobProduct.display(), stackName, stackProduct.display())
 }
 
-func (r *jobDiagnosticsResponse) validateStackName(stackName string, jobID int64) error {
-	expected := strings.TrimSpace(stackName)
-	actual := strings.TrimSpace(r.StackName)
-	if expected == "" || actual == "" || expected == actual {
-		return nil
+// recordRepository returns the repository of the stack's own record of the
+// job: org_name and repo_name on a Flex job row, owner_name and
+// repository_name on a Fleet claim. Both are empty without a record.
+func (r *jobDiagnosticsResponse) recordRepository() (owner, repo string) {
+	if r == nil || r.Local == nil || len(r.Local.Record) == 0 {
+		return "", ""
 	}
-	if jobID == 0 {
-		jobID = r.Request.WorkflowJobID
+	var record struct {
+		OrgName        string `json:"org_name"`
+		RepoName       string `json:"repo_name"`
+		OwnerName      string `json:"owner_name"`
+		RepositoryName string `json:"repository_name"`
 	}
-	return fmt.Errorf("job %d diagnostics resolved stack %q, but CLI selected stack %q", jobID, actual, expected)
+	_ = json.Unmarshal(r.Local.Record, &record)
+	owner = strings.TrimSpace(cmp.Or(record.OwnerName, record.OrgName))
+	repo = strings.TrimSpace(cmp.Or(record.RepositoryName, record.RepoName))
+	if owner == "" || repo == "" {
+		return "", ""
+	}
+	return owner, repo
 }
 
 func (r *jobDiagnosticsResponse) classifiedJobProduct() runsOnProduct {
