@@ -32,7 +32,7 @@ version for each stack so `roc` changes automatically when you enter its project
 directory:
 
 ```bash
-mise use --pin 'github:runs-on/cli[bin=roc]@3.6.1'
+mise use --pin 'github:runs-on/cli[bin=roc]@3.6.2'
 ```
 
 Install the latest stable CLI as your global default:
@@ -44,7 +44,7 @@ mise use --global 'github:runs-on/cli[bin=roc]@latest'
 Run an exact version once without changing your configuration:
 
 ```bash
-mise x 'github:runs-on/cli[bin=roc]@3.6.1' -- roc version
+mise x 'github:runs-on/cli[bin=roc]@3.6.2' -- roc version
 ```
 
 ### Download Binary
@@ -55,7 +55,7 @@ Download the exact CLI version that matches your stack from the
 Example (macOS ARM64):
 
 ```bash
-curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.1/roc_v3.6.1_darwin_arm64
+curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.2/roc_v3.6.2_darwin_arm64
 chmod a+x ./roc
 xattr -c ./roc  # clears the Gatekeeper quarantine flag, if any
 ./roc --help
@@ -64,7 +64,7 @@ xattr -c ./roc  # clears the Gatekeeper quarantine flag, if any
 Example (Linux AMD64):
 
 ```bash
-curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.1/roc_v3.6.1_linux_amd64
+curl -fLo ./roc https://github.com/runs-on/cli/releases/download/v3.6.2/roc_v3.6.2_linux_amd64
 chmod a+x ./roc
 ./roc --help
 ```
@@ -411,7 +411,7 @@ Then add the hook to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/runs-on/cli
-    rev: v3.6.1  # Use the latest release tag
+    rev: v3.6.2  # Use the latest release tag
     hooks:
       - id: roc-lint
 ```
